@@ -74,7 +74,9 @@ class CapturingLLM(LLMClient):
     def structured(self, *, stage, key, system, prompt, output):
         assert stage == "vocab_map" and system == MAPPER_SYSTEM and output is MappingBatchDecision
         self.calls.append((key, prompt))
-        codes = [json.loads(line.split("source_code: ", 1)[1]) for line in prompt.splitlines() if "source_code: " in line]
+        codes = [
+            json.loads(line.split("source_code: ", 1)[1]) for line in prompt.splitlines() if "source_code: " in line
+        ]
         return MappingBatchDecision.model_validate({"choices": [choice(c, self.answers.get(c, 0)) for c in codes]})
 
     def run_agent(self, **kw):  # pragma: no cover - not used
@@ -111,18 +113,43 @@ def test_text_score_prefers_the_clinical_drug_over_the_ingredient():
 def test_mapping_summary():
     def d(code, status, target, freq):
         return MappingDecision(
-            source_vocabulary_id="SRC_X", source_code=code, source_name=code, frequency=freq,
-            status=status, target_concept_id=target,
+            source_vocabulary_id="SRC_X",
+            source_code=code,
+            source_name=code,
+            frequency=freq,
+            status=status,
+            target_concept_id=target,
         )
 
-    rows = mapping_summary([d("a", "APPROVED", 1, 50), d("b", "UNCHECKED", 2, 30), d("c", "UNCHECKED", 0, 10),
-                            d("d", "FLAGGED", 0, 5), d("e", "REJECTED", 3, 5)])
-    assert rows == [{
-        "source_vocabulary_id": "SRC_X", "terms": 5, "approved": 1, "unchecked": 1, "flagged": 1, "rejected": 1,
-        "unmapped": 1, "records": 100, "records_mapped": 80, "pct_records_mapped": 80.0,
-    }]
-    assert mapping_summary([d("a", "APPROVED", 1, 50), d("b", "UNCHECKED", 2, 50)], include_unchecked=False)[0][
-        "records_mapped"] == 50
+    rows = mapping_summary(
+        [
+            d("a", "APPROVED", 1, 50),
+            d("b", "UNCHECKED", 2, 30),
+            d("c", "UNCHECKED", 0, 10),
+            d("d", "FLAGGED", 0, 5),
+            d("e", "REJECTED", 3, 5),
+        ]
+    )
+    assert rows == [
+        {
+            "source_vocabulary_id": "SRC_X",
+            "terms": 5,
+            "approved": 1,
+            "unchecked": 1,
+            "flagged": 1,
+            "rejected": 1,
+            "unmapped": 1,
+            "records": 100,
+            "records_mapped": 80,
+            "pct_records_mapped": 80.0,
+        }
+    ]
+    assert (
+        mapping_summary([d("a", "APPROVED", 1, 50), d("b", "UNCHECKED", 2, 50)], include_unchecked=False)[0][
+            "records_mapped"
+        ]
+        == 50
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -248,6 +275,7 @@ def test_search_candidates(staged, search_path):
     assert len(unit) <= 3
 
     assert search_candidates(conn, schemas, "Malaria", None)[0].concept_id == MALARIA
+    assert search_candidates(conn, schemas, "Paracetamol 500mg", "drug")[0].concept_id == ACETAMINOPHEN_500_TAB
     assert not search_candidates(conn, schemas, "Unspecified malaria", "Condition") or all(
         c.vocabulary_id != "ICD10" for c in search_candidates(conn, schemas, "Unspecified malaria", "Condition")
     )
@@ -259,32 +287,47 @@ def test_search_candidates(staged, search_path):
 
 
 def demo_recordings(root: Path) -> None:
-    record(root, "SRC_DRUG:batch1", [
-        choice("Paracetamol 500mg", ACETAMINOPHEN_500_TAB, 0.97),
-        choice("AL 20/120 tabs", 0, 0.7, retry=["artemether lumefantrine"]),
-        choice("ORS sachets", ORS, 0.85, "EQUIVALENT"),
-        choice("Zinc 20mg", 2000003005, 0.93),
-        choice("Amoxicillin 250mg caps", 2000003003, 0.97),
-        choice("Amlodipine 5mg", 2000003007, 0.97),
-        choice("Cotrimoxazole 960mg", 2000003009, 0.95),
-        choice("TLD (TDF/3TC/DTG)", 2999999999, 0.9),  # hallucinated id
-        choice("Metformin 500mg", 2000003006, 0.93),
-    ])
+    record(
+        root,
+        "SRC_DRUG:batch1",
+        [
+            choice("Paracetamol 500mg", ACETAMINOPHEN_500_TAB, 0.97),
+            choice("AL 20/120 tabs", 0, 0.7, retry=["artemether lumefantrine"]),
+            choice("ORS sachets", ORS, 0.85, "EQUIVALENT"),
+            choice("Zinc 20mg", 2000003005, 0.93),
+            choice("Amoxicillin 250mg caps", 2000003003, 0.97),
+            choice("Amlodipine 5mg", 2000003007, 0.97),
+            choice("Cotrimoxazole 960mg", 2000003009, 0.95),
+            choice("TLD (TDF/3TC/DTG)", 2999999999, 0.9),  # hallucinated id
+            choice("Metformin 500mg", 2000003006, 0.93),
+        ],
+    )
     record(root, "SRC_DRUG:retry1", [choice("AL 20/120 tabs", ARTEMETHER_LUMEFANTRINE_TAB, 0.95)])
-    record(root, "SRC_LAB:batch1", [
-        choice("HB", 2000004001, 0.93, "EQUIVALENT"),
-        choice("MRDT", 2000004002, 0.9),
-        choice("RBS", 2000004003, 0.8, "EQUIVALENT"),
-        choice("DBP", 2000004007, 0.95),
-        choice("SBP", 2000004006, 0.95),
-        choice("TEMP", 2000004005, 0.95),
-        choice("WT", 2000004004, 0.95),
-    ])
+    record(
+        root,
+        "SRC_LAB:batch1",
+        [
+            choice("HB", 2000004001, 0.93, "EQUIVALENT"),
+            choice("MRDT", 2000004002, 0.9),
+            choice("RBS", 2000004003, 0.8, "EQUIVALENT"),
+            choice("DBP", 2000004007, 0.95),
+            choice("SBP", 2000004006, 0.95),
+            choice("TEMP", 2000004005, 0.95),
+            choice("WT", 2000004004, 0.95),
+        ],
+    )
     record(root, "SRC_RESULT:batch1", [choice("NEG", 2000006002, 0.97), choice("POS", 2000006001, 0.97)])
-    record(root, "SRC_UNIT:batch1", [
-        choice("mmHg", 2000005005), choice("g/dL", GRAM_PER_DL, 0.99), choice("mmol/L", 2000005002, 0.99),
-        choice("C", 2000005004, 0.9), choice("kg", 2000005003, 0.99),
-    ])
+    record(
+        root,
+        "SRC_UNIT:batch1",
+        [
+            choice("mmHg", 2000005005),
+            choice("g/dL", GRAM_PER_DL, 0.99),
+            choice("mmol/L", 2000005002, 0.99),
+            choice("C", 2000005004, 0.9),
+            choice("kg", 2000005003, 0.99),
+        ],
+    )
     record(root, "SRC_VA_CAUSE:batch1", [choice("Diarrhoeal diseases", 2000001011, 0.8, "EQUIVALENT")])
 
 
@@ -326,14 +369,22 @@ def test_map_terms_with_replay(staged, tmp_path):
 
     malaria = by["SRC_VA_CAUSE", "Malaria"]
     assert (malaria.method, malaria.status, malaria.equivalence, malaria.target_concept_id) == (
-        "exact", "APPROVED", "EQUAL", MALARIA)
+        "exact",
+        "APPROVED",
+        "EQUAL",
+        MALARIA,
+    )
     assert by["SRC_VA_CAUSE", "Road traffic accident"].method == "exact"
     assert by["SRC_UNIT", "g/dL"].target_concept_id == GRAM_PER_DL
 
     # privacy: exactly the expected calls, and no rare or exact-matched term in any prompt
     calls = [json.loads(p.read_text()) for p in sorted((ws.root / "llm_calls").glob("*.json"))]
     assert [c["key"] for c in calls] == [
-        "SRC_DRUG:batch1", "SRC_DRUG:retry1", "SRC_LAB:batch1", "SRC_RESULT:batch1", "SRC_UNIT:batch1",
+        "SRC_DRUG:batch1",
+        "SRC_DRUG:retry1",
+        "SRC_LAB:batch1",
+        "SRC_RESULT:batch1",
+        "SRC_UNIT:batch1",
         "SRC_VA_CAUSE:batch1",
     ]
     for c in calls:
@@ -347,7 +398,13 @@ def test_map_terms_with_replay(staged, tmp_path):
     assert "AL 20/120 tabs" in retry and "artemether lumefantrine" in retry and "Paracetamol" not in retry
 
     audit = [e for e in ws.read_audit() if e["event"] == "vocab_mapped"]
-    assert {e["source_vocabulary_id"] for e in audit} == {"SRC_DRUG", "SRC_LAB", "SRC_RESULT", "SRC_UNIT", "SRC_VA_CAUSE"}
+    assert {e["source_vocabulary_id"] for e in audit} == {
+        "SRC_DRUG",
+        "SRC_LAB",
+        "SRC_RESULT",
+        "SRC_UNIT",
+        "SRC_VA_CAUSE",
+    }
     drug_audit = next(e for e in audit if e["source_vocabulary_id"] == "SRC_DRUG")
     assert drug_audit["rejected_ids"] == 1 and drug_audit["retried"] == 1 and drug_audit["methods"]["suppressed"] == 2
 
@@ -362,16 +419,23 @@ def test_map_terms_validates_choices_and_batches(staged):
     cfg.mapping.llm_batch_size = 2
     cfg.mapping.candidates_per_term = 2
     terms = [
-        SourceTerm(source_vocabulary_id="SRC_X", source_code=code, source_name=code, frequency=freq,
-                   target_domain="Measurement")
+        SourceTerm(
+            source_vocabulary_id="SRC_X",
+            source_code=code,
+            source_name=code,
+            frequency=freq,
+            target_domain="Measurement",
+        )
         for code, freq in [("SBP", 90), ("MRDT", 80), ("RBS", 70), ("WT", 60), ("DBP", 50), ("rare test", 2)]
     ]
-    llm = CapturingLLM({
-        "SBP": 2000004006,  # valid standard Measurement concept outside the 2 candidates: accepted
-        "MRDT": MALARIA,  # standard, but Condition domain: rejected
-        "RBS": 2000002001,  # ICD10, not standard: rejected
-        "WT": 2000004004,
-    })
+    llm = CapturingLLM(
+        {
+            "SBP": 2000004006,  # valid standard Measurement concept outside the 2 candidates: accepted
+            "MRDT": MALARIA,  # standard, but Condition domain: rejected
+            "RBS": 2000002001,  # ICD10, not standard: rejected
+            "WT": 2000004004,
+        }
+    )
     by = {d.source_code: d for d in map_terms(conn, schemas, terms, llm, cfg)}
     assert [k for k, _ in llm.calls] == ["SRC_X:batch1", "SRC_X:batch2", "SRC_X:batch3"]
     assert "SBP" in llm.calls[0][1] and "MRDT" in llm.calls[0][1] and "DBP" in llm.calls[2][1]
@@ -390,8 +454,10 @@ def test_map_terms_validates_choices_and_batches(staged):
 def test_map_terms_without_llm_falls_back_to_lexical(staged, tmp_path, which):
     conn, schemas, cfg = staged
     llm = NullLLM() if which == "null" else ReplayLLM(tmp_path / "empty")
-    by = {(d.source_vocabulary_id, d.source_code): d for d in map_terms(
-        conn, schemas, collect_terms(conn, schemas, load_spec()), llm, cfg)}
+    by = {
+        (d.source_vocabulary_id, d.source_code): d
+        for d in map_terms(conn, schemas, collect_terms(conn, schemas, load_spec()), llm, cfg)
+    }
 
     gdl = by["SRC_UNIT", "g/dL"]
     assert (gdl.method, gdl.status, gdl.target_concept_id) == ("lexical", "UNCHECKED", GRAM_PER_DL)
@@ -412,16 +478,26 @@ def test_map_terms_without_llm_falls_back_to_lexical(staged, tmp_path, which):
 
 
 def _decision(svid: str, code: str, target: int, status: str, **kw) -> MappingDecision:
-    return MappingDecision(source_vocabulary_id=svid, source_code=code, source_name=code, frequency=10,
-                           target_concept_id=target, status=status, **kw)
+    return MappingDecision(
+        source_vocabulary_id=svid,
+        source_code=code,
+        source_name=code,
+        frequency=10,
+        target_concept_id=target,
+        status=status,
+        **kw,
+    )
 
 
 @pytest.mark.postgres
 def test_write_source_to_concept_map(staged):
     conn, schemas, _ = staged
     stcm = f"{schemas.etl}.source_to_concept_map"
-    execute(conn, f"INSERT INTO {stcm} (source_code, source_vocabulary_id, target_concept_id) VALUES "
-                  "('old', 'SRC_DRUG', 1), ('keep', 'SRC_OTHER', 2)")
+    execute(
+        conn,
+        f"INSERT INTO {stcm} (source_code, source_vocabulary_id, target_concept_id) VALUES "
+        "('old', 'SRC_DRUG', 1), ('keep', 'SRC_OTHER', 2)",
+    )
     long_code = "x" * 300
     decisions = [
         _decision("SRC_DRUG", "Paracetamol 500mg", ACETAMINOPHEN_500_TAB, "APPROVED", target_vocabulary_id="RxNorm"),
@@ -434,11 +510,19 @@ def test_write_source_to_concept_map(staged):
     assert write_source_to_concept_map(conn, schemas, decisions) == 3
     rows = fetch_all(conn, f"SELECT * FROM {stcm} ORDER BY source_vocabulary_id, source_code")
     got = {(r["source_vocabulary_id"], r["source_code"]): r for r in rows}
-    assert set(got) == {("SRC_DRUG", "Paracetamol 500mg"), ("SRC_DRUG", "x" * 255), ("SRC_OTHER", "keep"),
-                        ("SRC_UNIT", "g/dL")}
+    assert set(got) == {
+        ("SRC_DRUG", "Paracetamol 500mg"),
+        ("SRC_DRUG", "x" * 255),
+        ("SRC_OTHER", "keep"),
+        ("SRC_UNIT", "g/dL"),
+    }
     assert got["SRC_DRUG", "x" * 255]["target_vocabulary_id"] == "RxNorm"
     para = got["SRC_DRUG", "Paracetamol 500mg"]
-    assert (para["source_concept_id"], para["target_concept_id"], para["invalid_reason"]) == (0, ACETAMINOPHEN_500_TAB, None)
+    assert (para["source_concept_id"], para["target_concept_id"], para["invalid_reason"]) == (
+        0,
+        ACETAMINOPHEN_500_TAB,
+        None,
+    )
     assert para["source_code_description"] == "Paracetamol 500mg"
     assert str(para["valid_start_date"]) == "1970-01-01"
 
@@ -468,7 +552,14 @@ def test_review_round_trip(staged, tmp_path):
 
     paths = export_review(ws, decisions)
     names = sorted(p.name for p in paths)
-    assert names == ["SRC_DRUG.csv", "SRC_LAB.csv", "SRC_RESULT.csv", "SRC_UNIT.csv", "SRC_VA_CAUSE.csv", "decisions.json"]
+    assert names == [
+        "SRC_DRUG.csv",
+        "SRC_LAB.csv",
+        "SRC_RESULT.csv",
+        "SRC_UNIT.csv",
+        "SRC_VA_CAUSE.csv",
+        "decisions.json",
+    ]
     drug_csv = ws.mappings_dir / "SRC_DRUG.csv"
     with drug_csv.open(newline="") as fh:
         reader = csv.DictReader(fh)
@@ -478,18 +569,23 @@ def test_review_round_trip(staged, tmp_path):
     assert f"{ACETAMINOPHEN}:acetaminophen" in rows["Paracetamol 500mg"]["alternatives"]
     assert str(ACETAMINOPHEN_500_TAB) not in rows["Paracetamol 500mg"]["alternatives"]
 
-    # unedited files import unchanged
+    # unedited files import unchanged; stray copies in the folder are not read
+    (ws.mappings_dir / "SRC_DRUG copy.csv").write_text(drug_csv.read_text().replace("APPROVED", "REJECTED"))
     assert import_review(ws, conn, schemas) == decisions
 
-    _edit_csv(drug_csv, {
-        "TLD (TDF/3TC/DTG)": {"target_concept_id": str(TLD_TAB)},
-        "ORS sachets": {"status": "REJECTED"},
-        "Zinc 20mg": {"target_concept_id": "2000002001"},  # ICD10 code: not standard
-        "Metformin 500mg": {"target_concept_id": str(MALARIA)},  # wrong domain
-        "Amlodipine 5mg": {"status": "approved", "target_concept_id": "0"},  # reviewer unmaps it
-        "Quinine inj 600mg": {"target_concept_id": "2000003010", "status": "UNCHECKED"},  # status as before
-        "Ceftriaxone 1g inj": {"target_concept_id": "2000003011", "status": "FLAGGED"},  # explicit status wins
-    })
+    _edit_csv(
+        drug_csv,
+        {
+            "TLD (TDF/3TC/DTG)": {"target_concept_id": str(TLD_TAB)},
+            "ORS sachets": {"status": "REJECTED"},
+            "Zinc 20mg": {"target_concept_id": "2000002001"},  # ICD10 code: not standard
+            "Metformin 500mg": {"target_concept_id": str(MALARIA)},  # wrong domain
+            "Amlodipine 5mg": {"status": "approved", "target_concept_id": "0"},  # reviewer unmaps it
+            "Quinine inj 600mg": {"target_concept_id": "2000003010", "status": "UNCHECKED"},  # status as before
+            "Ceftriaxone 1g inj": {"target_concept_id": "2000003011", "status": "FLAGGED"},  # explicit status wins
+            "Cotrimoxazole 960mg": {"status": "OK"},  # not a status
+        },
+    )
     imported = {d.source_code: d for d in import_review(ws, conn, schemas)}
     tld = imported["TLD (TDF/3TC/DTG)"]
     assert (tld.method, tld.status, tld.target_concept_id) == ("manual", "APPROVED", TLD_TAB)
@@ -501,7 +597,10 @@ def test_review_round_trip(staged, tmp_path):
     assert (aml.target_concept_id, aml.status, aml.method, aml.target_concept_name) == (0, "APPROVED", "manual", None)
     quinine = imported["Quinine inj 600mg"]
     assert (quinine.status, quinine.method, quinine.target_concept_name) == (
-        "APPROVED", "manual", "quinine dihydrochloride 300 MG/ML Injectable Solution")
+        "APPROVED",
+        "manual",
+        "quinine dihydrochloride 300 MG/ML Injectable Solution",
+    )
     ceftriaxone = imported["Ceftriaxone 1g inj"]
     assert (ceftriaxone.status, ceftriaxone.method, ceftriaxone.target_concept_id) == ("FLAGGED", "manual", 2000003011)
     assert ceftriaxone.target_concept_name == "ceftriaxone 1000 MG Injection"
@@ -513,12 +612,21 @@ def test_review_round_trip(staged, tmp_path):
     assert offline["Zinc 20mg"].status == "APPROVED"
 
     write_source_to_concept_map(conn, schemas, list(imported.values()))
-    codes = {r["source_code"]: r["target_concept_id"] for r in fetch_all(
-        conn, f"SELECT source_code, target_concept_id FROM {schemas.etl}.source_to_concept_map "
-              "WHERE source_vocabulary_id = 'SRC_DRUG'")}
+    codes = {
+        r["source_code"]: r["target_concept_id"]
+        for r in fetch_all(
+            conn,
+            f"SELECT source_code, target_concept_id FROM {schemas.etl}.source_to_concept_map "
+            "WHERE source_vocabulary_id = 'SRC_DRUG'",
+        )
+    }
     assert codes["TLD (TDF/3TC/DTG)"] == TLD_TAB and codes["Quinine inj 600mg"] == 2000003010
     assert not {"ORS sachets", "Zinc 20mg", "Metformin 500mg", "Amlodipine 5mg", "Ceftriaxone 1g inj"} & set(codes)
     assert import_review(ws, conn, schemas) == list(imported.values())  # importing twice gives the same result
+    assert (
+        imported["Cotrimoxazole 960mg"].status == "FLAGGED"
+        and "Unknown status 'OK'" in imported["Cotrimoxazole 960mg"].rationale
+    )
 
 
 def test_import_review_needs_decisions(tmp_path):
@@ -528,12 +636,33 @@ def test_import_review_needs_decisions(tmp_path):
 
 def test_export_review_formats(tmp_path):
     ws = Workspace(tmp_path / "w")
-    d = _decision("SRC Weird/ID", "a,b", 5, "UNCHECKED", confidence=0.123456, candidates=[
-        ConceptCandidate(concept_id=5, concept_name="five", domain_id="Drug", vocabulary_id="RxNorm",
-                         concept_class_id="Ingredient", standard_concept="S", concept_code="5"),
-        ConceptCandidate(concept_id=6, concept_name="six", domain_id="Drug", vocabulary_id="RxNorm",
-                         concept_class_id="Ingredient", standard_concept="S", concept_code="6"),
-    ])
+    d = _decision(
+        "SRC Weird/ID",
+        "a,b",
+        5,
+        "UNCHECKED",
+        confidence=0.123456,
+        candidates=[
+            ConceptCandidate(
+                concept_id=5,
+                concept_name="five",
+                domain_id="Drug",
+                vocabulary_id="RxNorm",
+                concept_class_id="Ingredient",
+                standard_concept="S",
+                concept_code="5",
+            ),
+            ConceptCandidate(
+                concept_id=6,
+                concept_name="six",
+                domain_id="Drug",
+                vocabulary_id="RxNorm",
+                concept_class_id="Ingredient",
+                standard_concept="S",
+                concept_code="6",
+            ),
+        ],
+    )
     paths = export_review(ws, [d])
     assert paths[1].name == "SRC_Weird_ID.csv"
     with paths[1].open(newline="") as fh:

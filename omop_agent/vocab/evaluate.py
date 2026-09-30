@@ -213,7 +213,12 @@ ORDER BY k.n DESC, k.code"""
         rows = query_rows(conn, schemas.render(sql))
     except psycopg.Error as e:
         return CodeCoverage(
-            **base, distinct_codes=0, codes_found=0, codes_mapped_to_standard=0, records=0, records_mapped=0,
+            **base,
+            distinct_codes=0,
+            codes_found=0,
+            codes_mapped_to_standard=0,
+            records=0,
+            records_mapped=0,
             error=short_error(e),
         )
     ok_key = "mapped" if fm.concept_role == "standard" else "found"
@@ -241,7 +246,9 @@ def _coverage_issue(cov: CodeCoverage) -> str:
     return msg + ". Check the code format (dots, case, padding) or map these codes with concept_map."
 
 
-def evaluate_vocabulary(conn: psycopg.Connection, schemas: Schemas, spec: ETLSpec, cfg: ProjectConfig) -> VocabEvaluation:
+def evaluate_vocabulary(
+    conn: psycopg.Connection, schemas: Schemas, spec: ETLSpec, cfg: ProjectConfig
+) -> VocabEvaluation:
     """Check vocabulary availability and ``vocab_code`` coverage for ``spec``."""
     ev = VocabEvaluation()
     try:
@@ -277,7 +284,10 @@ def evaluate_vocabulary(conn: psycopg.Connection, schemas: Schemas, spec: ETLSpe
                 "Add it to the Athena download and reload the vocabulary."
             )
     # A 'source' field that reads the same codes as a 'standard' field would repeat its message.
-    keys = [(c.source_table, c.vocabulary_id, " ".join((fm.expression or "").split())) for c, (_, fm) in zip(ev.coverage, fields)]
+    keys = [
+        (c.source_table, c.vocabulary_id, " ".join((fm.expression or "").split()))
+        for c, (_, fm) in zip(ev.coverage, fields)
+    ]
     standard_keys = {k for k, c in zip(keys, ev.coverage) if c.concept_role == "standard"}
     for key, cov in zip(keys, ev.coverage):
         if cov.error:
@@ -339,13 +349,16 @@ def render_vocab_evaluation_md(ev: VocabEvaluation) -> str:
         out.append("")
         for c in ev.coverage:
             if c.unmatched:
-                out.append(f"Unmatched codes in {_cell(c.target_table)}.{_cell(c.target_field)}: " + ", ".join(
-                    f"`{_cell(u.value)}` ({u.count:,})" for u in c.unmatched
-                ))
+                out.append(
+                    f"Unmatched codes in {_cell(c.target_table)}.{_cell(c.target_field)}: "
+                    + ", ".join(f"`{_cell(u.value)}` ({u.count:,})" for u in c.unmatched)
+                )
                 out.append("")
 
     out += ["## Loaded vocabularies", "", "| Vocabulary | Version | Concepts | Standard |", "|---|---|---:|---:|"]
     for v in ev.loaded:
-        out.append(f"| {_cell(v.vocabulary_id)} | {_cell(v.version or '')} | {v.concepts:,} | {v.standard_concepts:,} |")
+        out.append(
+            f"| {_cell(v.vocabulary_id)} | {_cell(v.version or '')} | {v.concepts:,} | {v.standard_concepts:,} |"
+        )
     out.append("")
     return "\n".join(out)

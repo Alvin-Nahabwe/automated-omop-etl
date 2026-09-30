@@ -81,6 +81,8 @@ def render_r_script(cfg: ProjectConfig, ws: Workspace, run_achilles: bool = True
     """The R script text for this project (no password in it)."""
     conn = _connection(cfg)
     host = conn.get("host") or "localhost"
+    if host.startswith("/"):  # a libpq socket directory; JDBC needs TCP
+        host = "localhost"
     dbname = conn.get("dbname") or conn.get("user") or "postgres"
     values: dict[str, Any] = {
         "server": f"{host}/{dbname}",

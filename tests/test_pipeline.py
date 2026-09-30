@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 
@@ -66,9 +67,36 @@ def test_demo_end_to_end(demo_project):
     finally:
         conn.close()
     prompts = " ".join(p.read_text() for p in (ws_root / "llm_calls").glob("*.json"))
-    for secret in ("Quinine", "Ceftriaxone", "Achieng", "Odhiambo"):
+    # rare source values and identifiers never reach a prompt (vocabulary concept names such as
+    # "quinine dihydrochloride ..." may appear as mapping candidates; that is not source data)
+    for secret in ("Quinine inj 600mg", "Ceftriaxone 1g inj", "Achieng", "Odhiambo", "KH000001"):
         assert secret not in prompts
     assert (ws_root / "report.html").exists() and "PASSED" in (ws_root / "report.md").read_text()
+
+
+@pytest.mark.postgres
+def test_remap_keeps_review_edits(demo_project):
+    cfg = load_config(demo_project)
+    p = Pipeline(cfg, log=lambda m: None)
+    p.stage_and_profile()
+    p.load_vocabulary()
+    p.design()
+    p.map_vocabulary()
+    csv_path = p.ws.mappings_dir / "SRC_DRUG.csv"
+    with csv_path.open(newline="") as fh:
+        reader = csv.DictReader(fh)
+        rows, header = list(reader), reader.fieldnames
+    for row in rows:  # the reviewer maps the rare quinine product by hand
+        if row["source_code"] == "Quinine inj 600mg":
+            row["target_concept_id"] = "2000003010"
+    with csv_path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=header)
+        w.writeheader()
+        w.writerows(rows)
+    decisions = p.map_vocabulary()  # re-run: keeps the manual decision, calls no LLM
+    quinine = next(d for d in decisions if d.source_code == "Quinine inj 600mg")
+    assert quinine.target_concept_id == 2000003010 and quinine.method == "manual"
+    p.close()
 
 
 @pytest.mark.postgres

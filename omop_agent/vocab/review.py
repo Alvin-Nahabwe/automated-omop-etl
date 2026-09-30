@@ -54,9 +54,7 @@ def _csv_name(source_vocabulary_id: str) -> str:
 
 
 def _alternatives(d: MappingDecision) -> str:
-    return "; ".join(
-        f"{c.concept_id}:{c.concept_name}" for c in d.candidates if c.concept_id != d.target_concept_id
-    )
+    return "; ".join(f"{c.concept_id}:{c.concept_name}" for c in d.candidates if c.concept_id != d.target_concept_id)
 
 
 def _row(d: MappingDecision) -> dict[str, object]:
@@ -121,7 +119,9 @@ def _apply_edit(
         d.status = status  # type: ignore[assignment]
     elif status and status not in _STATUSES:
         d.status = "FLAGGED"
-        d.rationale = f"Unknown status '{row['status'].strip()}' in the review file; use one of {', '.join(sorted(_STATUSES))}."
+        d.rationale = (
+            f"Unknown status '{row['status'].strip()}' in the review file; use one of {', '.join(sorted(_STATUSES))}."
+        )
         return d
 
     eq = row.get("equivalence", "").strip().upper()
@@ -158,7 +158,9 @@ def _apply_edit(
             d.rationale = f"Reviewer's target_concept_id rejected: {why}."
     if known is not None:
         d.target_concept_name, d.target_domain_id, d.target_vocabulary_id = (
-            known.concept_name, known.domain_id, known.vocabulary_id,
+            known.concept_name,
+            known.domain_id,
+            known.vocabulary_id,
         )
     else:
         d.target_concept_name = row.get("target_concept_name") or None
@@ -169,7 +171,9 @@ def _apply_edit(
     return d
 
 
-def import_review(ws: Workspace, conn: psycopg.Connection | None = None, schemas: Schemas | None = None) -> list[MappingDecision]:
+def import_review(
+    ws: Workspace, conn: psycopg.Connection | None = None, schemas: Schemas | None = None
+) -> list[MappingDecision]:
     """``decisions.json`` with the reviewer's CSV edits applied (matched on vocabulary + code).
 
     * a changed ``status`` is taken as is;
@@ -194,8 +198,10 @@ def import_review(ws: Workspace, conn: psycopg.Connection | None = None, schemas
                 if row.get("source_vocabulary_id", "") == svid:
                     edits[(svid, row.get("source_code", ""))] = row
     return [
-        _apply_edit(d, edits[(d.source_vocabulary_id, d.source_code)], conn, schemas)
-        if (d.source_vocabulary_id, d.source_code) in edits
-        else d
+        (
+            _apply_edit(d, edits[(d.source_vocabulary_id, d.source_code)], conn, schemas)
+            if (d.source_vocabulary_id, d.source_code) in edits
+            else d
+        )
         for d in decisions
     ]

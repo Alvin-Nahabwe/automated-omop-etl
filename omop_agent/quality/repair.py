@@ -9,7 +9,8 @@ if the table still compiles and ``EXPLAIN``s cleanly. Each applied change is rec
 Privacy: ``run_aggregate_query`` accepts one read-only SELECT that returns a count column ``n``.
 Rows with ``n < min_cell_count`` are withheld, and queries that mention a direct-identifier
 column (from the profile or ``privacy.pii_columns``), select ``*``, or use row-concatenating or
-file-access functions are refused.
+file-access functions are refused. Database error messages shown to the model (failed ETL steps,
+check and query errors) have record values redacted (``redact_error``).
 
 Tool names and input fields are part of recorded replays: do not rename them.
 """
@@ -19,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Literal
 
 import psycopg
@@ -302,6 +304,41 @@ _DENIED_FUNCTIONS = re.compile(
 )
 
 
+_ERROR_DETAIL = re.compile(r"\s*DETAIL:.*?(?=\s*HINT:|$)", re.S)
+_ERROR_QUOTED = re.compile(r'"([^"]*)"')
+_ERROR_OUT_OF_RANGE = re.compile(r"(out of range: )(\S+)")
+_ERROR_NAMED_OBJECT = re.compile(
+    r"\b(constraint|index|relation|table|column|schema|function|operator|type|sequence|role|database)\s+$", re.I
+)
+
+
+@lru_cache(maxsize=1)
+def _cdm_names() -> frozenset[str]:
+    cdm = load_cdm_spec()
+    return frozenset({t.name for t in cdm.tables.values()} | {f.name for t in cdm.tables.values() for f in t.fields})
+
+
+def redact_error(message: str | None, context: str | None = "") -> str:
+    """A database error message with record values removed, fit for a prompt.
+
+    PostgreSQL errors can quote data: ``DETAIL: Failing row contains (...)``, ``Key (id)=(42)``,
+    ``invalid input syntax for type date: "31/02/1990"``. DETAIL sections are dropped, and quoted
+    text is kept only when it names a database object (``constraint "x"``, ``column "y"``), a CDM
+    table/field, or an identifier used in ``context`` (the SQL).
+    """
+    msg = _ERROR_DETAIL.sub(" DETAIL: (withheld: may contain record values)", message or "")
+    known = _cdm_names() | {m.lower() for m in _IDENT.findall(context or "")}
+
+    def quoted(m: re.Match[str]) -> str:
+        value, before = m.group(1), msg[: m.start()]
+        if value.lower() in known or value.split(".")[-1].lower() in known or _ERROR_NAMED_OBJECT.search(before):
+            return m.group(0)
+        return '"<value withheld>"'
+
+    msg = _ERROR_QUOTED.sub(quoted, msg)
+    return _ERROR_OUT_OF_RANGE.sub(r"\1<value withheld>", msg)
+
+
 def _pii_columns(state: RepairState) -> set[str]:
     cols = {c.split(".")[-1].strip().lower() for c in state.cfg.privacy.pii_columns if c.strip()}
     if state.profile is not None:
@@ -387,7 +424,7 @@ def run_aggregate_query(state: RepairState, sql: str) -> str:
     try:
         rows = readonly_query(state.conn, state.schemas.render(sql), limit=QUERY_FETCH_LIMIT)
     except psycopg.Error as e:
-        return f"ERROR: {short_error(e)}"
+        return f"ERROR: {redact_error(short_error(e), sql)}"
     if rows and "n" not in rows[0]:
         return "ERROR: the result has no column named n; return the group size as COUNT(*) AS n."
     min_n = state.cfg.privacy.min_cell_count
@@ -574,7 +611,7 @@ def build_repair_prompt(
         lines.append(f"The last ETL build failed: {len(etl_errors)} step(s) raised an error.\n\nFAILED ETL STEPS")
         for i, s in enumerate(etl_errors, 1):
             lines.append(f"{i}. step {s.step} (target table {s.target_table})")
-            lines.append(f"   error: {s.error}")
+            lines.append(f"   error: {redact_error(s.error, s.sql)}")
             if s.source_rows is not None:
                 lines.append(f"   source rows: {s.source_rows}")
             if s.sql:
@@ -587,7 +624,8 @@ def build_repair_prompt(
             "\n\nFAILED CHECKS"
         )
         for i, r in enumerate(checks[:MAX_FAILURES_IN_PROMPT], 1):
-            lines.append(f"{i}. {summarize(r)}")
+            head = f"{r.key} ({r.severity}): ERROR {redact_error(r.error, r.sql)}" if r.error else summarize(r)
+            lines.append(f"{i}. {head}")
             lines.append(f"   {r.check_level} check: {r.description}")
             if r.sql:
                 lines.append("   check SQL:\n```sql\n" + _clip(r.sql, 1500) + "\n```")
@@ -605,7 +643,10 @@ def build_repair_prompt(
             f" [{len(tm.fields)} fields]"
         )
     if spec.custom_sql:
-        lines.append("Custom SQL steps: " + ", ".join(f"{c.name} -> {c.target_table}" for c in spec.custom_sql))
+        lines.append(
+            "Custom SQL steps (the tools cannot edit these; describe needed changes for a human): "
+            + ", ".join(f"{c.name} -> {c.target_table}" for c in spec.custom_sql)
+        )
     lines.append(f"Observation periods: {spec.observation_period}.")
     lines.append(
         "\nDiagnose the root cause of each failure, inspect with the tools, and fix the ETL spec (not the data) "

@@ -71,6 +71,14 @@ class Workspace:
         return self.root / "mappings"
 
     @property
+    def decisions_json(self) -> Path:
+        return self.mappings_dir / "decisions.json"
+
+    @property
+    def llm_calls_dir(self) -> Path:
+        return self.root / "llm_calls"
+
+    @property
     def sql_dir(self) -> Path:
         return self.root / "sql"
 

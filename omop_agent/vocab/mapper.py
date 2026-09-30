@@ -269,8 +269,9 @@ class _Searcher:
         if domain not in self._pools:
             where = f"c.standard_concept = 'S' AND c.invalid_reason IS NULL {self._domain_sql(domain)}"
             params = {"domain": domain, "n": EXHAUSTIVE_DOMAIN_SIZE + 1}
-            n = self._rows(f"SELECT COUNT(*) AS n FROM (SELECT 1 FROM {self.v}.concept c WHERE {where} LIMIT %(n)s) x",
-                           params)[0]["n"]
+            n = self._rows(
+                f"SELECT COUNT(*) AS n FROM (SELECT 1 FROM {self.v}.concept c WHERE {where} LIMIT %(n)s) x", params
+            )[0]["n"]
             self._pools[domain] = None
             if n <= EXHAUSTIVE_DOMAIN_SIZE:
                 self._pools[domain] = self._rows(
@@ -374,8 +375,10 @@ LIMIT %(pool)s"""
         return self._cache[key]
 
     def lookup(self, concept_id: int) -> dict | None:
-        rows = self._rows(f"SELECT {_CONCEPT_COLS}, c.invalid_reason FROM {self.v}.concept c WHERE c.concept_id = %(id)s",
-                          {"id": concept_id})
+        rows = self._rows(
+            f"SELECT {_CONCEPT_COLS}, c.invalid_reason FROM {self.v}.concept c WHERE c.concept_id = %(id)s",
+            {"id": concept_id},
+        )
         return rows[0] if rows else None
 
 
@@ -462,7 +465,13 @@ def _exact_match(t: SourceTerm, hits: list[_Hit]) -> MappingDecision | None:
     h, name = matches[0]
     how = "the concept name" if name == h.names[0] else f"the synonym '{name}'"
     return _decision(
-        t, hits, **_target(h.candidate), equivalence="EQUAL", confidence=1.0, status="APPROVED", method="exact",
+        t,
+        hits,
+        **_target(h.candidate),
+        equivalence="EQUAL",
+        confidence=1.0,
+        status="APPROVED",
+        method="exact",
         rationale=f"The source term equals {how} of the only matching standard concept.",
     )
 
@@ -471,12 +480,20 @@ def _lexical(t: SourceTerm, hits: list[_Hit], why: str) -> MappingDecision:
     top = hits[0].candidate if hits else None
     if top is not None and top.score >= LEXICAL_MIN_SCORE:
         return _decision(
-            t, hits, **_target(top), equivalence="EQUIVALENT" if top.score >= 0.95 else "INEXACT",
-            confidence=top.score, status="UNCHECKED", method="lexical",
+            t,
+            hits,
+            **_target(top),
+            equivalence="EQUIVALENT" if top.score >= 0.95 else "INEXACT",
+            confidence=top.score,
+            status="UNCHECKED",
+            method="lexical",
             rationale=f"No LLM review ({why}). Best lexical match, score {top.score:.2f}; check it before approving.",
         )
     return _decision(
-        t, hits, status="UNCHECKED", method="lexical",
+        t,
+        hits,
+        status="UNCHECKED",
+        method="lexical",
         rationale=f"No LLM review ({why}) and no lexical match scored {LEXICAL_MIN_SCORE} or more; map it manually.",
     )
 
@@ -493,7 +510,9 @@ def _format_term(i: int, t: SourceTerm, hits: list[_Hit], k: int, phrases: list[
         lines.append("   candidates (concept_id | name | class | vocabulary | score):")
         for h in hits[:k]:
             c = h.candidate
-            lines.append(f"   {c.concept_id} | {c.concept_name} | {c.concept_class_id} | {c.vocabulary_id} | {c.score:.2f}")
+            lines.append(
+                f"   {c.concept_id} | {c.concept_name} | {c.concept_class_id} | {c.vocabulary_id} | {c.score:.2f}"
+            )
     else:
         lines.append("   candidates: none found")
     return lines
@@ -517,7 +536,10 @@ def build_prompt(
             "",
         ]
     else:
-        lines += [f"Choose the best standard concept for each of these {len(batch)} source terms, or 0 if none fits.", ""]
+        lines += [
+            f"Choose the best standard concept for each of these {len(batch)} source terms, or 0 if none fits.",
+            "",
+        ]
     for i, t in enumerate(batch, 1):
         phrases = retry_phrases.get(t.source_code) if retry_phrases else None
         lines += _format_term(i, t, hits[t.source_code], k, phrases) + [""]
@@ -551,7 +573,9 @@ class _VocabMapper:
     def _call(self, key: str, prompt: str) -> MappingBatchDecision | str:
         """The model's answer, or the reason there is none."""
         try:
-            out = self.llm.structured(stage=STAGE, key=key, system=MAPPER_SYSTEM, prompt=prompt, output=MappingBatchDecision)
+            out = self.llm.structured(
+                stage=STAGE, key=key, system=MAPPER_SYSTEM, prompt=prompt, output=MappingBatchDecision
+            )
             self.stats["llm_calls"] += 1
             return out
         except LLMUnavailable as e:
@@ -564,12 +588,24 @@ class _VocabMapper:
     def _apply(self, t: SourceTerm, ch: TermChoice | None) -> MappingDecision:
         hits = self.hits[t.source_code]
         if ch is None:
-            return _decision(t, hits, status="UNCHECKED", method="llm",
-                             rationale="The model returned no choice for this term; map it manually.")
+            return _decision(
+                t,
+                hits,
+                status="UNCHECKED",
+                method="llm",
+                rationale="The model returned no choice for this term; map it manually.",
+            )
         cid = ch.chosen_concept_id
         if cid == 0:
-            return _decision(t, hits, status="UNCHECKED", method="llm", equivalence="UNMATCHED",
-                             confidence=ch.confidence, rationale=ch.rationale)
+            return _decision(
+                t,
+                hits,
+                status="UNCHECKED",
+                method="llm",
+                equivalence="UNMATCHED",
+                confidence=ch.confidence,
+                rationale=ch.rationale,
+            )
         cand = next((h.candidate for h in hits if h.candidate.concept_id == cid), None)
         if cand is None:
             row = self.s.lookup(cid)
@@ -577,13 +613,24 @@ class _VocabMapper:
             if cand is None:
                 self.stats["rejected_ids"] += 1
                 return _decision(
-                    t, hits, status="FLAGGED", method="llm", equivalence="UNMATCHED", confidence=0.0,
+                    t,
+                    hits,
+                    status="FLAGGED",
+                    method="llm",
+                    equivalence="UNMATCHED",
+                    confidence=0.0,
                     rationale=f"Rejected the model's choice: {why}. Model rationale: {ch.rationale}",
                 )
         auto = ch.confidence >= self.cfg.mapping.auto_approve_confidence and ch.equivalence != "UNMATCHED"
         return _decision(
-            t, hits, **_target(cand), equivalence=ch.equivalence, confidence=ch.confidence,
-            status="APPROVED" if auto else "UNCHECKED", method="llm", rationale=ch.rationale,
+            t,
+            hits,
+            **_target(cand),
+            equivalence=ch.equivalence,
+            confidence=ch.confidence,
+            status="APPROVED" if auto else "UNCHECKED",
+            method="llm",
+            rationale=ch.rationale,
         )
 
     def run(self, terms: list[SourceTerm]) -> dict[str, MappingDecision]:
@@ -596,7 +643,10 @@ class _VocabMapper:
             self.hits[t.source_code] = hits
             if t.frequency < min_cell:
                 out[t.source_code] = _decision(
-                    t, hits, status="UNCHECKED", method="suppressed",
+                    t,
+                    hits,
+                    status="UNCHECKED",
+                    method="suppressed",
                     rationale="Below the small-cell threshold; not sent to the LLM. Review it manually.",
                 )
             elif (d := _exact_match(t, hits)) is not None:
@@ -630,7 +680,9 @@ class _VocabMapper:
                     old = merged.get(h.candidate.concept_id)
                     if old is None or h.candidate.score > old.candidate.score:
                         merged[h.candidate.concept_id] = h
-            self.hits[t.source_code] = sorted(merged.values(), key=lambda h: (-h.candidate.score, h.candidate.concept_id))
+            self.hits[t.source_code] = sorted(
+                merged.values(), key=lambda h: (-h.candidate.score, h.candidate.concept_id)
+            )
             out[t.source_code].candidates = [h.candidate for h in self.hits[t.source_code][:DECISION_CANDIDATES]]
         self.stats["retried"] = len(retry)
         for n, batch in enumerate(_chunks(retry, self.cfg.mapping.llm_batch_size), 1):
@@ -702,23 +754,29 @@ def write_source_to_concept_map(
     vocabs = sorted({d.source_vocabulary_id for d in decisions})
     if not vocabs:
         return 0
-    execute(conn, schemas.render("DELETE FROM {etl}.source_to_concept_map WHERE source_vocabulary_id = ANY(%s)"), (vocabs,))
-    sql = schemas.render(
-        """INSERT INTO {etl}.source_to_concept_map
+    execute(
+        conn, schemas.render("DELETE FROM {etl}.source_to_concept_map WHERE source_vocabulary_id = ANY(%s)"), (vocabs,)
+    )
+    sql = schemas.render("""INSERT INTO {etl}.source_to_concept_map
                (source_code, source_concept_id, source_vocabulary_id, source_code_description,
                 target_concept_id, target_vocabulary_id, invalid_reason)
            VALUES (%s, 0, %s, %s, %s,
                    LEFT(COALESCE(%s, (SELECT vocabulary_id FROM {vocab}.concept WHERE concept_id = %s)), 20), NULL)
-           ON CONFLICT DO NOTHING"""
-    )
+           ON CONFLICT DO NOTHING""")
     n = 0
     with conn.cursor() as cur:
         for d in decisions:
             if _usable(d, include_unchecked):
                 cur.execute(
                     sql,
-                    (d.source_code[:255], d.source_vocabulary_id, d.source_name[:255], d.target_concept_id,
-                     d.target_vocabulary_id, d.target_concept_id),
+                    (
+                        d.source_code[:255],
+                        d.source_vocabulary_id,
+                        d.source_name[:255],
+                        d.target_concept_id,
+                        d.target_vocabulary_id,
+                        d.target_concept_id,
+                    ),
                 )
                 n += max(cur.rowcount, 0)
     return n
@@ -735,8 +793,17 @@ def mapping_summary(decisions: list[MappingDecision], include_unchecked: bool = 
     for d in decisions:
         r = rows.setdefault(
             d.source_vocabulary_id,
-            dict(source_vocabulary_id=d.source_vocabulary_id, terms=0, approved=0, unchecked=0, flagged=0,
-                 rejected=0, unmapped=0, records=0, records_mapped=0),
+            dict(
+                source_vocabulary_id=d.source_vocabulary_id,
+                terms=0,
+                approved=0,
+                unchecked=0,
+                flagged=0,
+                rejected=0,
+                unmapped=0,
+                records=0,
+                records_mapped=0,
+            ),
         )
         r["terms"] += 1
         r["records"] += d.frequency

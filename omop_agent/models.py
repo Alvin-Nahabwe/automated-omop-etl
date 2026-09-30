@@ -330,8 +330,8 @@ class CheckResult(BaseModel):
     severity: Literal["fatal", "convention", "characterization"] = "convention"
     num_violated_rows: int = 0
     num_denominator_rows: int = 0
-    pct_violated_rows: float = 0.0
-    threshold_pct: float = 0.0
+    pct_violated_rows: float = Field(0.0, description="Fraction 0..1 of the denominator that violates the check.")
+    threshold_pct: float = Field(0.0, description="Failure threshold in percent (0..100), as in DQD.")
     failed: bool = False
     not_applicable: bool = False
     error: str | None = None
@@ -348,7 +348,9 @@ class DQReport(BaseModel):
     engine: Literal["builtin", "dqd"] = "builtin"
     results: list[CheckResult]
     passed: bool
-    blocking_failures: list[str] = Field(default_factory=list)
+    blocking_failures: list[str] = Field(
+        default_factory=list, description="One line per blocking failure: '<check key> (<severity>): <detail>'."
+    )
 
     def failed(self) -> list[CheckResult]:
         return [r for r in self.results if r.failed or r.error]

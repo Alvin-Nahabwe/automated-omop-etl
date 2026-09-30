@@ -349,7 +349,10 @@ def _observation_period_overlap_sql(ctx: _Ctx) -> str:
 # --------------------------------------------------------------------------------------
 
 
-def _new(check: str, level: str, table: str, fld: str | None, threshold: float, extra: dict[str, str] | None = None) -> CheckResult:
+def _new(
+    check: str, level: str, table: str, fld: str | None, threshold: float, extra: dict[str, str] | None = None
+) -> CheckResult:
+    """A not-yet-evaluated result carrying DQD's description, category and severity."""
     info = check_catalog().get(check)
     return CheckResult(
         check_name=check,

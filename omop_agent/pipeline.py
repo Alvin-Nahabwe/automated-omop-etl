@@ -161,10 +161,15 @@ class Pipeline:
         )
         return spec  # type: ignore[return-value]
 
-    def map_vocabulary(self) -> list[MappingDecision]:
+    def map_vocabulary(self, remap: bool = False) -> list[MappingDecision]:
+        """Evaluate the vocabulary and map source codes.
+
+        Decisions from an earlier run, including a reviewer's CSV edits, are kept for terms that
+        are still present; only new terms are mapped. ``remap=True`` maps everything again.
+        """
         from .vocab.evaluate import evaluate_vocabulary, render_vocab_evaluation_md
         from .vocab.mapper import collect_terms, map_terms, mapping_summary, write_source_to_concept_map
-        from .vocab.review import export_review
+        from .vocab.review import export_review, import_review
 
         def run() -> list[MappingDecision]:
             spec = self.load_spec()
@@ -174,7 +179,16 @@ class Pipeline:
             for issue in ev.issues:
                 self.log(f"  vocabulary: {issue}")
             terms = collect_terms(self.conn, self.schemas, spec)
-            decisions = map_terms(self.conn, self.schemas, terms, self.llm, self.cfg, self.ws)
+            prior: dict[tuple[str, str], MappingDecision] = {}
+            if not remap and self.ws.decisions_json.exists():
+                prior = {(d.source_vocabulary_id, d.source_code): d for d in import_review(self.ws, self.conn, self.schemas)}
+            freq = {(t.source_vocabulary_id, t.source_code): t.frequency for t in terms}
+            kept = [d.model_copy(update={"frequency": freq[k]}) for k, d in prior.items() if k in freq]
+            new_terms = [t for t in terms if (t.source_vocabulary_id, t.source_code) not in prior]
+            if kept:
+                self.log(f"  kept {len(kept)} earlier/reviewed decisions; mapping {len(new_terms)} new terms")
+            decisions = kept + (map_terms(self.conn, self.schemas, new_terms, self.llm, self.cfg, self.ws) if new_terms else [])
+            decisions.sort(key=lambda d: (d.source_vocabulary_id, -d.frequency, d.source_code))
             export_review(self.ws, decisions)
             n = write_source_to_concept_map(
                 self.conn, self.schemas, decisions, include_unchecked=self.cfg.mapping.use_unchecked_in_etl

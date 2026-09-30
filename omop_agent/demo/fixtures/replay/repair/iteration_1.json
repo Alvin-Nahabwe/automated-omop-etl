@@ -1,0 +1,34 @@
+{
+  "kind": "agent",
+  "tool_calls": [
+    {
+      "name": "get_table_mapping",
+      "input": {
+        "target_table": "visit_occurrence"
+      }
+    },
+    {
+      "name": "run_aggregate_query",
+      "input": {
+        "sql": "SELECT v.visit_type, (v.discharge_date IS NULL) AS no_discharge_date, COUNT(*) AS n FROM {src}.clinic_visits v GROUP BY 1, 2 ORDER BY 1, 2"
+      }
+    },
+    {
+      "name": "get_cdm_table",
+      "input": {
+        "table": "visit_occurrence"
+      }
+    },
+    {
+      "name": "update_field_mapping",
+      "input": {
+        "target_table": "visit_occurrence",
+        "target_field": "visit_end_date",
+        "kind": "expression",
+        "expression": "COALESCE(v.discharge_date::date, v.visit_date::date)",
+        "rationale": "discharge_date is only recorded for inpatient (IPD) stays; outpatient and emergency visits end on the day they start, which is the OHDSI convention when no end date is known."
+      }
+    }
+  ],
+  "final_text": "The visit_occurrence insert failed because visit_end_date is required but clinic_visits.discharge_date is empty for every OPD and EMERG visit (only IPD stays have one). I changed visit_end_date to COALESCE(v.discharge_date::date, v.visit_date::date), so single-day visits end on their start date. No data-quality results were available yet because the build stopped at this error."
+}

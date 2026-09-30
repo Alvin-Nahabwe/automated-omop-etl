@@ -29,6 +29,7 @@ from omop_agent.report.inspection import (
     build_report,
     characterize_cdm,
     collect_report_data,
+    fmt_pct,
     md_escape,
     small_cell,
 )
@@ -227,11 +228,14 @@ def full_ws(tmp_path: Path) -> tuple[ProjectConfig, Workspace]:
     )
     for stage in ("profile", "annotate", "design", "vocab_map", "build", "quality"):
         ws.mark(stage, "done")
-    ws.audit("human_approval", stage="design", approved=True, artifacts=["etl_spec.yaml"])
-    usage = {"input_tokens": 1000, "output_tokens": 200, "cache_read_input_tokens": 500, "cache_creation_input_tokens": 0}
-    ws.audit("llm_call", stage="annotate", key="profile", provider="anthropic", model="claude-opus-5-5", seconds=2.5, usage=usage, error=None)
-    ws.audit("llm_call", stage="design", key="person", provider="anthropic", model="claude-opus-5-5", seconds=4.0, usage=usage, error=None)
-    ws.audit("llm_call", stage="design", key="drug", provider="anthropic", model="claude-opus-5-5", seconds=1.0, usage={}, error="overloaded")
+    ws.audit("human_approval", stage="design", approved=True, artifacts=[str(ws.spec_md), str(ws.spec_yaml)])
+    ws.audit("repair", iteration=1, actions=1, trigger="isRequired.person.gender_concept_id", summary="Mapped sex 9.")
+    ws.audit("repair_skipped", iteration=2, reason="no recording for repair/iteration:2", trigger="etl:measurement")
+    usage = {"input_tokens": 1000, "output_tokens": 200, "cache_read_input_tokens": 500}
+    call = {"provider": "anthropic", "model": "claude-opus-5-5"}
+    ws.audit("llm_call", stage="annotate", key="profile", seconds=2.5, usage=usage, error=None, **call)
+    ws.audit("llm_call", stage="design", key="person", seconds=4.0, usage=usage, error=None, **call)
+    ws.audit("llm_call", stage="design", key="drug", seconds=1.0, usage={}, error="overloaded", **call)
     return cfg, ws
 
 
@@ -285,6 +289,12 @@ def test_verdict(full_ws):
     assert collect_report_data(cfg, ws)["verdict"] == "FAILED"
     ws.mark("build", "done")
 
+    # a stage waiting at a review gate means the results may be stale
+    ws.mark("design", "awaiting_review")
+    data = collect_report_data(cfg, ws)
+    assert data["verdict"] == "INCOMPLETE" and data["verdict_reasons"] == ["stage 'design' is awaiting_review"]
+    ws.mark("design", "done")
+
     # checks older than the latest ETL run do not count
     run = ws.load_json(ws.etl_run_json, ETLRunResult)
     ws.save_json(ws.etl_run_json, run.model_copy(update={"started_at": T0 + timedelta(hours=1)}))
@@ -331,6 +341,7 @@ def test_sections_content(full_ws):
 
     repairs = data["repairs"]
     assert repairs["n_actions"] == 1 and repairs["iterations"][0]["actions"][0]["target"] == "person.gender_concept_id"
+    assert [(e["iteration"], e["outcome"]) for e in repairs["events"]] == [(1, "done"), (2, "skipped")]
 
     llm = data["llm"]
     assert llm["totals"]["calls"] == 3 and llm["totals"]["input_tokens"] == 2000
@@ -342,6 +353,7 @@ def test_sections_content(full_ws):
     assert next(s for s in timeline["stages"] if s["stage"] == "build")["status"] == "done"
     assert next(s for s in timeline["stages"] if s["stage"] == "report")["status"] == "not run"
     assert timeline["approvals"][0]["decision"] == "approved"
+    assert timeline["approvals"][0]["details"] == 'artifacts=["etl_spec.md", "etl_spec.yaml"]'
 
     steps = {s["text"].split(" ")[0]: s["done"] for s in data["next_steps"]}
     assert steps["Review"] is False and steps["Register"] is False
@@ -371,6 +383,12 @@ def test_unreadable_artifacts_are_reported_not_fatal(tmp_path):
     assert data["llm"]["totals"]["input_tokens"] == 5
     md, html = (p.read_text() for p in build_report(cfg, ws))
     assert "Unreadable artifacts" in md and "Unreadable artifacts" in html
+
+
+def test_fmt_pct_never_rounds_to_the_bounds():
+    assert (fmt_pct(None), fmt_pct(0), fmt_pct(100.0), fmt_pct(42.04)) == ("—", "0.0%", "100.0%", "42.0%")
+    assert fmt_pct(99.97) == ">99.9%" and fmt_pct(0.01) == "<0.1%"
+    assert fmt_pct(99.999, 2) == ">99.99%"
 
 
 def test_small_cell():
@@ -451,8 +469,14 @@ def test_characterize_cdm_withholds_small_distributions(pg):
     create_cdm_tables(conn, schemas, include_vocab=False)
     cdm = qi(schemas.cdm)
     for pid in (1, 2):
-        execute(conn, f"INSERT INTO {cdm}.observation_period VALUES (%s, %s, DATE '2020-01-01', DATE '2021-01-01', 32817)", (pid, pid))
+        execute(
+            conn,
+            f"INSERT INTO {cdm}.observation_period VALUES (%s, %s, DATE '2020-01-01', DATE '2021-01-01', 32817)",
+            (pid, pid),
+        )
     out = characterize_cdm(conn, schemas, min_cell_count=5)
-    assert out["record_counts"] == [{"table": "observation_period", "count": None, "display": "<5", "suppressed": True, "bar": 0.0}]
+    assert out["record_counts"] == [
+        {"table": "observation_period", "count": None, "display": "<5", "suppressed": True, "bar": 0.0}
+    ]
     assert out["observation_period"]["suppressed"] and out["observation_period"]["median_days"] is None
     assert out["gender"] == [] and out["vocabulary_version"] is None

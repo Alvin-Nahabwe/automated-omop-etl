@@ -62,7 +62,9 @@ OK_STATUSES = {"done", "passed", "ok", "success", "succeeded", "complete", "comp
 SEVERITIES = ["fatal", "convention", "characterization"]
 KAHN_CATEGORIES = ["Conformance", "Completeness", "Plausibility"]
 CHECK_STATUSES = ["passed", "failed", "error", "not_applicable"]
-FIELD_KINDS = ["person_id", "visit_id", "auto_id", "column", "expression", "constant", "vocab_code", "concept_map", "null"]
+FIELD_KINDS = [
+    "person_id", "visit_id", "auto_id", "column", "expression", "constant", "vocab_code", "concept_map", "null"
+]
 MAX_REVIEW_ROWS = 100
 MAX_UNMATCHED_SHOWN = 5
 
@@ -280,16 +282,14 @@ def _verdict(
             failures.append(f"stage '{name}' failed" + (f": {_short(info['error'], 160)}" if info.get("error") else ""))
     if failures:
         return FAILED, failures
-    if dq is None:
-        reasons = ["data-quality checks have not run"]
-        if etl_run is None:
-            reasons.insert(0, "the ETL has not run")
-        return INCOMPLETE, reasons
     unfinished = [
         f"stage '{n}' is {i.get('status')}"
         for n, i in stages.items()
         if n != "report" and str(i.get("status", "")).lower() in UNFINISHED_STATUSES
     ]
+    if dq is None:
+        reasons = (["the ETL has not run"] if etl_run is None else []) + ["data-quality checks have not run"]
+        return INCOMPLETE, reasons + unfinished
     if unfinished:
         return INCOMPLETE, unfinished
     dq_at, etl_at = _as_utc(dq.run_at), _as_utc(etl_run.started_at) if etl_run else None
@@ -323,9 +323,8 @@ def _timeline(stages: dict[str, dict[str, Any]], audit: list[dict[str, Any]], ro
             rows.append({"stage": name, "status": "not run", "at": "", "details": ""})
             continue
         rest = {k: v for k, v in info.items() if k not in ("status", "at")}
-        rows.append(
-            {"stage": name, "status": str(info.get("status", "unknown")), "at": fmt_dt(info.get("at")), "details": _kv(rest)}
-        )
+        status = str(info.get("status", "unknown"))
+        rows.append({"stage": name, "status": status, "at": fmt_dt(info.get("at")), "details": _kv(rest)})
     approvals = []
     for e in audit:
         if e.get("event") != "human_approval":
@@ -420,7 +419,11 @@ def _vocab_section(ev: dict[str, Any], min_cell_count: int) -> dict[str, Any]:
         for v in _dicts(ev.get("loaded"))
     ]
     required = [
-        {"vocabulary_id": str(r.get("vocabulary_id") or ""), "reason": str(r.get("reason") or ""), "present": bool(r.get("present"))}
+        {
+            "vocabulary_id": str(r.get("vocabulary_id") or ""),
+            "reason": str(r.get("reason") or ""),
+            "present": bool(r.get("present")),
+        }
         for r in _dicts(ev.get("required"))
     ]
     coverage = []
@@ -491,7 +494,9 @@ def _mapping_section(decisions: list[MappingDecision], cfg: ProjectConfig) -> di
             "code": d.source_code,
             "name": d.source_name,
             "frequency": small_cell(d.frequency, mcc)["display"],
-            "concept": f"{d.target_concept_id} {d.target_concept_name or ''}".strip() if d.target_concept_id else "none (0)",
+            "concept": (
+                f"{d.target_concept_id} {d.target_concept_name or ''}".strip() if d.target_concept_id else "none (0)"
+            ),
             "equivalence": d.equivalence,
             "confidence": f"{d.confidence:.2f}",
             "method": d.method,
@@ -812,12 +817,22 @@ def characterize_cdm(conn: psycopg.Connection, schemas: Schemas, min_cell_count:
                 f"LEFT JOIN {vocab}.concept c ON c.concept_id = t.{qi(field)} GROUP BY 1, 2 ORDER BY n DESC, 1"
             )
         else:
-            sql = f"SELECT {qi(field)} AS concept_id, NULL AS concept_name, COUNT(*) AS n FROM {cdm}.{qi(table)} GROUP BY 1 ORDER BY n DESC, 1"
+            sql = (
+                f"SELECT {qi(field)} AS concept_id, NULL AS concept_name, COUNT(*) AS n FROM {cdm}.{qi(table)} "
+                "GROUP BY 1 ORDER BY n DESC, 1"
+            )
         if limit:
             sql += f" LIMIT {int(limit)}"
         rows = q(what, sql) or []
         return _add_bars(
-            [{"concept_id": r["concept_id"], "concept_name": _concept_label(r["concept_id"], r["concept_name"]), **cell(r["n"])} for r in rows]
+            [
+                {
+                    "concept_id": r["concept_id"],
+                    "concept_name": _concept_label(r["concept_id"], r["concept_name"]),
+                    **cell(r["n"]),
+                }
+                for r in rows
+            ]
         )
 
     # record counts, in load order
@@ -839,10 +854,14 @@ def characterize_cdm(conn: psycopg.Connection, schemas: Schemas, min_cell_count:
         gender = by_concept("persons by gender", "person", "gender_concept_id")
         rows = q(
             "year of birth",
-            f"SELECT (year_of_birth / 10) * 10 AS decade, COUNT(*) AS n FROM {cdm}.person GROUP BY 1 ORDER BY 1 NULLS LAST",
+            f"SELECT (year_of_birth / 10) * 10 AS decade, COUNT(*) AS n FROM {cdm}.person "
+            "GROUP BY 1 ORDER BY 1 NULLS LAST",
         )
         decades = _add_bars(
-            [{"decade": f"{r['decade']}s" if r["decade"] is not None else "unknown", **cell(r["n"])} for r in rows or []]
+            [
+                {"decade": f"{r['decade']}s" if r["decade"] is not None else "unknown", **cell(r["n"])}
+                for r in rows or []
+            ]
         )
 
     obs: dict[str, Any] | None = None
@@ -876,13 +895,16 @@ def characterize_cdm(conn: psycopg.Connection, schemas: Schemas, min_cell_count:
 
     vocab_version = None
     if (schemas.vocab, "vocabulary") in existing:
-        rows = q("vocabulary version", f"SELECT vocabulary_version FROM {vocab}.vocabulary WHERE vocabulary_id = 'None'")
+        rows = q(
+            "vocabulary version", f"SELECT vocabulary_version FROM {vocab}.vocabulary WHERE vocabulary_id = 'None'"
+        )
         vocab_version = rows[0]["vocabulary_version"] if rows else None
     cdm_source = None
     if counts.get("cdm_source"):
         rows = q(
             "cdm_source",
-            f"SELECT cdm_source_name, cdm_holder, cdm_version, vocabulary_version, cdm_release_date FROM {cdm}.cdm_source LIMIT 1",
+            "SELECT cdm_source_name, cdm_holder, cdm_version, vocabulary_version, cdm_release_date "
+            f"FROM {cdm}.cdm_source LIMIT 1",
         )
         cdm_source = {k: ("" if v is None else str(v)) for k, v in rows[0].items()} if rows else None
 

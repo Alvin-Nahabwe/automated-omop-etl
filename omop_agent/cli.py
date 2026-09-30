@@ -161,11 +161,14 @@ def design(config: Path = ConfigOpt) -> None:
 
 
 @app.command("map")
-def map_codes(config: Path = ConfigOpt) -> None:
+def map_codes(
+    config: Path = ConfigOpt,
+    remap: bool = typer.Option(False, help="Map every term again instead of keeping earlier/reviewed decisions."),
+) -> None:
     """Evaluate the vocabulary and map source codes (mappings/*.csv)."""
     p = _pipeline(config)
     try:
-        p.map_vocabulary()
+        p.map_vocabulary(remap=remap)
     finally:
         p.close()
 

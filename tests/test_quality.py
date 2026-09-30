@@ -25,7 +25,7 @@ from omop_agent.models import (
 )
 from omop_agent.quality import dqd_r
 from omop_agent.quality.checks import etl_checks, gate, run_builtin_checks, translate_sqlrender
-from omop_agent.quality.repair import RepairState, build_repair_tools, repair_spec, repair_triggers
+from omop_agent.quality.repair import RepairState, build_repair_tools, redact_error, repair_spec, repair_triggers
 from omop_agent.workspace import Workspace
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -127,6 +127,20 @@ def test_etl_checks_and_gate(tmp_path):
     passed, blocking = gate(results[:4], cfg, etl)
     assert not passed and blocking == ["etlStepError.drug_exposure (step 07_drug_exposure): boom"]
     assert gate(results[:4], cfg) == (True, [])
+
+
+def test_redact_error():
+    msg = redact_error(NOT_NULL_ERROR + " DETAIL: Failing row contains (1, 2, 9202, 2019-04-22, null).", "INSERT ...")
+    assert msg == NOT_NULL_ERROR + " DETAIL: (withheld: may contain record values)"
+    assert redact_error('invalid input syntax for type date: "31/02/1990"', "SELECT d.dob::date") == (
+        'invalid input syntax for type date: "<value withheld>"'
+    )
+    assert redact_error('column "dx_code" does not exist', "SELECT d.dx_code") == 'column "dx_code" does not exist'
+    assert redact_error('duplicate key value violates unique constraint "xpk_person" DETAIL: Key (person_id)=(42) '
+                        "already exists. HINT: h") == (
+        'duplicate key value violates unique constraint "xpk_person" DETAIL: (withheld: may contain record values) HINT: h'
+    )
+    assert redact_error("date field value out of range: 1800-13-01") == "date field value out of range: <value withheld>"
 
 
 def test_repair_triggers(tmp_path):
@@ -406,6 +420,9 @@ def test_run_aggregate_query(repair_env):
     assert "SELECT *" in q({"sql": "SELECT *, 100 AS n FROM {src}.individuals"})
     assert "string_agg" in q({"sql": "SELECT string_agg(sex, ',') AS s, 100 AS n FROM {src}.individuals"})
     assert q({"sql": "SELECT no_such_column, COUNT(*) AS n FROM {src}.individuals GROUP BY 1"}).startswith("ERROR: column")
+    # values quoted in error messages are withheld
+    out = q({"sql": "SELECT individual_id::int AS x, COUNT(*) AS n FROM {src}.individuals GROUP BY 1"})
+    assert out.startswith("ERROR: invalid input syntax") and "<value withheld>" in out and "KH0" not in out
     # data-modifying CTEs pass the text checks but fail in the read-only transaction
     out = q({"sql": "WITH d AS (DELETE FROM {src}.individuals RETURNING 1) SELECT COUNT(*) AS n FROM d"})
     assert out.startswith("ERROR:") and "read-only" in out
@@ -518,7 +535,8 @@ def test_repair_spec_replay(staged, tmp_path):
     ws.save_yaml(ws.spec_yaml, spec)
     etl = ETLRunResult(started_at=NOW, steps=[
         TableLoadResult(target_table="person", step="03_person", rows_inserted=400, source_rows=400),
-        TableLoadResult(target_table="visit_occurrence", step="05_visit_occurrence", error=NOT_NULL_ERROR,
+        TableLoadResult(target_table="visit_occurrence", step="05_visit_occurrence",
+                        error=NOT_NULL_ERROR + " DETAIL: Failing row contains (1, 2, 9202, 2019-04-22, null).",
                         sql="INSERT INTO cdm.visit_occurrence ...", source_rows=900),
     ])
     llm = ReplayLLM(replay_dir, ws)
@@ -535,6 +553,7 @@ def test_repair_spec_replay(staged, tmp_path):
 
     (call,) = [json.loads(p.read_text()) for p in (ws.root / "llm_calls").glob("*repair*.json")]
     assert NOT_NULL_ERROR in call["prompt"] and "INSERT INTO cdm.visit_occurrence" in call["prompt"]
+    assert "Failing row" not in call["prompt"] and "2019-04-22" not in call["prompt"]  # no record values
     assert "visit_occurrence (mapping_index 0) <- {src}.clinic_visits v" in call["prompt"]
     results = [c["result"] for c in call["tool_calls"]]
     assert "INSERT INTO" in results[0] and "OPD" in results[1] and results[2].startswith("OK:")
