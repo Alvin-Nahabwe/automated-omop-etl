@@ -138,3 +138,20 @@ def test_staging_refuses_the_cdm_and_vocabulary_schemas(pg, tmp_path, role):
     with pytest.raises(SourceDataError):
         stage_csv(cfg, conn, clash)
     assert scalar(conn, f"SELECT person_id FROM {qi(other)}.person") == 1  # not dropped
+
+
+def test_reload_when_the_bundle_adds_vocabularies(staged, tmp_path):
+    """Same Athena release, more vocabularies: must reload, not skip."""
+    import shutil
+
+    from omop_agent.demo import FIXTURE_VOCAB
+    from omop_agent.vocab.loader import load_athena
+
+    conn, schemas, cfg = staged
+    assert load_athena(conn, schemas, FIXTURE_VOCAB) == {}  # identical bundle: skipped
+    bigger = tmp_path / "vocab"
+    shutil.copytree(FIXTURE_VOCAB, bigger)
+    with (bigger / "VOCABULARY.csv").open("a") as fh:
+        fh.write("RxNorm Extension\tRxNorm Extension (synthetic fixture)\tomop-agent demo fixture\tfixture-2026-09\t2000009999\n")
+    counts = load_athena(conn, schemas, bigger)
+    assert counts["vocabulary"] == 10

@@ -74,6 +74,16 @@ def vocabulary_version(conn: psycopg.Connection, schemas: Schemas) -> str | None
         return None
 
 
+def loaded_vocabularies(conn: psycopg.Connection, schemas: Schemas) -> set[tuple[str, str]]:
+    """(vocabulary_id, vocabulary_version) of every vocabulary currently loaded."""
+    try:
+        with conn.transaction():
+            rows = fetch_all(conn, f"SELECT vocabulary_id, vocabulary_version FROM {qi(schemas.vocab)}.vocabulary")
+    except psycopg.Error:
+        return set()
+    return {(r["vocabulary_id"], r["vocabulary_version"] or "") for r in rows}
+
+
 def vocab_loaded(conn: psycopg.Connection, schemas: Schemas) -> bool:
     try:
         with conn.transaction():
@@ -91,8 +101,10 @@ def load_athena(
 ) -> dict[str, int]:
     """Load the Athena CSVs found in ``athena_dir``. Returns rows loaded per table.
 
-    Skips loading when a vocabulary with the same version string is already present,
-    unless ``force`` is set.
+    Skips loading only when the loaded vocabularies are exactly the ones in the download (same
+    vocabulary ids and versions), unless ``force`` is set. Comparing the release version alone
+    is not enough: a second bundle from the same Athena release that adds, say, ICD10 or
+    RxNorm Extension has the same release version.
     """
     athena_dir = Path(athena_dir)
     if not _find(athena_dir, "CONCEPT.csv"):
@@ -100,15 +112,18 @@ def load_athena(
     create_cdm_tables(conn, schemas, include_vocab=True)
 
     new_version = None
+    bundle: set[tuple[str, str]] = set()
     vfile = _find(athena_dir, "VOCABULARY.csv")
     if vfile:
         for line in vfile.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
             parts = line.split("\t")
+            if parts and parts[0]:
+                bundle.add((parts[0], parts[3] if len(parts) > 3 else ""))
             if parts and parts[0] == "None" and len(parts) > 3:
                 new_version = parts[3]
-    if not force and new_version and vocabulary_version(conn, schemas) == new_version and vocab_loaded(conn, schemas):
+    if not force and bundle and vocab_loaded(conn, schemas) and loaded_vocabularies(conn, schemas) == bundle:
         if ws:
-            ws.audit("vocab_load_skipped", version=new_version)
+            ws.audit("vocab_load_skipped", version=new_version, vocabularies=len(bundle))
         return {}
 
     counts: dict[str, int] = {}
