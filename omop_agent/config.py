@@ -63,6 +63,19 @@ class TargetConfig(_Base):
     staging_schema: str = Field("src", description="Raw copy of the source tables.")
     etl_schema: str = Field("etl", description="Working tables: id maps, source_to_concept_map.")
     results_schema: str = "results"
+    etl_role: str | None = Field(
+        None,
+        description="Optional least-privilege role for running the generated ETL SQL (SET LOCAL ROLE): "
+        "SELECT on the staging/vocabulary schemas, INSERT/TRUNCATE on the CDM and ETL schemas.",
+    )
+
+    @model_validator(mode="after")
+    def _distinct_schemas(self) -> "TargetConfig":
+        if len({self.cdm_schema, self.staging_schema, self.etl_schema}) < 3:
+            raise ValueError("target.cdm_schema, staging_schema and etl_schema must be different schemas")
+        if self.staging_schema in {self.vocab_schema, self.results_schema}:
+            raise ValueError("target.staging_schema must not be the vocabulary or results schema")
+        return self
 
 
 class VocabularyConfig(_Base):
@@ -78,6 +91,7 @@ class LLMConfig(_Base):
     replay_dir: Path | None = Field(None, description="Recorded responses used when provider=replay.")
     record_dir: Path | None = Field(None, description="If set, every live response is saved here for replay.")
     max_agent_iterations: int = 25
+    agent_max_tokens: int = Field(16000, description="max_tokens per turn of the repair agent (non-streaming).")
     base_url: str | None = Field(None, description="Override the API endpoint (default: the SDK's).")
     api_key_env: list[str] = Field(
         default_factory=lambda: ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
@@ -95,12 +109,15 @@ class PrivacyConfig(_Base):
     pii_columns: list[str] = Field(default_factory=list, description="Extra 'table.column' entries to treat as PII.")
     pii_name_patterns: list[str] = Field(
         default_factory=lambda: [
-            r"(^|_)(first|last|middle|given|family|sur|full|maiden)_?name",
-            r"^name$",
-            r"phone|mobile|msisdn|email|e_mail",
-            r"national_?id|passport|nhif|ssn|id_?number|id_?no$",
-            r"address|street|gps|latitude|longitude|lat$|lon$|lng$",
-            r"next_?of_?kin|guardian_?name|mother_?name|father_?name",
+            r"(^|_)(first|last|middle|given|family|sur|full|maiden|patient|client|person|individual|member|"
+            r"mother|mothers|father|fathers|guardian|kin|spouse|child)_?names?($|_)",
+            r"^names?$|(^|_)name_of_",
+            r"(^|_)(phone|telephone|tel|mobile|msisdn|cell|cellphone|contact|contact_?(no|number))($|_)",
+            r"e_?mail",
+            r"(^|_)(national_?id|passport|nhif|ssn|nin|mrn|id_?(no|num|number)|hospital_?(no|num|number)|"
+            r"record_?(no|num|number)|file_?(no|num|number))($|_)",
+            r"address|street|(^|_)gps|latitude|longitude|(^|_)(lat|lon|lng)($|_)",
+            r"next_?of_?kin",
         ]
     )
 

@@ -100,6 +100,22 @@ def test_remap_keeps_review_edits(demo_project):
 
 
 @pytest.mark.postgres
+def test_rerun_keeps_edited_spec_and_redesign_backs_it_up(demo_project):
+    cfg = load_config(demo_project)
+    Pipeline(cfg, log=lambda m: None).run_all()
+    spec_path = cfg.workdir / "etl_spec.yaml"
+    spec_path.write_text(spec_path.read_text() + "\n# reviewer note\n")
+    llm_calls = len(list((cfg.workdir / "llm_calls").glob("*.json")))
+    report = Pipeline(cfg, log=lambda m: None).run_all()
+    assert report.passed
+    assert "# reviewer note" in spec_path.read_text()  # not redrafted
+    new_calls = sorted((cfg.workdir / "llm_calls").glob("*.json"))[llm_calls:]
+    assert not [p for p in new_calls if "design" in p.name or "annotate" in p.name or "vocab_map" in p.name]
+    Pipeline(cfg, log=lambda m: None).run_all(redesign=True)
+    assert "# reviewer note" in (cfg.workdir / "etl_spec.1.yaml").read_text()
+
+
+@pytest.mark.postgres
 def test_review_gate_stops(demo_project):
     cfg = load_config(demo_project)
     p = Pipeline(cfg, approver=lambda stage, msg, paths: stage != "design", log=lambda m: None)
@@ -109,8 +125,40 @@ def test_review_gate_stops(demo_project):
     assert any(e["event"] == "human_approval" and not e["approved"] for e in p.ws.read_audit())
 
 
-def test_cli_init(tmp_path):
-    result = CliRunner().invoke(app, ["init", str(tmp_path), "--name", "kenya-hdss"])
+def test_cli_init(tmp_path, monkeypatch):
+    monkeypatch.delenv("PGUSER", raising=False)
+    monkeypatch.delenv("PGPASSWORD", raising=False)
+    result = CliRunner().invoke(app, ["init", str(tmp_path), "--name", "APHRC: Nairobi HDSS", "--source-type", "CSV"])
     assert result.exit_code == 0, result.output
-    text = (tmp_path / "omop_agent.yaml").read_text()
-    assert "claude-opus-5-5" in text and "min_cell_count: 5" in text
+    cfg = load_config(tmp_path / "omop_agent.yaml")
+    assert cfg.name == "APHRC: Nairobi HDSS" and cfg.source.type == "csv"
+    assert cfg.target.url == "postgresql://postgres:@localhost:5432/omop"
+    assert cfg.llm.model == "claude-opus-5-5" and cfg.privacy.min_cell_count == 5
+    bad = CliRunner().invoke(app, ["init", str(tmp_path / "x"), "--source-type", "excel"])
+    assert bad.exit_code != 0
+
+
+@pytest.mark.postgres
+def test_harmful_repair_is_reverted(demo_project, tmp_path):
+    import shutil
+
+    from omop_agent.demo import FIXTURE_REPLAY
+
+    replay = tmp_path / "replay"
+    shutil.copytree(FIXTURE_REPLAY, replay)
+    it3 = replay / "repair" / "iteration_3.json"
+    data = json.loads(it3.read_text())
+    data["tool_calls"].append({"name": "update_field_mapping", "input": {
+        "target_table": "visit_occurrence", "target_field": "visit_end_date", "kind": "expression",
+        "expression": "v.discharge_date::date", "rationale": "a change that compiles but fails at runtime",
+    }})
+    it3.write_text(json.dumps(data))
+    cfg = load_config(demo_project)
+    cfg.llm.replay_dir = replay
+    report = Pipeline(cfg, log=lambda m: None).run_all()
+    assert report.passed
+    events = [e["event"] for e in json.loads("[" + ",".join((cfg.workdir / "audit.jsonl").read_text().split("\n")[:-1]) + "]")]
+    assert "repair_reverted" in events
+    spec = ETLSpec.model_validate(__import__("yaml").safe_load((cfg.workdir / "etl_spec.yaml").read_text()))
+    end = next(f for f in spec.mapping_for("visit_occurrence").fields if f.target_field == "visit_end_date")
+    assert "COALESCE" in end.expression

@@ -175,3 +175,66 @@ def test_privacy_dates_are_not_phones_and_code_ranges_hide_rare_values():
     view = llm_view(profile, cfg).tables[0].columns[0]
     assert view.min_value is None and view.max_value is None
     assert [v.value for v in view.top_values] == ["1", "2"]
+
+
+class _Stream(_FakeStream):
+    def __init__(self, exc):
+        self.exc = exc
+
+    def get_final_message(self):
+        raise self.exc
+
+
+def test_structured_validation_error_becomes_llm_error(tmp_path):
+    try:
+        Answer.model_validate({"value": "not-a-number"})
+    except Exception as e:  # a real pydantic.ValidationError
+        exc = e
+    client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(stream=lambda **kw: _Stream(exc))))
+    ws = Workspace(tmp_path / "w")
+    llm = AnthropicLLM(LLMConfig(), ws, client=client)  # type: ignore[arg-type]
+    with pytest.raises(LLMError, match="did not validate"):
+        llm.structured(stage="s", key="k", system="", prompt="p", output=Answer)
+    assert ws.read_audit()[-1]["error"]  # the failed call is still logged
+
+
+def test_missing_credentials_become_llm_unavailable():
+    exc = TypeError('"Could not resolve authentication method. Expected either api_key or auth_token to be set."')
+    client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(stream=lambda **kw: _Stream(exc))))
+    llm = AnthropicLLM(LLMConfig(), None, client=client)  # type: ignore[arg-type]
+    with pytest.raises(LLMUnavailable, match="ANTHROPIC_API_KEY"):
+        llm.structured(stage="s", key="k", system="", prompt="p", output=Answer)
+
+
+def _msg(stop_reason, text="", usage=10):
+    content = [SimpleNamespace(type="text", text=text)] if text else []
+    return SimpleNamespace(
+        stop_reason=stop_reason, content=content, stop_details=None,
+        usage=SimpleNamespace(input_tokens=usage, output_tokens=1, cache_read_input_tokens=0, cache_creation_input_tokens=0),
+    )
+
+
+def test_agent_sums_usage_reports_limit_and_explains_bad_tool_input(tmp_path):
+    seen: dict = {}
+
+    def tool_runner(**kwargs):
+        seen.update(kwargs)
+        tool = kwargs["tools"][0]
+        # the model sends an invalid argument; the tool must answer with details, not raise
+        seen["bad"] = tool.call({"value": "oops"})
+        seen["good"] = tool.call({"value": 4})
+        return iter([_msg("tool_use"), _msg("tool_use"), _msg("tool_use", "still working")])
+
+    client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(tool_runner=tool_runner)))
+    ws = Workspace(tmp_path / "w")
+    llm = AnthropicLLM(LLMConfig(agent_max_tokens=20000), ws, client=client)  # type: ignore[arg-type]
+    tool = AgentTool("double", "double a value", Answer, lambda a: str(a.value * 2))
+    res = llm.run_agent(stage="repair", key="iteration:1", system="s", prompt="p", tools=[tool], max_iterations=3)
+    assert seen["max_tokens"] == 20000
+    assert seen["bad"].startswith("REJECTED: invalid arguments") and "value" in seen["bad"]
+    assert seen["good"] == "8"
+    assert "iteration limit of 3 reached" in res.final_text
+    record = json.loads(sorted((ws.root / "llm_calls").glob("*.json"))[0].read_text())
+    assert record["usage"]["input_tokens"] == 30  # summed over the three turns
+    assert len(record["transcript"]) == 3 and len(record["tool_calls"]) == 2
+    assert any(e["event"] == "agent_iteration_limit" for e in ws.read_audit())

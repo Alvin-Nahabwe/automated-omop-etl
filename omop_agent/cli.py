@@ -44,32 +44,47 @@ def init(
     name: str = typer.Option("my-omop-project", help="Project name."),
     source_type: str = typer.Option("csv", help="csv or database."),
     source: str = typer.Option("./data", help="CSV directory, or SQLAlchemy URL for a database source."),
-    db_url: str = typer.Option("postgresql://${PGUSER}:${PGPASSWORD}@localhost:5432/omop", help="Target PostgreSQL URL."),
+    db_url: str = typer.Option(
+        "postgresql://${PGUSER:-postgres}:${PGPASSWORD:-}@localhost:5432/omop",
+        help="Target PostgreSQL URL (${VAR} / ${VAR:-default} are read from the environment).",
+    ),
     athena_dir: str = typer.Option("./vocab", help="Unzipped Athena vocabulary download."),
 ) -> None:
     """Write a starter omop_agent.yaml."""
+    source_type = source_type.strip().lower()
+    if source_type not in {"csv", "database"}:
+        raise typer.BadParameter("--source-type must be 'csv' or 'database'")
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "omop_agent.yaml"
     if path.exists():
         raise typer.BadParameter(f"{path} already exists")
-    src = f"  type: csv\n  path: {source}\n" if source_type == "csv" else f"  type: database\n  url: {source}\n  schema: public\n"
+
+    def q(value: str) -> str:  # a YAML-safe (JSON) double-quoted scalar
+        return json.dumps(value, ensure_ascii=False)
+
+    src = (
+        f"  type: csv\n  path: {q(source)}\n"
+        if source_type == "csv"
+        else f"  type: database\n  url: {q(source)}\n  schema: public\n"
+    )
     path.write_text(
         f"""# omop-agent project configuration. ${{VAR}} and ${{VAR:-default}} are read from the environment.
-name: {name}
+name: {q(name)}
 workdir: ./work
 
 source:
 {src}
 target:
-  url: {db_url}
+  url: {q(db_url)}
   cdm_schema: cdm
   vocab_schema: cdm
   staging_schema: src
   etl_schema: etl
   results_schema: results
+  # etl_role: omop_etl        # optional least-privilege role for running the generated SQL
 
 vocabulary:
-  athena_dir: {athena_dir}
+  athena_dir: {q(athena_dir)}
 
 llm:
   provider: anthropic          # anthropic | replay | none
@@ -92,12 +107,13 @@ quality:
   use_r_dqd: false             # also run the official Achilles + DataQualityDashboard (needs R)
 
 cdm_source:
-  cdm_source_name: {name}
-  cdm_source_abbreviation: {name[:25]}
+  cdm_source_name: {q(name)}
+  cdm_source_abbreviation: {q(name[:25])}
   cdm_holder: ""
   source_description: ""
 """
     )
+    load_config(path)  # fail now, not on the first command, if the file is not valid
     console.print(f"Wrote {path}")
 
 
@@ -105,14 +121,19 @@ cdm_source:
 def run(
     config: Path = ConfigOpt,
     yes: bool = typer.Option(False, "--yes", "-y", help="Don't stop at review gates."),
-    skip_staging: bool = typer.Option(False, help="Reuse the staged source and profile."),
+    fresh: bool = typer.Option(False, help="Start over: re-stage, re-profile, redraft and remap everything."),
+    redesign: bool = typer.Option(False, help="Redraft the ETL spec (the current one is backed up)."),
+    remap: bool = typer.Option(False, help="Map every source code again instead of keeping reviewed decisions."),
 ) -> None:
-    """Run the whole pipeline (stops for review after design and mapping unless --yes)."""
+    """Run the whole pipeline (stops for review after design and mapping unless --yes).
+
+    Re-running resumes: existing artifacts, including a hand-edited etl_spec.yaml and reviewed
+    mappings, are kept unless --fresh / --redesign / --remap say otherwise."""
     from .pipeline import PipelineStopped
 
     p = _pipeline(config, yes)
     try:
-        report = p.run_all(skip_staging=skip_staging)
+        report = p.run_all(fresh=fresh, redesign=redesign, remap=remap)
     except PipelineStopped as e:
         console.print(f"[yellow]{e}[/]")
         raise typer.Exit(2)
@@ -256,8 +277,9 @@ def demo(
     console.print(f"Demo project written to {directory} (config {cfg_path})")
     if run_pipeline:
         p = _pipeline(cfg_path, yes=True)
-        report = p.run_all()
+        report = p.run_all(fresh=True)
         console.print(f"\n[bold {'green' if report.passed else 'red'}]{'PASSED' if report.passed else 'FAILED'}[/] -> {p.ws.report_html}")
+        raise typer.Exit(0 if report.passed else 1)
 
 
 @app.command("show-spec")

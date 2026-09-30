@@ -143,23 +143,42 @@ class Pipeline:
 
         self._run_stage("vocab_load", run)
 
-    def design(self) -> ETLSpec:
+    def design(self, redraft: bool = True) -> ETLSpec:
+        """Draft the ETL spec, or (``redraft=False``) keep the existing, possibly hand-edited one.
+
+        Redrafting over an existing spec first backs it up as ``etl_spec.<n>.yaml``.
+        """
         from .design.designer import design_etl
+        from .design.render import render_spec_md
 
-        def run() -> ETLSpec:
-            spec = design_etl(
-                self.load_profile(), self.load_annotations(), self.cfg, self.llm, self.conn, self.schemas, self.ws
-            )
-            self.log(f"  designed {len(spec.table_mappings)} table mappings -> {self.ws.spec_yaml.name}")
-            return spec
+        if not redraft and self.ws.spec_yaml.exists():
+            spec = self.load_spec()  # validates the (possibly hand-edited) YAML
+            self.ws.spec_md.write_text(render_spec_md(spec))
+            self.log(f"▶ design: using the existing {self.ws.spec_yaml.name} (pass --redesign to redraft)")
+            self.ws.audit("design_reused", tables=[m.target_table for m in spec.table_mappings])
+        else:
+            def run() -> ETLSpec:
+                if self.ws.spec_yaml.exists():
+                    n = 1
+                    while (backup := self.ws.root / f"etl_spec.{n}.yaml").exists():
+                        n += 1
+                    backup.write_text(self.ws.spec_yaml.read_text())
+                    self.log(f"  previous spec saved as {backup.name}")
+                    self.ws.audit("spec_backup", path=backup.name)
+                spec = design_etl(
+                    self.load_profile(), self.load_annotations(), self.cfg, self.llm, self.conn, self.schemas, self.ws
+                )
+                self.log(f"  designed {len(spec.table_mappings)} table mappings -> {self.ws.spec_yaml.name}")
+                return spec
 
-        spec = self._run_stage("design", run)
+            spec = self._run_stage("design", run)  # type: ignore[assignment]
         self._gate(
             "design",
             "Review the ETL design (etl_spec.md). Edit etl_spec.yaml to change it.",
             [str(self.ws.spec_md), str(self.ws.spec_yaml)],
         )
-        return spec  # type: ignore[return-value]
+        self.ws.mark("design", "done")
+        return spec
 
     def map_vocabulary(self, remap: bool = False) -> list[MappingDecision]:
         """Evaluate the vocabulary and map source codes.
@@ -268,21 +287,35 @@ class Pipeline:
         return self._run_stage("quality", run)  # type: ignore[return-value]
 
     def build_check_repair(self) -> DQReport:
-        """Build, check, and let the repair agent fix the spec until the gate passes."""
+        """Build, check, and let the repair agent fix the spec until the gate passes.
+
+        A repair iteration that makes the result worse (an ETL error or more failing checks) is
+        rolled back: the last best spec is restored, rebuilt and re-checked.
+        """
         from .quality.repair import repair_spec
 
+        if self.ws.repairs_json.exists():  # repairs.json describes this build session only
+            self.ws.repairs_json.replace(self.ws.root / "repairs.previous.json")
         spec = self.load_spec()
         profile = self.load_profile() if self.ws.profile_json.exists() else None
         max_iter = self.cfg.quality.max_repair_iterations
         iteration = 0
+        best: tuple[tuple, ETLSpec] | None = None
         while True:
             etl = self.build(spec)
-            if etl.ok:
-                report = self.check(spec, etl)
-                if report.passed and not self._repairable(report):
-                    return report
-            else:
-                report = None
+            report = self.check(spec, etl) if etl.ok else None
+            score = self._score(etl, report)
+            if best is not None and score < best[0]:
+                self.log(f"  repair iteration {iteration} made the result worse; restoring the previous spec")
+                self.ws.audit("repair_reverted", iteration=iteration)
+                spec = best[1]
+                self.ws.save_yaml(self.ws.spec_yaml, spec, header=SPEC_HEADER)
+                etl = self.build(spec)
+                return self.check(spec, etl)
+            if best is None or score >= best[0]:
+                best = (score, spec)
+            if report is not None and report.passed and not self._repairable(report):
+                return report
             if iteration >= max_iter:
                 self.log(f"  stopping after {max_iter} repair iterations")
                 return report if report is not None else self.check(spec, etl)
@@ -298,6 +331,14 @@ class Pipeline:
                 self.log("  repair agent made no changes")
                 return report if report is not None else self.check(spec, etl)
 
+    def _score(self, etl: ETLRunResult, report: DQReport | None) -> tuple:
+        """Higher is better: gate passed, fewer ETL errors, fewer blocking and repairable failures."""
+        if report is None:
+            return (False, -len(etl.errors()), -10**9, -10**9)
+        sev = set(self.cfg.quality.repair_severities)
+        repairable = sum((r.failed or bool(r.error)) and r.severity in sev and not r.not_applicable for r in report.results)
+        return (report.passed, -len(etl.errors()), -len(report.blocking_failures), -repairable)
+
     def _repairable(self, report: DQReport) -> bool:
         sev = set(self.cfg.quality.repair_severities)
         return any((r.failed or r.error) and r.severity in sev and not r.not_applicable for r in report.results)
@@ -312,20 +353,30 @@ class Pipeline:
         self._run_stage("report", run)
 
     # ---- everything --------------------------------------------------------------------
-    def run_all(self, skip_staging: bool = False) -> DQReport:
+    def run_all(self, fresh: bool = False, redesign: bool = False, remap: bool = False) -> DQReport:
+        """Run every stage. Existing artifacts are reused unless ``fresh`` is set: the staged
+        source and profile, the annotations, the (possibly hand-edited) ETL spec unless
+        ``redesign``, and earlier or reviewed mapping decisions unless ``remap``."""
         self.ws.audit(
-            "pipeline_start", project=self.cfg.name, llm=self.cfg.llm.provider, model=self.cfg.llm.model
+            "pipeline_start", project=self.cfg.name, llm=self.cfg.llm.provider, model=self.cfg.llm.model,
+            fresh=fresh, redesign=redesign, remap=remap,
         )
         try:
-            if not skip_staging or not self.ws.profile_json.exists():
+            if fresh or not self.ws.profile_json.exists():
                 self.stage_and_profile()
-            self.annotate()
+            else:
+                self.log("▶ profile: reusing the staged source and profile.json")
+            if fresh or not self.ws.annotations_json.exists():
+                self.annotate()
             self.load_vocabulary()
-            self.design()
-            self.map_vocabulary()
+            self.design(redraft=fresh or redesign or not self.ws.spec_yaml.exists())
+            self.map_vocabulary(remap=fresh or remap)
             report = self.build_check_repair()
             self.report()
             self.ws.audit("pipeline_end", passed=report.passed)
             return report
         finally:
             self.close()
+
+
+SPEC_HEADER = "# ETL specification (restored by the repair loop). Edit and re-run `omop-agent build`."

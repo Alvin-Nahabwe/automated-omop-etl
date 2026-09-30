@@ -147,9 +147,12 @@ class FieldMapping(BaseModel):
                    concept itself (for *_source_concept_id fields).
       person_id    expression = the source patient key; resolved to person_id via the person
                    id map. Rows whose key has no person are dropped.
-      visit_id     expression = the source visit key; resolved via the visit id map (NULL when no
-                   match; rows are kept).
-      auto_id      a generated surrogate key (only for the table's own primary key).
+      visit_id     expression = the source visit key; resolved via the visit id map. When the CDM
+                   field is optional the row is kept with NULL; when it is required (the
+                   visit_occurrence primary key) rows without a visit are dropped.
+      auto_id      a generated surrogate key (only for the table's own primary key; never for
+                   person.person_id or visit_occurrence.visit_occurrence_id, which must come from
+                   the id maps so that events link to the right person and visit).
       null         leave the field NULL.
     """
 
@@ -365,7 +368,12 @@ class TableLoadResult(BaseModel):
     target_table: str
     step: str
     rows_inserted: int = 0
-    source_rows: int | None = None
+    source_rows: int | None = Field(None, description="Source rows after the mapping's joins and WHERE.")
+    retained_rows: int | None = Field(
+        None,
+        description="Source rows that survive the person/visit id joins (before vocabulary fan-out); "
+        "source_rows - retained_rows is the number of records dropped.",
+    )
     seconds: float = 0.0
     error: str | None = None
     sql: str | None = None

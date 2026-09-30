@@ -85,9 +85,9 @@ class ReplayLLM(LLMClient):
             else:
                 try:
                     result = tool.invoke(call.get("input", {}))
-                except Exception as e:  # mirror the SDK runner: errors go back as tool results
-                    result = f"Error: {e!r}"
-            calls.append({"name": call["name"], "input": call.get("input", {}), "result": result[:4000]})
+                except Exception as e:  # mirror AnthropicLLM: errors go back to the model as text
+                    result = f"ERROR: {type(e).__name__}: {e}"
+            calls.append({"name": call["name"], "input": call.get("input", {}), "result": result})
         text = data.get("final_text", "")
         self._log_call(
             stage=stage, key=key, kind="agent", system=system, prompt=prompt, response=text,

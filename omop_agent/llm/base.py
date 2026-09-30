@@ -99,6 +99,7 @@ class LLMClient(ABC):
         started: float,
         usage: dict[str, Any] | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
+        transcript: list[dict[str, Any]] | None = None,
         error: str | None = None,
     ) -> None:
         if self.workspace is None:
@@ -116,6 +117,7 @@ class LLMClient(ABC):
             "prompt": prompt,
             "response": response,
             "tool_calls": tool_calls or [],
+            "transcript": transcript or [],
             "usage": usage or {},
             "error": error,
         }

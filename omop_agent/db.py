@@ -42,13 +42,22 @@ def ql(value: Any) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+# PostgreSQL 16 reserved words (pg_get_keywords() categories R and T) plus a few common type
+# names; identifiers matching these are always quoted.
 _RESERVED = {
-    "all", "and", "any", "as", "asc", "both", "case", "cast", "check", "column", "constraint",
-    "create", "default", "desc", "distinct", "do", "else", "end", "except", "false", "for",
-    "foreign", "from", "grant", "group", "having", "in", "into", "is", "join", "leading", "limit",
-    "not", "null", "offset", "on", "only", "or", "order", "primary", "references", "select",
-    "table", "then", "to", "trailing", "true", "union", "unique", "user", "using", "when",
-    "where", "with", "window", "year", "month", "day", "date", "time", "timestamp",
+    "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric", "authorization",
+    "binary", "both", "case", "cast", "check", "collate", "collation", "column", "concurrently",
+    "constraint", "create", "cross", "current_catalog", "current_date", "current_role",
+    "current_schema", "current_time", "current_timestamp", "current_user", "date", "day",
+    "default", "deferrable", "desc", "distinct", "do", "else", "end", "except", "false", "fetch",
+    "for", "foreign", "freeze", "from", "full", "grant", "group", "having", "ilike", "in",
+    "initially", "inner", "intersect", "into", "is", "isnull", "join", "lateral", "leading",
+    "left", "like", "limit", "localtime", "localtimestamp", "month", "name", "natural", "not",
+    "notnull", "null", "offset", "on", "only", "or", "order", "outer", "overlaps", "placing",
+    "position", "primary", "references", "returning", "right", "select", "session_user", "similar",
+    "some", "symmetric", "system_user", "table", "tablesample", "then", "time", "timestamp", "to",
+    "trailing", "true", "type", "union", "unique", "user", "using", "value", "values", "variadic",
+    "verbose", "when", "where", "window", "with", "year",
 }
 
 
