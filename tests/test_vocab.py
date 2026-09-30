@@ -795,3 +795,21 @@ def test_export_review_formats(tmp_path):
         row = next(csv.DictReader(fh))
     assert row["source_code"] == "a,b" and row["confidence"] == "0.12" and row["alternatives"] == "6:six"
     assert import_review(ws) == [d]
+
+
+@pytest.mark.postgres
+def test_fields_reading_the_same_column_do_not_double_count(staged):
+    """Regression from a live run: drug_concept_id and drug_source_concept_id both used
+    concept_map on prescriptions.drug; summing their counts lifted 3-record drug names over the
+    small-cell threshold and sent them to the LLM."""
+    conn, schemas, cfg = staged
+    spec = load_spec()
+    drug = spec.mapping_for("drug_exposure")
+    drug.fields = [f for f in drug.fields if f.target_field != "drug_source_concept_id"] + [
+        FieldMapping(target_field="drug_source_concept_id", kind="concept_map", expression="p.drug",
+                     vocabulary="SRC_DRUG", target_domain="Drug", concept_role="source"),
+    ]
+    single = {t.source_code: t.frequency for t in collect_terms(conn, schemas, load_spec()) if t.source_vocabulary_id == "SRC_DRUG"}
+    double = {t.source_code: t.frequency for t in collect_terms(conn, schemas, spec) if t.source_vocabulary_id == "SRC_DRUG"}
+    assert double == single
+    assert all(n < cfg.privacy.min_cell_count for code, n in double.items() if code in RARE[:2])

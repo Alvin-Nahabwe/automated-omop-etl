@@ -171,7 +171,10 @@ def collect_terms(
 ) -> list[SourceTerm]:
     """Distinct values (with frequencies) of every ``concept_map`` expression in the spec.
 
-    Values of fields that share a source vocabulary are merged and their counts summed.
+    Values of fields that share a source vocabulary are merged. A term's frequency is the
+    largest count from any single read of the source, never a sum: two fields that read the
+    same column (e.g. ``drug_concept_id`` and ``drug_source_concept_id``) would otherwise
+    double-count the same records and lift a rare value over the small-cell threshold.
     Sorted by (source_vocabulary_id, -frequency, code).
 
     A field whose expression reads a direct identifier is skipped, so its values can never
@@ -183,6 +186,7 @@ def collect_terms(
     if skip and ws is not None:
         ws.audit("vocab_pii_fields_skipped", fields=list(skip.values()))
     merged: dict[tuple[str, str], SourceTerm] = {}
+    seen_reads: set[tuple[str, str]] = set()
     for i, tm in enumerate(spec.table_mappings):
         for j, fm in enumerate(tm.fields):
             expr, vocab = (fm.expression or "").strip(), (fm.vocabulary or "").strip()
@@ -192,6 +196,9 @@ def collect_terms(
                 f"SELECT code, COUNT(*) AS n FROM (\nSELECT {paren(expr)}::text AS code\n{source_from_sql(tm)}\n) q\n"
                 "WHERE code IS NOT NULL AND btrim(code) <> '' GROUP BY code"
             )
+            if (vocab, sql) in seen_reads:  # the same records, read again for another field
+                continue
+            seen_reads.add((vocab, sql))
             try:
                 rows = query_rows(conn, schemas.render(sql))
             except psycopg.Error as e:
@@ -202,7 +209,7 @@ def collect_terms(
                 key = (vocab, r["code"])
                 if key in merged:
                     t = merged[key]
-                    t.frequency += int(r["n"])
+                    t.frequency = max(t.frequency, int(r["n"]))
                     t.target_domain = t.target_domain or fm.target_domain
                 else:
                     merged[key] = SourceTerm(
