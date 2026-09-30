@@ -256,7 +256,7 @@ def test_from_events_and_cdm_source_steps():
     assert "32817" in op.sql
     cs = steps[-1]
     assert cs.name.endswith("_cdm_source") and cs.kind == "metadata"
-    assert "vocabulary_id = 'CDM' AND concept_code = 'CDM v5.4'" in cs.sql
+    assert "vocabulary_id = 'CDM' AND concept_code IN ('CDM v5.4.0', 'CDM v5.4')" in cs.sql
     assert "WHERE vocabulary_id = 'None'), 'unknown')" in cs.sql
 
 
