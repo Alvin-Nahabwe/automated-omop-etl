@@ -1,0 +1,354 @@
+{
+  "kind": "structured",
+  "output": {
+    "tables": [
+      {
+        "table": "individuals",
+        "description": "HDSS population register: one row per individual ever registered.",
+        "grain": "one row per individual",
+        "person_key": "individual_id",
+        "candidate_cdm_tables": [
+          "person"
+        ]
+      },
+      {
+        "table": "residency_episodes",
+        "description": "Periods during which each individual was resident in the surveillance area, with entry and exit events.",
+        "grain": "one row per residency episode",
+        "person_key": "individual_id",
+        "candidate_cdm_tables": [
+          "observation_period"
+        ]
+      },
+      {
+        "table": "clinic_visits",
+        "description": "Encounters at linked health facilities.",
+        "grain": "one row per clinic visit",
+        "person_key": "individual_id",
+        "candidate_cdm_tables": [
+          "visit_occurrence",
+          "care_site"
+        ]
+      },
+      {
+        "table": "diagnoses",
+        "description": "Diagnoses recorded at clinic visits, coded in ICD-10.",
+        "grain": "one row per diagnosis per visit",
+        "person_key": "individual_id",
+        "candidate_cdm_tables": [
+          "condition_occurrence"
+        ]
+      },
+      {
+        "table": "prescriptions",
+        "description": "Medicines prescribed at clinic visits, recorded with local product names.",
+        "grain": "one row per prescribed product per visit",
+        "person_key": "individual_id",
+        "candidate_cdm_tables": [
+          "drug_exposure"
+        ]
+      },
+      {
+        "table": "lab_results",
+        "description": "Laboratory results and vital signs recorded at clinic visits with local test codes.",
+        "grain": "one row per test result",
+        "person_key": "individual_id",
+        "candidate_cdm_tables": [
+          "measurement"
+        ]
+      },
+      {
+        "table": "deaths",
+        "description": "Deaths observed by the HDSS with a verbal-autopsy cause category.",
+        "grain": "one row per death",
+        "person_key": "individual_id",
+        "candidate_cdm_tables": [
+          "death"
+        ]
+      }
+    ],
+    "columns": [
+      {
+        "table": "individuals",
+        "column": "individual_id",
+        "semantic_type": "person_identifier",
+        "coding_system": null,
+        "description": "HDSS individual identifier (KH + 6 digits)."
+      },
+      {
+        "table": "individuals",
+        "column": "sex",
+        "semantic_type": "categorical",
+        "coding_system": "local",
+        "description": "Sex coded 1=male, 2=female, 9=unknown (HDSS convention)."
+      },
+      {
+        "table": "individuals",
+        "column": "dob",
+        "semantic_type": "date",
+        "coding_system": null,
+        "description": "Date of birth written day-first (dd/mm/yyyy)."
+      },
+      {
+        "table": "individuals",
+        "column": "village",
+        "semantic_type": "categorical",
+        "coding_system": "local",
+        "description": "Village of residence."
+      },
+      {
+        "table": "individuals",
+        "column": "hh_id",
+        "semantic_type": "foreign_key",
+        "coding_system": null,
+        "description": "Household identifier."
+      },
+      {
+        "table": "individuals",
+        "column": "first_name",
+        "semantic_type": "pii",
+        "coding_system": null,
+        "description": "Given name (withheld)."
+      },
+      {
+        "table": "individuals",
+        "column": "last_name",
+        "semantic_type": "pii",
+        "coding_system": null,
+        "description": "Family name (withheld)."
+      },
+      {
+        "table": "individuals",
+        "column": "phone",
+        "semantic_type": "pii",
+        "coding_system": null,
+        "description": "Phone number (withheld)."
+      },
+      {
+        "table": "residency_episodes",
+        "column": "individual_id",
+        "semantic_type": "foreign_key",
+        "coding_system": null,
+        "description": "Individual the episode belongs to."
+      },
+      {
+        "table": "residency_episodes",
+        "column": "start_date",
+        "semantic_type": "date",
+        "coding_system": null,
+        "description": "Start of residency (ISO date)."
+      },
+      {
+        "table": "residency_episodes",
+        "column": "start_event",
+        "semantic_type": "categorical",
+        "coding_system": "local",
+        "description": "Entry event: BTH birth, ENU enumeration, IMG in-migration."
+      },
+      {
+        "table": "residency_episodes",
+        "column": "end_date",
+        "semantic_type": "date",
+        "coding_system": null,
+        "description": "End of residency or end of follow-up."
+      },
+      {
+        "table": "residency_episodes",
+        "column": "end_event",
+        "semantic_type": "categorical",
+        "coding_system": "local",
+        "description": "Exit event: DTH death, OMG out-migration, OBE still resident at end of follow-up."
+      },
+      {
+        "table": "clinic_visits",
+        "column": "visit_id",
+        "semantic_type": "record_identifier",
+        "coding_system": null,
+        "description": "Visit identifier."
+      },
+      {
+        "table": "clinic_visits",
+        "column": "individual_id",
+        "semantic_type": "foreign_key",
+        "coding_system": null,
+        "description": "Patient."
+      },
+      {
+        "table": "clinic_visits",
+        "column": "visit_date",
+        "semantic_type": "date",
+        "coding_system": null,
+        "description": "Visit (admission) date."
+      },
+      {
+        "table": "clinic_visits",
+        "column": "discharge_date",
+        "semantic_type": "date",
+        "coding_system": null,
+        "description": "Discharge date; only filled for inpatient stays."
+      },
+      {
+        "table": "clinic_visits",
+        "column": "visit_type",
+        "semantic_type": "categorical",
+        "coding_system": "local",
+        "description": "OPD outpatient, IPD inpatient, EMERG emergency."
+      },
+      {
+        "table": "clinic_visits",
+        "column": "facility",
+        "semantic_type": "categorical",
+        "coding_system": "local",
+        "description": "Health facility name."
+      },
+      {
+        "table": "diagnoses",
+        "column": "visit_id",
+        "semantic_type": "foreign_key",
+        "coding_system": null,
+        "description": "Visit at which the diagnosis was made."
+      },
+      {
+        "table": "diagnoses",
+        "column": "individual_id",
+        "semantic_type": "foreign_key",
+        "coding_system": null,
+        "description": "Patient."
+      },
+      {
+        "table": "diagnoses",
+        "column": "icd10",
+        "semantic_type": "coded",
+        "coding_system": "ICD10",
+        "description": "ICD-10 code; some are written without the dot (J189 for J18.9)."
+      },
+      {
+        "table": "diagnoses",
+        "column": "dx_text",
+        "semantic_type": "categorical",
+        "coding_system": null,
+        "description": "ICD-10 label."
+      },
+      {
+        "table": "diagnoses",
+        "column": "dx_date",
+        "semantic_type": "date",
+        "coding_system": null,
+        "description": "Diagnosis date."
+      },
+      {
+        "table": "prescriptions",
+        "column": "visit_id",
+        "semantic_type": "foreign_key",
+        "coding_system": null,
+        "description": "Visit."
+      },
+      {
+        "table": "prescriptions",
+        "column": "individual_id",
+        "semantic_type": "foreign_key",
+        "coding_system": null,
+        "description": "Patient."
+      },
+      {
+        "table": "prescriptions",
+        "column": "drug",
+        "semantic_type": "coded",
+        "coding_system": "local",
+        "description": "Local drug product name, often abbreviated (AL = artemether/lumefantrine, TLD = tenofovir/lamivudine/dolutegravir)."
+      },
+      {
+        "table": "prescriptions",
+        "column": "qty",
+        "semantic_type": "numeric_measurement",
+        "coding_system": null,
+        "description": "Quantity dispensed."
+      },
+      {
+        "table": "prescriptions",
+        "column": "days",
+        "semantic_type": "numeric_measurement",
+        "coding_system": null,
+        "description": "Days of supply."
+      },
+      {
+        "table": "prescriptions",
+        "column": "date_prescribed",
+        "semantic_type": "date",
+        "coding_system": null,
+        "description": "Prescription date."
+      },
+      {
+        "table": "lab_results",
+        "column": "visit_id",
+        "semantic_type": "foreign_key",
+        "coding_system": null,
+        "description": "Visit; empty for some results."
+      },
+      {
+        "table": "lab_results",
+        "column": "individual_id",
+        "semantic_type": "foreign_key",
+        "coding_system": null,
+        "description": "Patient; some ids are not in the register."
+      },
+      {
+        "table": "lab_results",
+        "column": "test",
+        "semantic_type": "coded",
+        "coding_system": "local",
+        "description": "Local test code: HB haemoglobin, MRDT malaria rapid test, RBS random blood sugar, WT weight, TEMP temperature, SBP/DBP blood pressure."
+      },
+      {
+        "table": "lab_results",
+        "column": "result",
+        "semantic_type": "numeric_measurement",
+        "coding_system": null,
+        "description": "Numeric result, or POS/NEG for the malaria rapid test."
+      },
+      {
+        "table": "lab_results",
+        "column": "unit",
+        "semantic_type": "categorical",
+        "coding_system": "local",
+        "description": "Unit string; empty for qualitative tests."
+      },
+      {
+        "table": "lab_results",
+        "column": "test_date",
+        "semantic_type": "date",
+        "coding_system": null,
+        "description": "Result date."
+      },
+      {
+        "table": "deaths",
+        "column": "individual_id",
+        "semantic_type": "foreign_key",
+        "coding_system": null,
+        "description": "Deceased individual."
+      },
+      {
+        "table": "deaths",
+        "column": "dod",
+        "semantic_type": "date",
+        "coding_system": null,
+        "description": "Date of death."
+      },
+      {
+        "table": "deaths",
+        "column": "va_cause",
+        "semantic_type": "categorical",
+        "coding_system": "local",
+        "description": "Verbal-autopsy cause category."
+      }
+    ],
+    "notes": [
+      "dob uses day-first dates (dd/mm/yyyy) while every other date is ISO; parse it with an explicit format.",
+      "Sex code 9 means unknown and should map to concept 0.",
+      "Outpatient and emergency visits have no discharge_date; the visit end date must fall back to the visit date.",
+      "Some ICD-10 codes are written without the dot (e.g. J189); normalise them before vocabulary lookup.",
+      "Some lab results reference individuals that are not in the register; they cannot be linked to a person.",
+      "first_name, last_name and phone are direct identifiers and must not be loaded into the CDM."
+    ]
+  }
+}

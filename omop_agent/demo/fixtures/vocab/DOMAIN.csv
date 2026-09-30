@@ -1,0 +1,15 @@
+domain_id	domain_name	domain_concept_id
+Metadata	Metadata	2000009100
+Gender	Gender	2000009101
+Visit	Visit	2000009102
+Type Concept	Type Concept	2000009103
+Condition	Condition	2000009104
+Observation	Observation	2000009105
+Drug	Drug	2000009106
+Measurement	Measurement	2000009107
+Unit	Unit	2000009108
+Meas Value	Meas Value	2000009109
+Procedure	Procedure	2000009110
+Device	Device	2000009111
+Race	Race	2000009112
+Ethnicity	Ethnicity	2000009113

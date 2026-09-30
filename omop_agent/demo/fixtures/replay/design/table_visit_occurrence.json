@@ -1,0 +1,87 @@
+{
+  "kind": "structured",
+  "output": {
+    "target_table": "visit_occurrence",
+    "source": {
+      "table": "clinic_visits",
+      "alias": "v"
+    },
+    "joins": [],
+    "where": null,
+    "fields": [
+      {
+        "target_field": "visit_occurrence_id",
+        "kind": "visit_id",
+        "expression": "v.visit_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Visit key resolved through the visit id map."
+      },
+      {
+        "target_field": "person_id",
+        "kind": "person_id",
+        "expression": "v.individual_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Patient key resolved through the person id map."
+      },
+      {
+        "target_field": "visit_concept_id",
+        "kind": "expression",
+        "expression": "CASE v.visit_type WHEN 'OPD' THEN 9202 WHEN 'IPD' THEN 9201 WHEN 'EMERG' THEN 9203 ELSE 0 END",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "OPD=Outpatient, IPD=Inpatient, EMERG=Emergency Room."
+      },
+      {
+        "target_field": "visit_start_date",
+        "kind": "expression",
+        "expression": "v.visit_date::date",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "visit_start_datetime",
+        "kind": "expression",
+        "expression": "v.visit_date::timestamp",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "visit_end_date",
+        "kind": "expression",
+        "expression": "v.discharge_date::date",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Discharge date closes the visit."
+      },
+      {
+        "target_field": "visit_type_concept_id",
+        "kind": "constant",
+        "expression": "32817",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "EHR record from the clinic system (32817)."
+      },
+      {
+        "target_field": "visit_source_value",
+        "kind": "column",
+        "expression": "v.visit_type",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      }
+    ],
+    "rationale": "One row per clinic visit."
+  }
+}

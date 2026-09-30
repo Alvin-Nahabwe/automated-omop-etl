@@ -1,0 +1,15 @@
+concept_class_id	concept_class_name	concept_class_concept_id
+Answer	Answer	2000009200
+Clinical Drug	Clinical Drug	2000009201
+Clinical Drug Form	Clinical Drug Form	2000009202
+Clinical Finding	Clinical Finding	2000009203
+Clinical Observation	Clinical Observation	2000009204
+Event	Event	2000009205
+Gender	Gender	2000009206
+ICD10 code	ICD10 code	2000009207
+Ingredient	Ingredient	2000009208
+Lab Test	Lab Test	2000009209
+Type Concept	Type Concept	2000009210
+Undefined	Undefined	2000009211
+Unit	Unit	2000009212
+Visit	Visit	2000009213

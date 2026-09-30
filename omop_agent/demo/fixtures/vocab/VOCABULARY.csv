@@ -1,0 +1,10 @@
+vocabulary_id	vocabulary_name	vocabulary_reference	vocabulary_version	vocabulary_concept_id
+None	None (synthetic fixture)	omop-agent demo fixture	v5.0 FIXTURE	2000009000
+Gender	Gender (synthetic fixture)	omop-agent demo fixture	fixture-2026-09	2000009001
+Visit	Visit (synthetic fixture)	omop-agent demo fixture	fixture-2026-09	2000009002
+Type Concept	Type Concept (synthetic fixture)	omop-agent demo fixture	fixture-2026-09	2000009003
+SNOMED	SNOMED (synthetic fixture)	omop-agent demo fixture	fixture-2026-09	2000009004
+ICD10	ICD10 (synthetic fixture)	omop-agent demo fixture	fixture-2026-09	2000009005
+RxNorm	RxNorm (synthetic fixture)	omop-agent demo fixture	fixture-2026-09	2000009006
+LOINC	LOINC (synthetic fixture)	omop-agent demo fixture	fixture-2026-09	2000009007
+UCUM	UCUM (synthetic fixture)	omop-agent demo fixture	fixture-2026-09	2000009008

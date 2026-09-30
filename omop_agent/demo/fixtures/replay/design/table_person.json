@@ -1,0 +1,114 @@
+{
+  "kind": "structured",
+  "output": {
+    "target_table": "person",
+    "source": {
+      "table": "individuals",
+      "alias": "i"
+    },
+    "joins": [],
+    "where": null,
+    "fields": [
+      {
+        "target_field": "person_id",
+        "kind": "person_id",
+        "expression": "i.individual_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Patient key resolved through the person id map."
+      },
+      {
+        "target_field": "gender_concept_id",
+        "kind": "expression",
+        "expression": "CASE i.sex WHEN '1' THEN 8507 WHEN '2' THEN 8532 ELSE 0 END",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "HDSS sex codes: 1=male (8507), 2=female (8532), 9=unknown (0)."
+      },
+      {
+        "target_field": "year_of_birth",
+        "kind": "expression",
+        "expression": "EXTRACT(YEAR FROM to_date(i.dob, 'DD/MM/YYYY'))::int",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "dob is written day-first (dd/mm/yyyy)."
+      },
+      {
+        "target_field": "month_of_birth",
+        "kind": "expression",
+        "expression": "EXTRACT(MONTH FROM to_date(i.dob, 'DD/MM/YYYY'))::int",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "day_of_birth",
+        "kind": "expression",
+        "expression": "EXTRACT(DAY FROM to_date(i.dob, 'DD/MM/YYYY'))::int",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "birth_datetime",
+        "kind": "expression",
+        "expression": "to_date(i.dob, 'DD/MM/YYYY')::timestamp",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "race_concept_id",
+        "kind": "constant",
+        "expression": "0",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Race is not collected."
+      },
+      {
+        "target_field": "ethnicity_concept_id",
+        "kind": "constant",
+        "expression": "0",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Ethnicity is not collected."
+      },
+      {
+        "target_field": "person_source_value",
+        "kind": "column",
+        "expression": "i.individual_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "gender_source_value",
+        "kind": "column",
+        "expression": "i.sex",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "gender_source_concept_id",
+        "kind": "constant",
+        "expression": "0",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      }
+    ],
+    "rationale": "One row per registered HDSS individual."
+  }
+}

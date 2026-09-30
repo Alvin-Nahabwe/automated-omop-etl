@@ -1,0 +1,114 @@
+{
+  "kind": "structured",
+  "output": {
+    "target_table": "drug_exposure",
+    "source": {
+      "table": "prescriptions",
+      "alias": "p"
+    },
+    "joins": [],
+    "where": null,
+    "fields": [
+      {
+        "target_field": "drug_exposure_id",
+        "kind": "auto_id",
+        "expression": null,
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Surrogate key."
+      },
+      {
+        "target_field": "person_id",
+        "kind": "person_id",
+        "expression": "p.individual_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Patient key resolved through the person id map."
+      },
+      {
+        "target_field": "drug_concept_id",
+        "kind": "concept_map",
+        "expression": "p.drug",
+        "vocabulary": "SRC_DRUG",
+        "target_domain": "Drug",
+        "concept_role": "standard",
+        "rationale": "Local drug names need Usagi-style mapping to RxNorm."
+      },
+      {
+        "target_field": "drug_exposure_start_date",
+        "kind": "expression",
+        "expression": "p.date_prescribed::date",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "drug_exposure_end_date",
+        "kind": "expression",
+        "expression": "p.date_prescribed::date + GREATEST(COALESCE(p.days::int, 1), 1) - 1",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Start date plus days supplied."
+      },
+      {
+        "target_field": "drug_type_concept_id",
+        "kind": "constant",
+        "expression": "32817",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "EHR record from the clinic system (32817)."
+      },
+      {
+        "target_field": "quantity",
+        "kind": "expression",
+        "expression": "p.qty::numeric",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "days_supply",
+        "kind": "expression",
+        "expression": "p.days::int",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "visit_occurrence_id",
+        "kind": "visit_id",
+        "expression": "p.visit_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Links the record to its clinic visit."
+      },
+      {
+        "target_field": "drug_source_value",
+        "kind": "column",
+        "expression": "p.drug",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "drug_source_concept_id",
+        "kind": "constant",
+        "expression": "0",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      }
+    ],
+    "rationale": "One row per prescription line."
+  }
+}

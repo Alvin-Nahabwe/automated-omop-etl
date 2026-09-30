@@ -1,0 +1,23 @@
+{
+  "kind": "structured",
+  "output": {
+    "choices": [
+      {
+        "source_code": "NEG",
+        "chosen_concept_id": 2000006002,
+        "equivalence": "EQUAL",
+        "confidence": 0.96,
+        "rationale": "NEG = Negative.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "POS",
+        "chosen_concept_id": 2000006001,
+        "equivalence": "EQUAL",
+        "confidence": 0.96,
+        "rationale": "POS = Positive.",
+        "retry_search_terms": []
+      }
+    ]
+  }
+}

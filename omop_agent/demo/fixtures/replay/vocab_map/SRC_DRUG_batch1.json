@@ -1,0 +1,88 @@
+{
+  "kind": "structured",
+  "output": {
+    "choices": [
+      {
+        "source_code": "Paracetamol 500mg",
+        "chosen_concept_id": 2000003002,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.93,
+        "rationale": "Paracetamol is acetaminophen; 500 mg oral tablet is the standard presentation. Form is not stated in the source, so EQUIVALENT rather than EQUAL.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "AL 20/120 tabs",
+        "chosen_concept_id": 0,
+        "equivalence": "UNMATCHED",
+        "confidence": 0.0,
+        "rationale": "AL 20/120 is artemether 20 mg / lumefantrine 120 mg, which is not among the candidates.",
+        "retry_search_terms": [
+          "artemether lumefantrine",
+          "artemether 20 MG / lumefantrine 120 MG Oral Tablet"
+        ]
+      },
+      {
+        "source_code": "ORS sachets",
+        "chosen_concept_id": 0,
+        "equivalence": "UNMATCHED",
+        "confidence": 0.0,
+        "rationale": "ORS means oral rehydration salts; the candidates are unrelated.",
+        "retry_search_terms": [
+          "oral rehydration salts",
+          "glucose potassium chloride sodium chloride sodium citrate oral"
+        ]
+      },
+      {
+        "source_code": "Zinc 20mg",
+        "chosen_concept_id": 2000003005,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.9,
+        "rationale": "Zinc 20 mg dispersible tablets for diarrhoea are zinc sulfate 20 mg.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "Amoxicillin 250mg caps",
+        "chosen_concept_id": 2000003003,
+        "equivalence": "EQUAL",
+        "confidence": 0.97,
+        "rationale": "Same ingredient, strength and dose form.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "Amlodipine 5mg",
+        "chosen_concept_id": 2000003007,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.94,
+        "rationale": "Amlodipine 5 mg is marketed as oral tablets; form not stated in the source.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "Cotrimoxazole 960mg",
+        "chosen_concept_id": 2000003009,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.92,
+        "rationale": "Co-trimoxazole 960 mg = sulfamethoxazole 800 mg + trimethoprim 160 mg.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "TLD (TDF/3TC/DTG)",
+        "chosen_concept_id": 0,
+        "equivalence": "UNMATCHED",
+        "confidence": 0.0,
+        "rationale": "TLD is the fixed-dose combination tenofovir disoproxil / lamivudine / dolutegravir; not among the candidates.",
+        "retry_search_terms": [
+          "dolutegravir lamivudine tenofovir disoproxil",
+          "tenofovir lamivudine dolutegravir oral tablet"
+        ]
+      },
+      {
+        "source_code": "Metformin 500mg",
+        "chosen_concept_id": 2000003006,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.93,
+        "rationale": "Metformin hydrochloride 500 mg oral tablet; the 850 mg product is a different strength.",
+        "retry_search_terms": []
+      }
+    ]
+  }
+}

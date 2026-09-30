@@ -1,0 +1,197 @@
+"""Privacy guard: decides what source information may be shown to the LLM.
+
+Rules (enforced by construction, not by prompt):
+  * the LLM only ever sees aggregate metadata - table/column names, types, counts, ranges,
+    and value frequencies; never a patient row;
+  * values seen fewer than ``min_cell_count`` times are suppressed everywhere they could reach
+    the LLM (profile top values, vocabulary terms, repair-agent query results);
+  * columns detected as direct identifiers (names, phone numbers, national IDs, addresses,
+    GPS) get no values, no min/max, only counts;
+  * ``send_values_to_llm: false`` removes all values and keeps only statistics.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Iterable
+
+from .config import PrivacyConfig
+from typing import TYPE_CHECKING
+
+from .models import ColumnProfile, SourceProfile, TableProfile, ValueFreq
+
+if TYPE_CHECKING:
+    from .models import TableMapping
+
+_PHONE = re.compile(r"^\+?\d[\d\s-]{8,14}$")
+_DATE_LIKE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}|^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$")
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+# Numeric columns with at most this many distinct values are treated as codes, so their
+# min/max are only shown when those values themselves pass small-cell suppression.
+CODE_LIKE_MAX_DISTINCT = 50
+
+
+def detect_pii(table: str, column: str, sample_values: Iterable[str], cfg: PrivacyConfig) -> str | None:
+    """Return a reason string if the column looks like a direct identifier, else None."""
+    qualified = f"{table}.{column}".lower()
+    if qualified in {c.lower() for c in cfg.pii_columns}:
+        return "listed in privacy.pii_columns"
+    col = column.lower()
+    for pat in cfg.pii_name_patterns:
+        if re.search(pat, col):
+            return f"column name matches /{pat}/"
+    values = [v for v in sample_values if v]
+    if len(values) >= 5:
+        if sum(bool(_EMAIL.match(v)) for v in values) / len(values) > 0.5:
+            return "values look like e-mail addresses"
+        phone_like = [v for v in values if _PHONE.match(v) and not _DATE_LIKE.match(v)]
+        if len(phone_like) / len(values) > 0.5:
+            return "values look like phone numbers"
+    return None
+
+
+def suppress_small_cells(values: list[ValueFreq], min_cell_count: int) -> tuple[list[ValueFreq], int]:
+    kept = [v for v in values if v.count >= min_cell_count]
+    return kept, len(values) - len(kept)
+
+
+def redact_column(col: ColumnProfile) -> ColumnProfile:
+    """Strip every value-bearing statistic from a column profile."""
+    return col.model_copy(
+        update={"top_values": [], "min_value": None, "max_value": None, "mean": None, "n_suppressed_values": 0}
+    )
+
+
+def llm_view(profile: SourceProfile, cfg: PrivacyConfig) -> SourceProfile:
+    """The version of the profile that is allowed into a prompt."""
+    tables: list[TableProfile] = []
+    for t in profile.tables:
+        cols = []
+        for c in t.columns:
+            if c.is_pii or not cfg.send_values_to_llm:
+                cols.append(redact_column(c))
+                continue
+            kept, n_dropped = suppress_small_cells(c.top_values, profile.min_cell_count)
+            update: dict = {
+                "top_values": kept[: cfg.max_values_per_column],
+                "n_suppressed_values": c.n_suppressed_values + n_dropped,
+            }
+            if _range_reveals_rare_value(c, {v.value for v in kept}):
+                update.update(min_value=None, max_value=None)
+            else:
+                update.update(min_value=_coarsen(c, c.min_value), max_value=_coarsen(c, c.max_value))
+            cols.append(c.model_copy(update=update))
+        tables.append(t.model_copy(update={"columns": cols}))
+    return profile.model_copy(update={"tables": tables})
+
+
+def _coarsen(col: ColumnProfile, value: str | None) -> str | None:
+    """Range endpoints are single records: show dates as years and continuous numbers rounded to
+    two significant figures, so an extreme value (the oldest birth date, a heaviest weight) is not
+    disclosed exactly."""
+    if value is None:
+        return None
+    if col.inferred_type in {"date", "datetime"}:
+        m = re.match(r"^(\d{4})", value)
+        return m.group(1) if m else None
+    if col.inferred_type in {"integer", "float"} and col.n_distinct > CODE_LIKE_MAX_DISTINCT:
+        try:
+            x = float(value)
+        except ValueError:
+            return None
+        if x == 0:
+            return "0"
+        rounded = float(f"{x:.2g}")
+        return f"~{int(rounded) if rounded.is_integer() else rounded}"
+    return value
+
+
+def _range_reveals_rare_value(col: ColumnProfile, shown: set[str]) -> bool:
+    """A code-like numeric column's min/max are individual values: show them only if they are
+    themselves frequent enough to be listed (e.g. a sex range [1 .. 9] would reveal a rare 9)."""
+    if col.inferred_type not in {"integer", "float", "boolean"} or col.n_distinct > CODE_LIKE_MAX_DISTINCT:
+        return False
+    return any(v is not None and v not in shown for v in (col.min_value, col.max_value))
+
+
+def profile_prompt_text(profile: SourceProfile, cfg: PrivacyConfig, tables: list[str] | None = None) -> str:
+    """Compact, privacy-filtered text rendering of the profile for prompts."""
+    view = llm_view(profile, cfg)
+    lines: list[str] = []
+    for t in view.tables:
+        if tables is not None and t.name not in tables:
+            continue
+        lines.append(f"SOURCE TABLE {t.name} ({t.n_rows} rows)")
+        for c in t.columns:
+            bits: list[str] = [c.inferred_type]
+            if c.declared_type:
+                bits.append(f"declared {c.declared_type}")
+            null_pct = 100.0 * c.n_null / c.n_rows if c.n_rows else 0.0
+            bits.append(f"{null_pct:.0f}% null")
+            bits.append(f"{c.n_distinct} distinct")
+            if c.unique:
+                bits.append("unique")
+            if c.date_format:
+                bits.append(f"format {c.date_format} (PostgreSQL: to_date(x, '{_pg_template(c.date_format)}'))")
+            if c.min_value is not None or c.max_value is not None:
+                bits.append(f"range [{c.min_value} .. {c.max_value}]")
+            if c.is_pii:
+                bits.append(f"PII - values withheld ({c.pii_reason})")
+            line = f"  - {c.name}: " + ", ".join(bits)
+            if c.top_values:
+                vals = "; ".join(f"{v.value!r}×{v.count}" for v in c.top_values)
+                line += f"\n      top values: {vals}"
+                if c.n_suppressed_values:
+                    line += f" (+{c.n_suppressed_values} values not listed: rare or beyond the top {cfg.max_values_per_column})"
+            lines.append(line)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _pg_template(fmt: str) -> str:
+    from .profiling.profiler import strftime_to_pg
+
+    try:
+        return strftime_to_pg(fmt)
+    except Exception:  # an unknown directive: show the strftime pattern only
+        return fmt
+
+
+def pii_columns(profile: SourceProfile | None, cfg: PrivacyConfig) -> dict[str, set[str]]:
+    """Direct-identifier columns per source table (from the profile and ``privacy.pii_columns``)."""
+    out: dict[str, set[str]] = {}
+    if profile is not None:
+        for t in profile.tables:
+            cols = {c.name.lower() for c in t.columns if c.is_pii}
+            if cols:
+                out[t.name.lower()] = cols
+    for entry in cfg.pii_columns:
+        if "." in entry:
+            table, col = entry.lower().rsplit(".", 1)
+            out.setdefault(table, set()).add(col)
+    return out
+
+
+_ALIAS_COL = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def pii_references(tm: "TableMapping", profile: SourceProfile | None, cfg: PrivacyConfig) -> list[str]:
+    """``table.column`` identifiers that a table mapping reads (direct identifiers must never be
+    loaded into the CDM or sent for vocabulary mapping)."""
+    from .sqlguard import strip_literals
+
+    pii = pii_columns(profile, cfg)
+    if not pii:
+        return []
+    aliases = {tm.source.alias.lower(): tm.source.table.lower()}
+    aliases.update({j.alias.lower(): j.table.lower() for j in tm.joins})
+    texts = [f.expression for f in tm.fields] + [tm.where] + [j.on for j in tm.joins]
+    hits: list[str] = []
+    for text in texts:
+        for alias, col in _ALIAS_COL.findall(strip_literals(text or "")):
+            table = aliases.get(alias.lower())
+            if table and col.lower() in pii.get(table.split(".")[-1], set()):
+                ref = f"{table}.{col.lower()}"
+                if ref not in hits:
+                    hits.append(ref)
+    return hits

@@ -1,0 +1,74 @@
+{
+  "kind": "structured",
+  "output": {
+    "person_key": {
+      "table": "individuals",
+      "expression": "individual_id"
+    },
+    "visit_key": {
+      "table": "clinic_visits",
+      "expression": "visit_id"
+    },
+    "observation_period": "table_mapping",
+    "tables": [
+      {
+        "target_table": "person",
+        "source_tables": [
+          "individuals"
+        ],
+        "rationale": "The HDSS register lists every individual once."
+      },
+      {
+        "target_table": "observation_period",
+        "source_tables": [
+          "residency_episodes"
+        ],
+        "rationale": "Residency episodes are when HDSS events would be recorded for a person."
+      },
+      {
+        "target_table": "visit_occurrence",
+        "source_tables": [
+          "clinic_visits"
+        ],
+        "rationale": "One CDM visit per clinic visit."
+      },
+      {
+        "target_table": "condition_occurrence",
+        "source_tables": [
+          "diagnoses"
+        ],
+        "rationale": "ICD-10 diagnoses map to SNOMED conditions."
+      },
+      {
+        "target_table": "drug_exposure",
+        "source_tables": [
+          "prescriptions"
+        ],
+        "rationale": "Prescriptions become drug exposures."
+      },
+      {
+        "target_table": "measurement",
+        "source_tables": [
+          "lab_results"
+        ],
+        "rationale": "Lab tests and vital signs are measurements."
+      },
+      {
+        "target_table": "death",
+        "source_tables": [
+          "deaths"
+        ],
+        "rationale": "HDSS-verified deaths with verbal-autopsy causes."
+      }
+    ],
+    "unmapped_source_tables": [],
+    "assumptions": [
+      "HDSS residency episodes define observation periods.",
+      "Sex code 9 means unknown and maps to concept 0.",
+      "EHR type concept (32817) is used for all records."
+    ],
+    "open_questions": [
+      "Should care sites be created from clinic_visits.facility?"
+    ]
+  }
+}

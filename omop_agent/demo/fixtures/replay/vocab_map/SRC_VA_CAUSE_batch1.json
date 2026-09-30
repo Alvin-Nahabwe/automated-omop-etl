@@ -1,0 +1,47 @@
+{
+  "kind": "structured",
+  "output": {
+    "choices": [
+      {
+        "source_code": "Road traffic accident",
+        "chosen_concept_id": 2000001010,
+        "equivalence": "EQUAL",
+        "confidence": 0.95,
+        "rationale": "Same event concept (Observation domain; cause_concept_id has no domain restriction).",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "HIV/AIDS related death",
+        "chosen_concept_id": 2000001006,
+        "equivalence": "WIDER",
+        "confidence": 0.8,
+        "rationale": "The closest standard concept is HIV infection; the verbal-autopsy category is more specific.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "Pneumonia",
+        "chosen_concept_id": 2000001002,
+        "equivalence": "EQUAL",
+        "confidence": 0.95,
+        "rationale": "Same condition.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "Malaria",
+        "chosen_concept_id": 2000001001,
+        "equivalence": "EQUAL",
+        "confidence": 0.95,
+        "rationale": "Same condition.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "Diarrhoeal diseases",
+        "chosen_concept_id": 2000001011,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.85,
+        "rationale": "Verbal-autopsy diarrhoeal disease category maps best to diarrhea.",
+        "retry_search_terms": []
+      }
+    ]
+  }
+}

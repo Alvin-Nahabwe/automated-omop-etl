@@ -1,0 +1,31 @@
+{
+  "kind": "structured",
+  "output": {
+    "choices": [
+      {
+        "source_code": "AL 20/120 tabs",
+        "chosen_concept_id": 2000003001,
+        "equivalence": "EQUAL",
+        "confidence": 0.95,
+        "rationale": "Artemether 20 mg / lumefantrine 120 mg oral tablet matches the product exactly.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "ORS sachets",
+        "chosen_concept_id": 2000003004,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.85,
+        "rationale": "Oral rehydration salts powder for oral solution. The source gives no formulation, so this is a Clinical Drug Form; worth a human check.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "TLD (TDF/3TC/DTG)",
+        "chosen_concept_id": 2000003008,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.93,
+        "rationale": "Dolutegravir 50 / lamivudine 300 / tenofovir disoproxil fumarate 300 mg is the WHO-recommended TLD tablet.",
+        "retry_search_terms": []
+      }
+    ]
+  }
+}

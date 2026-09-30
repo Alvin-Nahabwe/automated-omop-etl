@@ -1,0 +1,80 @@
+{
+  "kind": "structured",
+  "output": {
+    "choices": [
+      {
+        "source_code": "WT",
+        "chosen_concept_id": 0,
+        "equivalence": "UNMATCHED",
+        "confidence": 0.0,
+        "rationale": "WT abbreviates body weight.",
+        "retry_search_terms": [
+          "body weight"
+        ]
+      },
+      {
+        "source_code": "DBP",
+        "chosen_concept_id": 0,
+        "equivalence": "UNMATCHED",
+        "confidence": 0.0,
+        "rationale": "DBP abbreviates diastolic blood pressure.",
+        "retry_search_terms": [
+          "diastolic blood pressure"
+        ]
+      },
+      {
+        "source_code": "HB",
+        "chosen_concept_id": 0,
+        "equivalence": "UNMATCHED",
+        "confidence": 0.0,
+        "rationale": "HB abbreviates haemoglobin (g/dL in the source).",
+        "retry_search_terms": [
+          "hemoglobin mass volume blood",
+          "hemoglobin"
+        ]
+      },
+      {
+        "source_code": "RBS",
+        "chosen_concept_id": 0,
+        "equivalence": "UNMATCHED",
+        "confidence": 0.0,
+        "rationale": "RBS is random blood sugar, reported in mmol/L.",
+        "retry_search_terms": [
+          "glucose moles volume blood",
+          "blood glucose"
+        ]
+      },
+      {
+        "source_code": "SBP",
+        "chosen_concept_id": 0,
+        "equivalence": "UNMATCHED",
+        "confidence": 0.0,
+        "rationale": "SBP abbreviates systolic blood pressure.",
+        "retry_search_terms": [
+          "systolic blood pressure"
+        ]
+      },
+      {
+        "source_code": "TEMP",
+        "chosen_concept_id": 0,
+        "equivalence": "UNMATCHED",
+        "confidence": 0.0,
+        "rationale": "TEMP is body temperature.",
+        "retry_search_terms": [
+          "body temperature"
+        ]
+      },
+      {
+        "source_code": "MRDT",
+        "chosen_concept_id": 0,
+        "equivalence": "UNMATCHED",
+        "confidence": 0.0,
+        "rationale": "MRDT is the malaria rapid diagnostic test (Plasmodium antigen).",
+        "retry_search_terms": [
+          "plasmodium antigen blood rapid immunoassay",
+          "malaria rapid test"
+        ]
+      }
+    ]
+  }
+}

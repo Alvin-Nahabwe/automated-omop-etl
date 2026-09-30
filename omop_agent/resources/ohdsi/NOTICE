@@ -1,0 +1,19 @@
+Files in this directory are copied unmodified from OHDSI projects licensed under the
+Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+
+From OHDSI/CommonDataModel (https://github.com/OHDSI/CommonDataModel), branch main:
+  OMOP_CDMv5.4_Field_Level.csv         (inst/csv/)
+  OMOP_CDMv5.4_Table_Level.csv         (inst/csv/)
+  OMOPCDM_postgresql_5.4_ddl.sql       (inst/ddl/5.4/postgresql/)
+  OMOPCDM_postgresql_5.4_primary_keys.sql
+  OMOPCDM_postgresql_5.4_constraints.sql
+  OMOPCDM_postgresql_5.4_indices.sql
+
+From OHDSI/DataQualityDashboard (https://github.com/OHDSI/DataQualityDashboard), branch main,
+inst/csv/ (renamed with a DQD_ prefix):
+  DQD_OMOP_CDMv5.4_Check_Descriptions.csv
+  DQD_OMOP_CDMv5.4_Field_Level.csv
+  DQD_OMOP_CDMv5.4_Table_Level.csv
+  DQD_OMOP_CDMv5.4_Concept_Level.csv
+
+Copyright OHDSI (Observational Health Data Sciences and Informatics).

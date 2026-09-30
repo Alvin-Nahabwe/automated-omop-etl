@@ -1,0 +1,63 @@
+{
+  "kind": "structured",
+  "output": {
+    "choices": [
+      {
+        "source_code": "WT",
+        "chosen_concept_id": 2000004004,
+        "equivalence": "EQUAL",
+        "confidence": 0.95,
+        "rationale": "Body weight.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "DBP",
+        "chosen_concept_id": 2000004007,
+        "equivalence": "EQUAL",
+        "confidence": 0.97,
+        "rationale": "Diastolic blood pressure.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "HB",
+        "chosen_concept_id": 2000004001,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.92,
+        "rationale": "Haemoglobin mass concentration in blood; the source units are g/dL.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "RBS",
+        "chosen_concept_id": 2000004003,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.9,
+        "rationale": "Random blood sugar in mmol/L is glucose moles/volume in blood; the random timing is not coded.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "SBP",
+        "chosen_concept_id": 2000004006,
+        "equivalence": "EQUAL",
+        "confidence": 0.97,
+        "rationale": "Systolic blood pressure.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "TEMP",
+        "chosen_concept_id": 2000004005,
+        "equivalence": "EQUAL",
+        "confidence": 0.95,
+        "rationale": "Body temperature.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "MRDT",
+        "chosen_concept_id": 2000004002,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.9,
+        "rationale": "Rapid immunoassay for Plasmodium antigen in blood; results are POS/NEG.",
+        "retry_search_terms": []
+      }
+    ]
+  }
+}
