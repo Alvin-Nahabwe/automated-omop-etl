@@ -157,3 +157,21 @@ def test_privacy_view():
     assert "values withheld" in text
     no_values = profile_prompt_text(profile, PrivacyConfig(send_values_to_llm=False))
     assert "Paracetamol" not in no_values
+
+
+def test_privacy_dates_are_not_phones_and_code_ranges_hide_rare_values():
+    cfg = PrivacyConfig()
+    assert detect_pii("visits", "visit_date", ["2019-01-05"] * 6, cfg) is None
+    assert detect_pii("people", "dob", ["19/05/1942"] * 6, cfg) is None
+    sex = ColumnProfile(
+        name="sex", inferred_type="integer", n_rows=100, n_null=0, n_distinct=3, unique=False,
+        min_value="1", max_value="9",
+        top_values=[ValueFreq(value="1", count=50), ValueFreq(value="2", count=48), ValueFreq(value="9", count=2)],
+    )
+    profile = SourceProfile(
+        source_type="csv", generated_at="2026-01-01T00:00:00Z", min_cell_count=5,
+        tables=[TableProfile(name="people", n_rows=100, columns=[sex])],
+    )
+    view = llm_view(profile, cfg).tables[0].columns[0]
+    assert view.min_value is None and view.max_value is None
+    assert [v.value for v in view.top_values] == ["1", "2"]

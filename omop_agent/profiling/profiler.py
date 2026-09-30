@@ -8,8 +8,8 @@ detection. No patient row is ever pulled into Python.
 Privacy is enforced here, not only when prompting: top values below ``min_cell_count`` are
 filtered in SQL (``HAVING``), lexical min/max of text columns are kept only when those values
 are themselves frequent enough, and columns detected as direct identifiers get no values,
-ranges or means at all. High-cardinality key columns (patient, visit, household ids) list no
-values either: their frequencies would be per-person record counts.
+ranges or means at all. Patient keys and other high-cardinality id columns (visit, household)
+list no values either: their frequencies would be per-person record counts.
 """
 
 from __future__ import annotations
@@ -31,12 +31,12 @@ TYPE_MATCH_RATIO = 0.95  # share of sampled non-null values a pattern must match
 SAMPLE_VALUES = 20_000  # non-null values inspected per column for type inference
 TABLESAMPLE_ABOVE = 200_000  # tables larger than this are block-sampled for type inference
 PII_SAMPLE_VALUES = 50  # distinct values handed to privacy.detect_pii
-KEY_MAX_LISTED_DISTINCT = 50  # identifier-named columns with more distinct values list none
+KEY_MAX_LISTED_DISTINCT = 50  # other id-named columns with more distinct values list none
 _MAX_TARGETS = 600  # select-list entries per aggregate query (Postgres caps it at 1664)
-_KEY_NAME = re.compile(
-    r"(^|_)(id|uuid|guid)(_|$)|(patient|person|individual|client|subject|member|visit|encounter)_?(id|no|num|number)$",
-    re.I,
+_PERSON_KEY_NAME = re.compile(
+    r"(patient|person|individual|client|subject|participant|member)_?(id|no|num|number|uuid)$", re.I
 )
+_KEY_NAME = re.compile(r"(^|_)(id|uuid|guid)(_|$)|(visit|encounter|record|episode|household)_?(id|no|num|number)$", re.I)
 
 _TRIM_CHARS = "E' \\t\\r\\n'"
 _BOOL_VALUES = ("true", "false", "yes", "no", "y", "n", "t", "f")
@@ -175,7 +175,6 @@ class _Col:
     expr: str  # SQL expression yielding the raw text value
     declared_type: str | None
     idx: int
-    sample_n: int = 0
     inferred_type: str = "empty"
     date_format: str | None = None
     pii_reason: str | None = None
@@ -258,7 +257,7 @@ def _profile_table(
         if c.pii_reason is None and nn:
             if _is_key_column(c.name, nd):
                 # Frequencies of a patient/visit key are per-person record counts: withhold them.
-                s["lo"] = s["hi"] = None
+                s["lo"] = s["hi"] = s["mean"] = None
             elif not (nd == nn and min_cell > 1) and top_n > 0:
                 top = _top_values(conn, tbl, c, min_cell, top_n)
             n_hidden = nd - len(top)
@@ -287,7 +286,9 @@ def _profile_table(
 
 
 def _is_key_column(name: str, n_distinct: int) -> bool:
-    """A high-cardinality identifier (person, visit, household key...): its values are not listed."""
+    """A patient key, or a high-cardinality visit/household/record key: its values are not listed."""
+    if _PERSON_KEY_NAME.search(name):
+        return True
     return n_distinct > KEY_MAX_LISTED_DISTINCT and bool(_KEY_NAME.search(name))
 
 
@@ -308,7 +309,6 @@ def _inspect_sample(
     if block and counts["n"] == 0:  # sparse column: the block sample missed every value
         block = False
         counts = _pattern_counts(conn, _sample_sql(tbl, c, n_rows, False))
-    c.sample_n = int(counts["n"])
     c.inferred_type, c.date_format = _infer_type(counts)
     values: list[str] = []
     # Dates are never phone numbers, but ISO dates ("2019-01-05") match the phone pattern in

@@ -110,10 +110,11 @@ def test_pii_columns_have_no_values(demo):
 @pytest.mark.postgres
 def test_key_columns_list_no_values(demo):
     conn, schemas, cfg, profile = demo
-    for table in ("clinic_visits", "diagnoses", "lab_results", "prescriptions"):
+    for table in ("clinic_visits", "diagnoses", "lab_results", "prescriptions", "deaths"):
         c = col(profile, table, "individual_id")
-        assert not c.unique and c.top_values == [] and c.min_value is None
-        assert c.n_suppressed_values == c.n_distinct
+        assert c.top_values == [] and c.min_value is None and c.max_value is None
+        assert c.n_suppressed_values == c.n_distinct and not c.is_pii
+    assert col(profile, "individuals", "hh_id").top_values == []  # 124 households
 
 
 @pytest.mark.postgres

@@ -19,7 +19,11 @@ from .config import PrivacyConfig
 from .models import ColumnProfile, SourceProfile, TableProfile, ValueFreq
 
 _PHONE = re.compile(r"^\+?\d[\d\s-]{8,14}$")
+_DATE_LIKE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}|^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$")
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+# Numeric columns with at most this many distinct values are treated as codes, so their
+# min/max are only shown when those values themselves pass small-cell suppression.
+CODE_LIKE_MAX_DISTINCT = 50
 
 
 def detect_pii(table: str, column: str, sample_values: Iterable[str], cfg: PrivacyConfig) -> str | None:
@@ -35,7 +39,8 @@ def detect_pii(table: str, column: str, sample_values: Iterable[str], cfg: Priva
     if len(values) >= 5:
         if sum(bool(_EMAIL.match(v)) for v in values) / len(values) > 0.5:
             return "values look like e-mail addresses"
-        if sum(bool(_PHONE.match(v)) for v in values) / len(values) > 0.5 and not all(v.isdigit() and len(v) < 9 for v in values):
+        phone_like = [v for v in values if _PHONE.match(v) and not _DATE_LIKE.match(v)]
+        if len(phone_like) / len(values) > 0.5:
             return "values look like phone numbers"
     return None
 
@@ -62,16 +67,23 @@ def llm_view(profile: SourceProfile, cfg: PrivacyConfig) -> SourceProfile:
                 cols.append(redact_column(c))
                 continue
             kept, n_dropped = suppress_small_cells(c.top_values, profile.min_cell_count)
-            cols.append(
-                c.model_copy(
-                    update={
-                        "top_values": kept[: cfg.max_values_per_column],
-                        "n_suppressed_values": c.n_suppressed_values + n_dropped,
-                    }
-                )
-            )
+            update: dict = {
+                "top_values": kept[: cfg.max_values_per_column],
+                "n_suppressed_values": c.n_suppressed_values + n_dropped,
+            }
+            if _range_reveals_rare_value(c, {v.value for v in kept}):
+                update.update(min_value=None, max_value=None)
+            cols.append(c.model_copy(update=update))
         tables.append(t.model_copy(update={"columns": cols}))
     return profile.model_copy(update={"tables": tables})
+
+
+def _range_reveals_rare_value(col: ColumnProfile, shown: set[str]) -> bool:
+    """A code-like numeric column's min/max are individual values: show them only if they are
+    themselves frequent enough to be listed (e.g. a sex range [1 .. 9] would reveal a rare 9)."""
+    if col.inferred_type not in {"integer", "float", "boolean"} or col.n_distinct > CODE_LIKE_MAX_DISTINCT:
+        return False
+    return any(v is not None and v not in shown for v in (col.min_value, col.max_value))
 
 
 def profile_prompt_text(profile: SourceProfile, cfg: PrivacyConfig, tables: list[str] | None = None) -> str:
@@ -83,7 +95,7 @@ def profile_prompt_text(profile: SourceProfile, cfg: PrivacyConfig, tables: list
             continue
         lines.append(f"SOURCE TABLE {t.name} ({t.n_rows} rows)")
         for c in t.columns:
-            bits = [c.inferred_type]
+            bits: list[str] = [c.inferred_type]
             if c.declared_type:
                 bits.append(f"declared {c.declared_type}")
             null_pct = 100.0 * c.n_null / c.n_rows if c.n_rows else 0.0
@@ -102,7 +114,7 @@ def profile_prompt_text(profile: SourceProfile, cfg: PrivacyConfig, tables: list
                 vals = "; ".join(f"{v.value!r}×{v.count}" for v in c.top_values)
                 line += f"\n      top values: {vals}"
                 if c.n_suppressed_values:
-                    line += f" (+{c.n_suppressed_values} rare values withheld)"
+                    line += f" (+{c.n_suppressed_values} values not listed: rare or beyond the top {cfg.max_values_per_column})"
             lines.append(line)
         lines.append("")
     return "\n".join(lines)
