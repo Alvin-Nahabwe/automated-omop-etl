@@ -831,3 +831,31 @@ def test_lab_terms_carry_their_units(staged):
     assert 'units recorded with it: "mmol/L" ×' in prompt
     drugs = [t for t in collect_terms(conn, schemas, load_spec()) if t.source_vocabulary_id == "SRC_DRUG"]
     assert all(t.units == [] for t in drugs)  # only measurement/observation concepts get units
+
+
+@pytest.mark.postgres
+def test_low_confidence_choice_with_search_phrases_is_retried(staged, tmp_path):
+    """Live-run regression: the model mapped HB to a generic concept at 0.6 and asked for
+    'Hemoglobin [Mass/volume] in Blood'; the mapper used to ignore that request."""
+    conn, schemas, cfg = staged
+    rec = tmp_path / "rec"
+
+    def choice(code, cid, eq, conf, phrases=()):
+        return {"source_code": code, "chosen_concept_id": cid, "equivalence": eq, "confidence": conf,
+                "rationale": "test", "retry_search_terms": list(phrases)}
+
+    save_recording(rec, "vocab_map", "SRC_LAB:batch1", {"kind": "structured", "output": {"choices": [
+        choice("HB", 2000004010, "WIDER", 0.5, ["Hemoglobin mass volume blood"]),       # settles, asks for better
+        choice("WT", 2000004004, "EQUAL", 0.6, ["body weight measured"]),               # asks, nothing better found
+        choice("SBP", 2000004006, "EQUAL", 0.97),
+    ]}})
+    save_recording(rec, "vocab_map", "SRC_LAB:retry1", {"kind": "structured", "output": {"choices": [
+        choice("HB", 2000004001, "EQUAL", 0.93),
+        choice("WT", 0, "UNMATCHED", 0.0),
+    ]}})
+    terms = [t for t in collect_terms(conn, schemas, load_spec(), privacy=cfg.privacy)
+             if t.source_vocabulary_id == "SRC_LAB" and t.source_code in {"HB", "WT", "SBP"}]
+    by = {d.source_code: d for d in map_terms(conn, schemas, terms, ReplayLLM(rec), cfg)}
+    assert by["HB"].target_concept_id == 2000004001      # the better concept found by the second search
+    assert by["WT"].target_concept_id == 2000004004      # retry found nothing better: first choice kept
+    assert by["SBP"].target_concept_id == 2000004006     # confident choice: not retried

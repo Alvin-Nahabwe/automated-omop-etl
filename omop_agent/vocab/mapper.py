@@ -94,7 +94,9 @@ flags. Read them with clinical knowledge, but map only when the meaning is clear
 when you are expanding an abbreviation or choosing between close options.
 - When no candidate fits, propose up to 3 better search phrases in retry_search_terms, such \
 as expanded abbreviations, generic drug names or full test names. The vocabulary will be \
-searched again with them.
+searched again with them. Do the same when you pick the best listed candidate but expect a \
+better one exists (give it a lower confidence): your choice is kept unless the new search \
+finds something better.
 - When units recorded with a lab test or observation are listed, choose the concept whose \
 property matches them: g/dL, mg/dL and g/L are mass concentrations ([Mass/volume]), mmol/L and \
 umol/L are molar ([Moles/volume]), and so on. Prefer a concept that names the specimen (e.g. \
@@ -676,9 +678,10 @@ def build_prompt(
     lines = [f"Source vocabulary: {source_vocabulary_id}", f"Target domain: {', '.join(domains)}", ""]
     if retry_phrases is not None:
         lines += [
-            "Second search. In the previous round no candidate fitted these terms, so the vocabulary was "
-            "searched again with the phrases you suggested. Choose from the updated candidates, or 0 if "
-            "none fits. There will be no further search.",
+            "Second search. In the previous round no candidate fitted these terms, or you expected a better "
+            "concept than the one you picked, so the vocabulary was searched again with the phrases you "
+            "suggested. Choose from the updated candidates, or 0 if none fits (a term you had already mapped "
+            "then keeps its first choice). There will be no further search.",
             "",
         ]
     else:
@@ -830,7 +833,10 @@ class _VocabMapper:
                     continue
                 out[t.source_code] = self._apply(t, ch)
                 suggested = [p.strip() for p in (ch.retry_search_terms if ch else []) if p.strip()]
-                if ch is not None and _unmatched(ch) and suggested:
+                # search again when nothing fitted, or when the model settled for a listed concept
+                # below the auto-approve bar and named a better one to look for
+                wants_better = ch is not None and ch.confidence < self.cfg.mapping.auto_approve_confidence
+                if ch is not None and suggested and (_unmatched(ch) or wants_better):
                     retry.append(t)
                     phrases[t.source_code] = suggested[:MAX_RETRY_PHRASES]
 
@@ -853,8 +859,13 @@ class _VocabMapper:
                 continue  # keep the first-round answer (unmapped)
             choices = _match_choices(batch, ans.choices)
             for t in batch:
-                if (ch := choices.get(t.source_code)) is not None:
-                    out[t.source_code] = self._apply(t, ch)
+                if (ch := choices.get(t.source_code)) is None:
+                    continue
+                if _unmatched(ch) and out[t.source_code].target_concept_id != 0:
+                    continue  # nothing better found: keep the first-round concept
+                keep_candidates = out[t.source_code].candidates
+                out[t.source_code] = self._apply(t, ch)
+                out[t.source_code].candidates = out[t.source_code].candidates or keep_candidates
         return out
 
 

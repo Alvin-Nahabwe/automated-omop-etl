@@ -312,8 +312,9 @@ class TermChoice(BaseModel):
     rationale: str
     retry_search_terms: list[str] = Field(
         default_factory=list,
-        description="If no candidate fits, up to 3 better search phrases (synonyms, expanded "
-        "abbreviations, generic drug names) to search the vocabulary again.",
+        description="If no candidate fits, or you chose the best listed one but a better concept "
+        "probably exists, up to 3 search phrases (synonyms, expanded abbreviations, generic drug names, "
+        "full test names) to search the vocabulary again.",
     )
 
 
