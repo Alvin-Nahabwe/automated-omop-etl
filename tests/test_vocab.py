@@ -460,8 +460,10 @@ def test_map_terms_with_replay(staged, tmp_path):
         assert c["system"] == MAPPER_SYSTEM
         for rare in RARE:
             assert rare not in c["prompt"]
-        assert 'source_code: "Malaria"' not in c["prompt"]
     prompts = {c["key"]: c["prompt"] for c in calls}
+    # exact matches still go to the model (as the top candidate), so related terms are mapped
+    # consistently; without an answer for them the exact match is used (asserted above)
+    assert 'source_code: "Malaria"' in prompts["SRC_VA_CAUSE:batch1"]
     assert "2000003002 | acetaminophen 500 MG Oral Tablet | Clinical Drug | RxNorm |" in prompts["SRC_DRUG:batch1"]
     retry = prompts["SRC_DRUG:retry1"]
     assert "AL 20/120 tabs" in retry and "artemether lumefantrine" in retry and "Paracetamol" not in retry

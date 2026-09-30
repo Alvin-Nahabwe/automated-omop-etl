@@ -8,8 +8,11 @@ names or phone numbers are never collected as terms. For each source vocabulary:
 1. terms seen fewer than ``privacy.min_cell_count`` times are *suppressed*: they get lexical
    candidates for the reviewer, are never sent to the LLM, and stay unmapped;
 2. a term equal to the name or a synonym of exactly one standard concept in the target
-   domain is mapped directly (method ``exact``);
-3. the other terms go to the LLM in batches, each with its top lexical candidates. The model
+   domain is an *exact* match. With an LLM it is still sent, as the top candidate, so that
+   related terms are mapped consistently (a live run mapped NEG to the LOINC answer "Neg"
+   through the shortcut while the model mapped POS to SNOMED "Positive"). The exact match is
+   used directly (method ``exact``) only when no LLM answer is available;
+3. the terms go to the LLM in batches, each with its top lexical candidates. The model
    picks one concept id (or 0) and may suggest better search phrases. A choice marked
    UNMATCHED is kept unmapped whatever id came with it;
 4. terms left unmapped with suggested phrases are searched again and sent once more;
@@ -737,6 +740,7 @@ class _VocabMapper:
         min_cell = self.cfg.privacy.min_cell_count
         ordered = sorted(terms, key=lambda t: (-t.frequency, t.source_code))
         out: dict[str, MappingDecision] = {}
+        exact: dict[str, MappingDecision] = {}  # used when the LLM gives no answer
         pending: list[SourceTerm] = []
         for t in ordered:
             hits = self.s.search(t.source_name, t.target_domain, self.k)
@@ -749,13 +753,13 @@ class _VocabMapper:
                     method="suppressed",
                     rationale="Below the small-cell threshold; not sent to the LLM. Review it manually.",
                 )
-            elif (d := _exact_match(t, hits)) is not None:
-                out[t.source_code] = d
             else:
+                if (d := _exact_match(t, hits)) is not None:
+                    exact[t.source_code] = d
                 pending.append(t)
         if self.llm_disabled is not None:
             for t in pending:
-                out[t.source_code] = _lexical(t, self.hits[t.source_code], self.llm_disabled)
+                out[t.source_code] = exact.get(t.source_code) or _lexical(t, self.hits[t.source_code], self.llm_disabled)
             return out
 
         # round 1: every pending term, in batches
@@ -765,11 +769,14 @@ class _VocabMapper:
             ans = self._call(f"{self.svid}:batch{n}", build_prompt(self.svid, batch, self.hits, self.k))
             if isinstance(ans, str):
                 for t in batch:
-                    out[t.source_code] = _lexical(t, self.hits[t.source_code], ans)
+                    out[t.source_code] = exact.get(t.source_code) or _lexical(t, self.hits[t.source_code], ans)
                 continue
             choices = _match_choices(batch, ans.choices)
             for t in batch:
                 ch = choices.get(t.source_code)
+                if ch is None and t.source_code in exact:
+                    out[t.source_code] = exact[t.source_code]
+                    continue
                 out[t.source_code] = self._apply(t, ch)
                 suggested = [p.strip() for p in (ch.retry_search_terms if ch else []) if p.strip()]
                 if ch is not None and _unmatched(ch) and suggested:
