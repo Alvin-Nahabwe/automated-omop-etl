@@ -14,7 +14,7 @@ from omop_agent.config import load_config
 from omop_agent.db import Schemas, connect, execute, qi, scalar
 from omop_agent.demo import create_demo_project
 from omop_agent.models import ETLSpec, RepairAction
-from omop_agent.pipeline import Pipeline, PipelineStopped
+from omop_agent.pipeline import Pipeline, PipelineStopped, SpecInvalid
 
 DB_URL = os.environ.get("OMOP_AGENT_TEST_DB_URL")
 
@@ -162,3 +162,21 @@ def test_harmful_repair_is_reverted(demo_project, tmp_path):
     spec = ETLSpec.model_validate(__import__("yaml").safe_load((cfg.workdir / "etl_spec.yaml").read_text()))
     end = next(f for f in spec.mapping_for("visit_occurrence").fields if f.target_field == "visit_end_date")
     assert "COALESCE" in end.expression
+
+
+@pytest.mark.postgres
+def test_unsafe_hand_edit_is_refused_at_build(demo_project):
+    import yaml
+
+    cfg = load_config(demo_project)
+    p = Pipeline(cfg, log=lambda m: None)
+    p.run_all()
+    spec = yaml.safe_load((cfg.workdir / "etl_spec.yaml").read_text())
+    person = next(m for m in spec["table_mappings"] if m["target_table"] == "person")
+    person["fields"].append({"target_field": "person_source_value", "kind": "expression", "expression": "i.first_name"})
+    person["fields"] = [f for f in person["fields"] if f["target_field"] != "person_source_value" or f["expression"] == "i.first_name"]
+    (cfg.workdir / "etl_spec.yaml").write_text(yaml.safe_dump(spec, sort_keys=False))
+    p2 = Pipeline(cfg, log=lambda m: None)
+    with pytest.raises(SpecInvalid, match="first_name"):
+        p2.build_check_repair()
+    p2.close()

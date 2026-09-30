@@ -129,7 +129,7 @@ def run(
 
     Re-running resumes: existing artifacts, including a hand-edited etl_spec.yaml and reviewed
     mappings, are kept unless --fresh / --redesign / --remap say otherwise."""
-    from .pipeline import PipelineStopped
+    from .pipeline import PipelineStopped, SpecInvalid
 
     p = _pipeline(config, yes)
     try:
@@ -137,6 +137,9 @@ def run(
     except PipelineStopped as e:
         console.print(f"[yellow]{e}[/]")
         raise typer.Exit(2)
+    except SpecInvalid as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(1)
     console.print(f"\n[bold {'green' if report.passed else 'red'}]{'PASSED' if report.passed else 'FAILED'}[/] -> {p.ws.report_html}")
     raise typer.Exit(0 if report.passed else 1)
 
@@ -211,6 +214,8 @@ def build(
     repair: bool = typer.Option(True, help="Run quality checks and the repair loop after building."),
 ) -> None:
     """Compile the spec to SQL and load the CDM."""
+    from .pipeline import SpecInvalid
+
     p = _pipeline(config)
     try:
         if repair:
@@ -218,6 +223,9 @@ def build(
             raise typer.Exit(0 if report.passed else 1)
         result = p.build()
         raise typer.Exit(0 if result.ok else 1)
+    except SpecInvalid as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(1)
     finally:
         p.close()
 

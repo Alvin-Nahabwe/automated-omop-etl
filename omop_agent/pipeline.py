@@ -39,6 +39,10 @@ class PipelineStopped(Exception):
     """Raised when a reviewer declines to continue at a gate."""
 
 
+class SpecInvalid(Exception):
+    """Raised when the ETL spec on disk has validation errors (e.g. after a hand edit)."""
+
+
 @dataclass
 class Pipeline:
     cfg: ProjectConfig
@@ -251,11 +255,30 @@ class Pipeline:
         self.ws.audit("mappings_reimported", rows=n)
         return n
 
+    def validated_spec(self) -> ETLSpec:
+        """Load etl_spec.yaml and validate it again: it may have been edited by hand since it was
+        designed. Errors (unsafe SQL, identifiers loaded into the CDM, events not linked through
+        the id maps, unknown fields, ...) stop the build; warnings are logged."""
+        from .design.validate import format_issues, validate_spec
+
+        spec = self.load_spec()
+        profile = self.load_profile() if self.ws.profile_json.exists() else None
+        issues = validate_spec(spec, profile, self.conn, self.schemas, privacy=self.cfg.privacy)
+        self.conn.rollback()
+        errors = [i for i in issues if i.severity == "error"]
+        for i in issues:
+            if i.severity != "error":
+                self.log(f"  spec warning: {i.message}")
+        if errors:
+            self.ws.audit("spec_invalid", errors=[str(i) for i in errors])
+            raise SpecInvalid(f"{self.ws.spec_yaml.name} has {len(errors)} error(s):\n{format_issues(errors)}")
+        return spec
+
     def build(self, spec: ETLSpec | None = None) -> ETLRunResult:
         from .etl.runner import run_etl
 
         def run() -> ETLRunResult:
-            result = run_etl(self.conn, self.schemas, spec or self.load_spec(), self.cfg, self.ws)
+            result = run_etl(self.conn, self.schemas, spec or self.validated_spec(), self.cfg, self.ws)
             loaded = sum(s.rows_inserted for s in result.steps if s.error is None)
             self.log(f"  {len(result.steps)} steps, {loaded} rows loaded, {len(result.errors())} errors")
             for s in result.errors():
@@ -307,7 +330,7 @@ class Pipeline:
             self.ws.repairs_json.replace(self.ws.root / "repairs.previous.json")
         if self.ws.spec_yaml.exists():  # the spec exactly as reviewed, before any automatic repair
             (self.ws.root / "etl_spec.before_repair.yaml").write_text(self.ws.spec_yaml.read_text())
-        spec = self.load_spec()
+        spec = self.validated_spec()
         profile = self.load_profile() if self.ws.profile_json.exists() else None
         max_iter = self.cfg.quality.max_repair_iterations
         iteration = 0

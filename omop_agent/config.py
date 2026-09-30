@@ -68,8 +68,10 @@ class TargetConfig(_Base):
     results_schema: str = "results"
     etl_role: str | None = Field(
         None,
-        description="Optional least-privilege role for running the generated ETL SQL (SET LOCAL ROLE): "
-        "SELECT on the staging/vocabulary schemas, INSERT/TRUNCATE on the CDM and ETL schemas.",
+        description="Optional least-privilege role for running the generated ETL SQL (SET LOCAL ROLE). It "
+        "needs USAGE and SELECT on the staging and vocabulary schemas, USAGE plus SELECT, INSERT and DELETE on "
+        "the CDM and ETL schemas, and the connecting user must be a member of it. Tables are emptied as the "
+        "connecting user, not this role.",
     )
 
     @model_validator(mode="after")

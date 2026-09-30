@@ -73,12 +73,18 @@ a Rabbit-in-a-Hat document, and it compiles directly to SQL. Each `TableMapping`
 | kind | SQL |
 |---|---|
 | `column`, `expression`, `constant` | the expression, cast to the CDM column type |
-| `person_id` | `JOIN etl.person_map pm ON pm.source_value = (expr)::text`: unmatched rows are dropped (and counted) |
+| `person_id` | `JOIN etl.person_map pm ON pm.source_value = (expr)::text`: unmatched rows are dropped (and counted). Required for every `person_id` field, including `person.person_id` |
 | `visit_id` | `LEFT JOIN etl.visit_map` (INNER when the field is required) |
 | `auto_id` | `max(existing id) + ROW_NUMBER() OVER ()`, so several mappings can feed one table |
 | `vocab_code` | `LEFT JOIN vocab.concept` on code+vocabulary, then `Maps to` for `concept_role: standard` |
 | `concept_map` | `LEFT JOIN etl.source_to_concept_map` on code+`source_vocabulary_id` |
 | `null` | `NULL` |
+
+The id maps are append-only, so a person keeps the same `person_id` across re-runs. After
+`person` and `visit_occurrence` load, map entries for people or visits that the mappings
+filtered out are pruned, so events can't point at them. The build re-validates the spec first,
+because it may have been edited by hand. Retention is measured before vocabulary fan-out
+(`TableLoadResult.retained_rows`), so one-to-many mappings can't hide dropped records.
 
 Concept lookups yield `0` when the source value exists but has no mapping. When the source
 value is NULL they yield NULL, or 0 if the CDM field is required. `varchar(n)` targets are
@@ -92,7 +98,9 @@ expressions and custom SQL resolve to the configured schemas.
 The built-in checks re-implement the Data Quality Dashboard field- and table-level checks in
 PostgreSQL. Names, thresholds and severities are read from DQD's own v5.4 metadata (bundled in
 `resources/ohdsi`), so results line up with DQD. An extra `etlRecordRetention` check compares
-source rows with loaded rows for each table mapping. The run passes when no check with a
+source rows with rows kept after the person/visit joins for each table mapping. DQD checks the
+built-in engine doesn't implement are listed as not applicable, and so is each empty table, as a
+single summary row. The run passes when no check with a
 blocking severity (default `fatal`) fails and no ETL step errored. Otherwise the repair agent
 gets the failures and a set of tools:
 
