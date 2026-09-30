@@ -529,7 +529,9 @@ def _cdm_source_sql(cdm_source: CdmSourceConfig | None) -> str:
             "    CURRENT_DATE,",
             "    '5.4',",
             "    COALESCE((SELECT concept_id FROM {vocab}.concept"
-            " WHERE vocabulary_id = 'CDM' AND concept_code = 'CDM v5.4' LIMIT 1), 0),",
+            # Athena codes CDM versions as 'CDM v5.4.0' (concept 756265), 'CDM v5.4.1', ...
+            " WHERE vocabulary_id = 'CDM' AND concept_code IN ('CDM v5.4.0', 'CDM v5.4')"
+            " ORDER BY concept_code DESC LIMIT 1), 0),",
             "    LEFT(COALESCE((SELECT vocabulary_version FROM {vocab}.vocabulary"
             " WHERE vocabulary_id = 'None'), 'unknown'), 20);",
         ]

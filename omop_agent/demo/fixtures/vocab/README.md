@@ -6,7 +6,8 @@ exists only so the demo and the tests can run without a licensed Athena download
 
 * Only these concept ids are real OMOP concepts: `0`, `8507` (MALE), `8532` (FEMALE),
   `9201` (Inpatient Visit), `9202` (Outpatient Visit), `9203` (Emergency Room Visit), and
-  `32817` (EHR). Their `concept_code` values are placeholders.
+  `32817` (EHR). Their ids, names and codes were checked against an Athena release
+  (vocabulary version `v5.0 29-AUG-26`).
 * Every other concept uses the local-concept range (`>= 2,000,000,000`). Its name reads like
   the real vocabulary so that mapping behaves realistically, but ids, codes and relationships
   are made up. ICD-10 and LOINC codes are real codes, used only as lookup keys.
