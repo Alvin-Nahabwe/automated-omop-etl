@@ -1,0 +1,397 @@
+{#- Inspection report (Markdown). Input: the dict from collect_report_data(). -#}
+# OMOP ETL inspection report: {{ project.name|md }}
+
+## 1. Summary
+
+**Verdict: {{ verdict }}**: {{ verdict_reasons|map('md')|join('; ') }}.
+
+| | |
+|---|---|
+| Project | {{ project.name|md }} |
+| Generated | {{ project.generated_at }} |
+| Verdict | **{{ verdict }}** |
+| CDM version | {{ project.cdm_version|md }} |
+| Vocabulary version | {{ project.vocabulary_version|md }} |
+| LLM (configured) | {{ project.llm|md }} |
+| LLM (used, from audit) | {{ project.llm_used|map('md')|join(', ') if project.llm_used else 'no calls recorded' }} |
+| Workspace | {{ project.workdir|md }} |
+| Small-cell threshold | counts below {{ project.min_cell_count }} are shown as "&lt;{{ project.min_cell_count }}" |
+{% if problems %}
+
+> **Unreadable artifacts** (skipped in this report):
+{% for p in problems %}
+> - {{ p|md }}
+{% endfor %}
+{% endif %}
+
+## 2. Pipeline timeline
+
+{% if timeline.has_state %}
+| Stage | Status | Updated | Details |
+|---|---|---|---|
+{% for s in timeline.stages %}
+| {{ s.stage }} | {{ s.status|md }} | {{ s.at }} | {{ s.details|md }} |
+{% endfor %}
+{% else %}
+_Not run: no state.json in the workspace._
+{% endif %}
+
+**Human approvals**
+{% if timeline.approvals %}
+
+| Time | Stage | Decision | Details |
+|---|---|---|---|
+{% for a in timeline.approvals %}
+| {{ a.at }} | {{ a.stage|md }} | {{ a.decision }} | {{ a.details|md }} |
+{% endfor %}
+{% else %}
+
+_None recorded._
+{% endif %}
+
+## 3. Source summary
+
+{% if source %}
+{{ source.n_tables }} tables, {{ source.n_rows|num }} rows, {{ source.n_columns }} columns ({{ source.source_type }} source, profiled {{ source.generated_at }}).
+
+| Table | Rows | Columns | PII columns | Description | Grain |
+|---|--:|--:|--:|---|---|
+{% for t in source.tables %}
+| {{ t.name|md }} | {{ t.n_rows|num }} | {{ t.n_columns }} | {{ t.n_pii }} | {{ t.description|md }} | {{ t.grain|md }} |
+{% endfor %}
+
+**PII columns withheld from the LLM** ({{ source.pii|length }})
+{% if source.pii %}
+
+{% for c in source.pii %}
+- {{ c.table|md }}.{{ c.column|md }}: {{ c.reason|md }}
+{% endfor %}
+{% else %}
+
+_None detected._
+{% endif %}
+
+**Date formats detected**
+{% if source.date_formats %}
+
+| Column | Format | Type |
+|---|---|---|
+{% for d in source.date_formats %}
+| {{ d.table|md }}.{{ d.column|md }} | {{ d.format|md }} | {{ d.type }} |
+{% endfor %}
+{% else %}
+
+_None detected._
+{% endif %}
+{% else %}
+_Not run: no profile.json in the workspace._
+{% endif %}
+
+**Notes and questions from the profile interpretation**
+{% if annotations is none %}
+
+_Not run: no annotations.json in the workspace._
+{% elif annotations.notes %}
+
+{% for n in annotations.notes %}
+- {{ n|md }}
+{% endfor %}
+{% else %}
+
+_None._
+{% endif %}
+
+## 4. ETL design
+
+{% if design %}
+{{ design.n_mappings }} table mappings, {{ design.n_fields }} field mappings, CDM {{ design.cdm_version|md }}. Person key: {{ design.person_key|md }}. Visit key: {{ design.visit_key|md if design.visit_key else 'none' }}. Observation period: {{ design.observation_period }}.
+
+Fields by kind: {% for k in design.kinds_total %}{{ k.kind }} {{ k.n }}{{ ', ' if not loop.last else '' }}{% endfor %}.
+
+| Target | Source | Joins / filter | Fields | Kinds | Rationale |
+|---|---|---|--:|---|---|
+{% for t in design.tables %}
+| {{ t.target }} | {{ t.source|md }} | {{ (t.joins + (['where ' ~ t.where] if t.where else []))|map('md')|join('; ') }} | {{ t.n_fields }} | {{ t.kinds }} | {{ t.rationale|md }} |
+{% endfor %}
+{% if design.custom_sql %}
+
+**Custom SQL steps**
+
+{% for c in design.custom_sql %}
+- {{ c.name|md }} → {{ c.target|md }}: {{ c.rationale|md }}
+{% endfor %}
+{% endif %}
+
+**Assumptions**
+{% if design.assumptions %}
+
+{% for a in design.assumptions %}
+- {{ a|md }}
+{% endfor %}
+{% else %}
+
+_None recorded._
+{% endif %}
+
+**Open questions**
+{% if design.open_questions %}
+
+{% for q in design.open_questions %}
+- {{ q|md }}
+{% endfor %}
+{% else %}
+
+_None._
+{% endif %}
+{% else %}
+_Not run: no etl_spec.yaml in the workspace._
+{% endif %}
+
+## 5. Vocabulary
+
+{% if vocab %}
+Vocabulary version: {{ vocab.vocabulary_version|md if vocab.vocabulary_version else 'unknown' }}. {{ vocab.loaded|length }} vocabularies loaded; {{ vocab.required|length }} required, {{ vocab.n_missing }} missing.
+
+{% if vocab.required %}
+| Required vocabulary | Present | Reason |
+|---|---|---|
+{% for r in vocab.required %}
+| {{ r.vocabulary_id|md }} | {{ 'yes' if r.present else '**MISSING**' }} | {{ r.reason|md }} |
+{% endfor %}
+
+{% endif %}
+**Code coverage**
+{% if vocab.coverage %}
+
+| Target field | Vocabulary | Source table | Distinct codes | Found | Mapped to standard | Records | Records mapped | Top unmatched |
+|---|---|---|--:|--:|--:|--:|--:|---|
+{% for c in vocab.coverage %}
+| {{ c.target|md }} | {{ c.vocabulary_id|md }} | {{ c.source_table|md }} | {{ c.distinct_codes|num }} | {{ c.codes_found|num }} | {{ c.codes_mapped|num }} | {{ c.records|num }} | {{ c.records_mapped|num }} ({{ c.pct|pct }}) | {{ ('ERROR: ' ~ c.error)|md if c.error else c.unmatched|md }} |
+{% endfor %}
+{% else %}
+
+_No coded fields evaluated._
+{% endif %}
+{% if vocab.issues %}
+
+**Issues**
+
+{% for i in vocab.issues %}
+- {{ i|md }}
+{% endfor %}
+{% endif %}
+{% else %}
+_Not run: no vocab_evaluation.json in the workspace._
+{% endif %}
+
+## 6. Vocabulary mapping
+
+{% if mapping %}
+| Source vocabulary | Terms | Approved | Unchecked | Flagged | Rejected | Unmapped (0) | Suppressed | Records mapped |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+{% for v in mapping.vocabularies + [mapping.totals] %}
+| {{ '**all**' if loop.last else v.source_vocabulary_id|md }} | {{ v.terms|num }} | {{ v.approved|num }} | {{ v.unchecked|num }} | {{ v.flagged|num }} | {{ v.rejected|num }} | {{ v.unmapped|num }} | {{ v.suppressed|num }} | {{ v.records_mapped|num }} / {{ v.records|num }} ({{ v.pct|pct }}) |
+{% endfor %}
+
+UNCHECKED mappings are {{ 'loaded into' if mapping.use_unchecked_in_etl else 'excluded from' }} the ETL (`mapping.use_unchecked_in_etl`).
+
+**Terms needing human review** ({{ mapping.review_total }})
+{% if mapping.review %}
+
+| Status | Vocabulary | Code | Term | Frequency | Proposed concept | Equivalence | Confidence |
+|---|---|---|---|--:|---|---|--:|
+{% for r in mapping.review %}
+| {{ r.status }} | {{ r.vocabulary|md }} | {{ r.code|md }} | {{ r.name|md }} | {{ r.frequency|md }} | {{ r.concept|md }} | {{ r.equivalence }} | {{ r.confidence }} |
+{% endfor %}
+{% if mapping.review_total > mapping.review|length %}
+
+_{{ mapping.review_total - mapping.review|length }} more in mappings/*.csv._
+{% endif %}
+{% else %}
+
+_None: every term has been reviewed._
+{% endif %}
+{% else %}
+_Not run: no mappings/decisions.json in the workspace._
+{% endif %}
+
+## 7. ETL run
+
+{% if etl %}
+Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }} ({{ etl.duration|secs }}){% endif %}. {{ etl.steps|length }} steps, {{ etl.total_rows|num }} rows loaded, {{ etl.n_errors }} error(s).
+
+| Step | Table | Rows inserted | Source rows | Retention | Time | Error |
+|---|---|--:|--:|--:|--:|---|
+{% for s in etl.steps %}
+| {{ s.step|md }} | {{ s.table|md }} | {{ s.rows|num }} | {{ s.source_rows|num }} | {{ s.retention|pct }} | {{ s.seconds|secs }} | {{ ('**ERROR** ' ~ s.error)|md if s.error else '' }} |
+{% endfor %}
+{% else %}
+_Not run: no etl_run.json in the workspace._
+{% endif %}
+
+## 8. Data quality
+
+{% if dq %}
+{{ dq.n_checks }} checks ({{ dq.engine }} engine) run {{ dq.run_at }}: **{{ 'PASSED' if dq.passed else 'FAILED' }}**, {{ dq.failed|length }} failed, {{ dq.n_blocking }} blocking, {{ dq.errors|length }} errored.
+{% if dq.blocking_failures %}
+
+> **Blocking failures ({{ dq.blocking_failures|length }})**
+>
+{% for b in dq.blocking_failures %}
+> - {{ b|md }}
+{% endfor %}
+{% endif %}
+
+| Severity | Passed | Failed | Error | Not applicable | Total |
+|---|--:|--:|--:|--:|--:|
+{% for r in dq.by_severity %}
+| {{ '**total**' if loop.last else r.name }} | {{ r.passed }} | {{ r.failed }} | {{ r.error }} | {{ r.not_applicable }} | {{ r.total }} |
+{% endfor %}
+
+| Kahn category | Passed | Failed | Error | Not applicable | Total |
+|---|--:|--:|--:|--:|--:|
+{% for r in dq.by_category %}
+| {{ '**total**' if loop.last else r.name|md }} | {{ r.passed }} | {{ r.failed }} | {{ r.error }} | {{ r.not_applicable }} | {{ r.total }} |
+{% endfor %}
+
+**Failed checks**
+{% if dq.failed %}
+
+| Blocking | Check | Severity | Category | Violated rows | % violated | Threshold | Description |
+|---|---|---|---|--:|--:|--:|---|
+{% for f in dq.failed %}
+| {{ '**BLOCKING**' if f.blocking else '' }} | {{ f.key|md }} | {{ f.severity }} | {{ f.category|md }} | {{ f.violated|num }} / {{ f.denominator|num }} | {{ f.pct|pct(2) }} | {{ f.threshold }} | {{ f.description|md }} |
+{% endfor %}
+{% else %}
+
+_None._
+{% endif %}
+{% if dq.errors %}
+
+**Checks that errored**
+
+{% for e in dq.errors %}
+- {{ '**BLOCKING** ' if e.blocking else '' }}{{ e.key|md }} ({{ e.severity }}): {{ e.error|md }}
+{% endfor %}
+{% endif %}
+{% else %}
+_Not run: no dq_results.json in the workspace._
+{% endif %}
+
+## 9. Repair log
+
+{% if repairs is none %}
+_Not run: no repairs.json in the workspace._
+{% elif not repairs.iterations %}
+_The repair agent made no changes._
+{% else %}
+{{ repairs.n_actions }} change(s) over {{ repairs.iterations|length }} iteration(s).
+{% for it in repairs.iterations %}
+
+**Iteration {{ it.iteration }}**
+
+| Field | Change | Rationale | Trigger |
+|---|---|---|---|
+{% for a in it.actions %}
+| {{ a.target|md }} | {{ a.change|md }} | {{ a.rationale|md }} | {{ a.trigger|md }} |
+{% endfor %}
+{% endfor %}
+{% endif %}
+
+## 10. CDM characterization
+
+{% if cdm %}
+Counts below {{ cdm.min_cell_count }} are shown as "&lt;{{ cdm.min_cell_count }}".{% if cdm.cdm_source %} CDM source: {{ cdm.cdm_source.cdm_source_name|md }} (CDM {{ cdm.cdm_source.cdm_version|md }}, vocabulary {{ cdm.cdm_source.vocabulary_version|md }}).{% endif %}
+
+
+**Record counts**
+{% if cdm.record_counts %}
+
+| Table | Records | |
+|---|--:|---|
+{% for r in cdm.record_counts %}
+| {{ r.table }} | {{ r.display|md }} | {{ r.bar|textbar }} |
+{% endfor %}
+{% else %}
+
+_The CDM tables are empty._
+{% endif %}
+{% if cdm.gender %}
+
+**Persons by gender**
+
+| Gender | Concept id | Persons | |
+|---|--:|--:|---|
+{% for r in cdm.gender %}
+| {{ r.concept_name|md }} | {{ r.concept_id }} | {{ r.display|md }} | {{ r.bar|textbar }} |
+{% endfor %}
+{% endif %}
+{% if cdm.birth_decades %}
+
+**Year of birth by decade**
+
+| Decade | Persons | |
+|---|--:|---|
+{% for r in cdm.birth_decades %}
+| {{ r.decade }} | {{ r.display|md }} | {{ r.bar|textbar }} |
+{% endfor %}
+{% endif %}
+{% if cdm.observation_period %}
+
+**Observation period length**: {{ cdm.observation_period.periods|md }} periods for {{ cdm.observation_period.persons|md }} persons;
+{% if cdm.observation_period.suppressed %}
+distribution withheld (fewer than {{ cdm.min_cell_count }} periods).
+{% else %}
+median {{ cdm.observation_period.median_days|num }} days (p10 {{ cdm.observation_period.p10_days|num }}, p90 {{ cdm.observation_period.p90_days|num }}).
+{% endif %}
+{% endif %}
+{% for t in cdm.top_concepts %}
+
+**Top concepts: {{ t.table }}** ({{ t.field }})
+
+| Concept id | Name | Records | |
+|--:|---|--:|---|
+{% for r in t.rows %}
+| {{ r.concept_id }} | {{ r.concept_name|md }} | {{ r.display|md }} | {{ r.bar|textbar }} |
+{% endfor %}
+{% endfor %}
+{% if cdm.errors %}
+
+**Queries that failed**
+
+{% for e in cdm.errors %}
+- {{ e|md }}
+{% endfor %}
+{% endif %}
+{% else %}
+_{{ cdm_note|md }}_
+{% endif %}
+
+## 11. LLM usage
+
+Configured: {{ project.llm|md }}. {{ llm.totals.calls }} call(s), {{ llm.totals.input_tokens|num }} input tokens (+{{ llm.totals.cache_read|num }} read from cache, {{ llm.totals.cache_write|num }} written to cache), {{ llm.totals.output_tokens|num }} output tokens, {{ llm.totals.errors }} error(s).
+{% if llm.stages %}
+
+| Stage | Calls | Input tokens | Cache read | Cache write | Output tokens | Errors | Time |
+|---|--:|--:|--:|--:|--:|--:|--:|
+{% for s in llm.stages %}
+| {{ s.stage|md }} | {{ s.calls }} | {{ s.input_tokens|num }} | {{ s.cache_read|num }} | {{ s.cache_write|num }} | {{ s.output_tokens|num }} | {{ s.errors }} | {{ s.seconds|secs }} |
+{% endfor %}
+{% endif %}
+{% if llm.errors %}
+
+**LLM errors**{% if llm.n_errors > llm.errors|length %} (first {{ llm.errors|length }} of {{ llm.n_errors }}){% endif %}
+
+
+{% for e in llm.errors %}
+- {{ e.stage|md }} / {{ e.key|md }}: {{ e.error|md }}
+{% endfor %}
+{% endif %}
+
+Every prompt and response is stored verbatim under `llm_calls/` ({{ llm.n_records }} record(s)). Prompts contain aggregate metadata only; no patient rows are sent.
+
+## 12. Next steps
+
+{% for s in next_steps %}
+- [{{ 'x' if s.done else ' ' }}] {{ s.text }}
+{% endfor %}

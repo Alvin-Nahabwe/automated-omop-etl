@@ -1,0 +1,500 @@
+{#- Inspection report (HTML, self-contained: inline CSS, no scripts, no external assets). -#}
+{#- Input: the dict from collect_report_data(); rendered with autoescape on. -#}
+{% macro empty(msg) %}<p class="empty">{{ msg }}</p>{% endmacro %}
+{% macro badge(text, cls=none) %}<span class="badge b-{{ cls or (text|statuscls) }}">{{ text }}</span>{% endmacro %}
+{% macro bar(r) %}<td class="barcell">{% if r.bar %}<span class="bar" style="width: {{ r.bar }}%" title="{{ r.display }}"></span>{% elif r.suppressed %}<span class="supp" title="suppressed: fewer than {{ project.min_cell_count }}"></span>{% endif %}</td>{% endmacro %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>OMOP ETL inspection: {{ project.name }}</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f4f1; --surface: #fcfcfb; --text: #0b0b0b; --text-2: #52514e; --muted: #6f6e69;
+  --border: #e2e1dc; --zebra: #f3f2ee; --code-bg: #eeede9; --link: #1c5cab;
+  --bar: #2a78d6;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --good-tint: #e9f6e9; --warning-tint: #fdf4de; --critical-tint: #fbebeb;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --text: #ffffff; --text-2: #c3c2b7; --muted: #9c9b92;
+    --border: #353430; --zebra: #20201e; --code-bg: #272724; --link: #86b6ef;
+    --bar: #3987e5;
+    --good-tint: #16291a; --warning-tint: #2e2612; --critical-tint: #331c1c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --text: #ffffff; --text-2: #c3c2b7; --muted: #9c9b92;
+  --border: #353430; --zebra: #20201e; --code-bg: #272724; --link: #86b6ef;
+  --bar: #3987e5;
+  --good-tint: #16291a; --warning-tint: #2e2612; --critical-tint: #331c1c;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+main { max-width: 1120px; margin: 0 auto; padding: 32px 20px 64px; }
+h1 { font-size: 26px; line-height: 1.25; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 19px; margin: 0 0 14px; display: flex; align-items: baseline; gap: 10px; }
+h2 .sn { color: var(--muted); font-variant-numeric: tabular-nums; font-weight: 600; min-width: 1.4em; }
+h3 { font-size: 15px; margin: 22px 0 8px; }
+p { margin: 8px 0; }
+a { color: var(--link); }
+code { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+.sub { color: var(--text-2); margin: 0 0 20px; }
+.muted { color: var(--muted); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 22px 24px; margin: 18px 0; }
+.empty { color: var(--muted); font-style: italic; }
+
+.verdict { display: flex; gap: 14px; align-items: flex-start; border-radius: 10px; padding: 16px 20px; margin: 18px 0; border: 1px solid var(--border); border-left: 6px solid var(--status); background: var(--tint); }
+.verdict .icon { flex: none; width: 34px; height: 34px; border-radius: 50%; background: var(--status); color: #fff; display: grid; place-items: center; font-weight: 700; font-size: 18px; }
+.verdict .label { font-size: 22px; font-weight: 700; letter-spacing: 0.04em; }
+.verdict ul { margin: 4px 0 0; padding-left: 18px; color: var(--text-2); }
+.v-passed { --status: var(--good); --tint: var(--good-tint); }
+.v-failed { --status: var(--critical); --tint: var(--critical-tint); }
+.v-incomplete { --status: var(--warning); --tint: var(--warning-tint); }
+.v-incomplete .icon { color: #0b0b0b; }
+
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px 24px; margin: 0; }
+.facts div { min-width: 0; }
+.facts dt { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+.facts dd { margin: 2px 0 0; overflow-wrap: anywhere; }
+
+.toc ol { columns: 3 200px; margin: 0; padding-left: 20px; color: var(--muted); }
+.toc li { margin: 2px 0; }
+
+.stats { display: flex; flex-wrap: wrap; gap: 10px 28px; margin: 4px 0 12px; }
+.stat .v { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.stat .k { color: var(--muted); font-size: 12px; }
+
+.tw { overflow-x: auto; margin: 8px 0 4px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; vertical-align: top; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+th { font-size: 12px; font-weight: 600; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap; border-bottom-width: 2px; }
+tbody tr:nth-child(even) { background: var(--zebra); }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.wrap { overflow-wrap: anywhere; min-width: 16ch; }
+td.err { color: var(--text); overflow-wrap: anywhere; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+tr.total td { font-weight: 650; border-top: 2px solid var(--border); background: transparent; }
+tr.blocking td:first-child { box-shadow: inset 4px 0 0 var(--critical); }
+
+.barcell { width: 38%; min-width: 120px; vertical-align: middle; }
+.bar { display: block; height: 12px; max-width: 100%; background: var(--bar); border-radius: 0 4px 4px 0; }
+.supp { display: block; width: 14px; height: 12px; border: 1px dashed var(--muted); border-left: 0; border-radius: 0 4px 4px 0; }
+
+.badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; white-space: nowrap; padding: 1px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text); }
+.badge::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--dot, var(--muted)); }
+.b-ok { --dot: var(--good); }
+.b-fail { --dot: var(--critical); }
+.b-warn { --dot: var(--warning); }
+.b-muted { color: var(--muted); }
+
+.callout { border: 1px solid var(--border); border-left: 4px solid var(--critical); background: var(--critical-tint); border-radius: 8px; padding: 10px 14px; margin: 10px 0; }
+.callout.warn { border-left-color: var(--warning); background: var(--warning-tint); }
+ul.plain { margin: 6px 0; padding-left: 20px; }
+ul.plain li { margin: 3px 0; }
+
+ul.checklist { list-style: none; padding: 0; margin: 0; }
+ul.checklist li { display: flex; gap: 12px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid var(--border); }
+ul.checklist li:last-child { border-bottom: 0; }
+.box { flex: none; width: 18px; height: 18px; margin-top: 3px; border: 2px solid var(--muted); border-radius: 4px; display: grid; place-items: center; font-size: 12px; line-height: 1; }
+li.done .box { background: var(--good); border-color: var(--good); color: #fff; }
+li.done .txt { color: var(--text-2); text-decoration: line-through; text-decoration-color: var(--muted); }
+
+footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 32px; }
+@media (max-width: 640px) { main { padding: 20px 12px 48px; } .card { padding: 16px; } .barcell { min-width: 80px; } }
+@media print { body { background: #fff; } .toc { display: none; } .card { break-inside: avoid-page; border-color: #ccc; } }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>OMOP ETL inspection report: {{ project.name }}</h1>
+  <p class="sub">Generated {{ project.generated_at }} by omop-agent</p>
+</header>
+
+{# ---------------------------------------------------------------- 1. summary #}
+<section id="s1" class="card" aria-labelledby="h1s">
+  <h2 id="h1s"><span class="sn">1</span>Summary</h2>
+  <div class="verdict v-{{ verdict|lower }}" role="status">
+    <span class="icon" aria-hidden="true">{{ {'PASSED': '✓', 'FAILED': '✕'}.get(verdict, '!') }}</span>
+    <div>
+      <div class="label">{{ verdict }}</div>
+      <ul>{% for r in verdict_reasons %}<li>{{ r }}</li>{% endfor %}</ul>
+    </div>
+  </div>
+  <dl class="facts">
+    <div><dt>Project</dt><dd>{{ project.name }}</dd></div>
+    <div><dt>Generated</dt><dd>{{ project.generated_at }}</dd></div>
+    <div><dt>CDM version</dt><dd>{{ project.cdm_version }}</dd></div>
+    <div><dt>Vocabulary version</dt><dd>{{ project.vocabulary_version }}</dd></div>
+    <div><dt>LLM (configured)</dt><dd>{{ project.llm }}</dd></div>
+    <div><dt>LLM (used, from audit)</dt><dd>{{ project.llm_used|join(', ') if project.llm_used else 'no calls recorded' }}</dd></div>
+    <div><dt>Workspace</dt><dd><code>{{ project.workdir }}</code></dd></div>
+    <div><dt>Small-cell threshold</dt><dd>counts below {{ project.min_cell_count }} shown as &lt;{{ project.min_cell_count }}</dd></div>
+  </dl>
+  {% if problems %}
+  <div class="callout warn"><strong>Unreadable artifacts</strong> (skipped in this report)
+    <ul class="plain">{% for p in problems %}<li>{{ p }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+  <nav class="toc" aria-label="Contents">
+    <ol start="2">
+      <li><a href="#s2">Pipeline timeline</a></li><li><a href="#s3">Source summary</a></li>
+      <li><a href="#s4">ETL design</a></li><li><a href="#s5">Vocabulary</a></li>
+      <li><a href="#s6">Vocabulary mapping</a></li><li><a href="#s7">ETL run</a></li>
+      <li><a href="#s8">Data quality</a></li><li><a href="#s9">Repair log</a></li>
+      <li><a href="#s10">CDM characterization</a></li><li><a href="#s11">LLM usage</a></li>
+      <li><a href="#s12">Next steps</a></li>
+    </ol>
+  </nav>
+</section>
+
+{# ---------------------------------------------------------------- 2. timeline #}
+<section id="s2" class="card">
+  <h2><span class="sn">2</span>Pipeline timeline</h2>
+  {% if timeline.has_state %}
+  <div class="tw"><table>
+    <thead><tr><th>Stage</th><th>Status</th><th>Updated</th><th>Details</th></tr></thead>
+    <tbody>
+    {% for s in timeline.stages %}
+      <tr><td>{{ s.stage }}</td><td>{{ badge(s.status) }}</td><td class="n">{{ s.at }}</td><td class="wrap">{{ s.details }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}{{ empty('Not run: no state.json in the workspace.') }}{% endif %}
+  <h3>Human approvals</h3>
+  {% if timeline.approvals %}
+  <div class="tw"><table>
+    <thead><tr><th>Time</th><th>Stage</th><th>Decision</th><th>Details</th></tr></thead>
+    <tbody>
+    {% for a in timeline.approvals %}
+      <tr><td class="n">{{ a.at }}</td><td>{{ a.stage }}</td><td>{{ badge(a.decision, {'approved': 'ok', 'declined': 'fail'}.get(a.decision, 'muted')) }}</td><td class="wrap">{{ a.details }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}{{ empty('None recorded.') }}{% endif %}
+</section>
+
+{# ---------------------------------------------------------------- 3. source #}
+<section id="s3" class="card">
+  <h2><span class="sn">3</span>Source summary</h2>
+  {% if source %}
+  <div class="stats">
+    <div class="stat"><div class="v">{{ source.n_tables }}</div><div class="k">tables</div></div>
+    <div class="stat"><div class="v">{{ source.n_rows|num }}</div><div class="k">rows</div></div>
+    <div class="stat"><div class="v">{{ source.n_columns }}</div><div class="k">columns</div></div>
+    <div class="stat"><div class="v">{{ source.pii|length }}</div><div class="k">PII columns withheld</div></div>
+  </div>
+  <p class="muted">{{ source.source_type }} source, profiled {{ source.generated_at }}.</p>
+  <div class="tw"><table>
+    <thead><tr><th>Table</th><th class="n">Rows</th><th class="n">Columns</th><th class="n">PII</th><th>Description</th><th>Grain</th></tr></thead>
+    <tbody>
+    {% for t in source.tables %}
+      <tr><td>{{ t.name }}</td><td class="n">{{ t.n_rows|num }}</td><td class="n">{{ t.n_columns }}</td><td class="n">{{ t.n_pii }}</td><td class="wrap">{{ t.description }}</td><td class="wrap">{{ t.grain }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  <h3>PII columns withheld from the LLM</h3>
+  {% if source.pii %}
+  <ul class="plain">{% for c in source.pii %}<li><code>{{ c.table }}.{{ c.column }}</code>: {{ c.reason }}</li>{% endfor %}</ul>
+  {% else %}{{ empty('None detected.') }}{% endif %}
+  <h3>Date formats detected</h3>
+  {% if source.date_formats %}
+  <div class="tw"><table>
+    <thead><tr><th>Column</th><th>Format</th><th>Type</th></tr></thead>
+    <tbody>{% for d in source.date_formats %}<tr><td><code>{{ d.table }}.{{ d.column }}</code></td><td><code>{{ d.format }}</code></td><td>{{ d.type }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% else %}{{ empty('None detected.') }}{% endif %}
+  {% else %}{{ empty('Not run: no profile.json in the workspace.') }}{% endif %}
+  <h3>Notes and questions from the profile interpretation</h3>
+  {% if annotations is none %}{{ empty('Not run: no annotations.json in the workspace.') }}
+  {% elif annotations.notes %}<ul class="plain">{% for n in annotations.notes %}<li>{{ n }}</li>{% endfor %}</ul>
+  {% else %}{{ empty('None.') }}{% endif %}
+</section>
+
+{# ---------------------------------------------------------------- 4. design #}
+<section id="s4" class="card">
+  <h2><span class="sn">4</span>ETL design</h2>
+  {% if design %}
+  <div class="stats">
+    <div class="stat"><div class="v">{{ design.n_mappings }}</div><div class="k">table mappings</div></div>
+    <div class="stat"><div class="v">{{ design.n_fields }}</div><div class="k">field mappings</div></div>
+    <div class="stat"><div class="v">{{ design.open_questions|length }}</div><div class="k">open questions</div></div>
+  </div>
+  <p>CDM {{ design.cdm_version }} · person key <code>{{ design.person_key }}</code> · visit key {% if design.visit_key %}<code>{{ design.visit_key }}</code>{% else %}none{% endif %} · observation period: {{ design.observation_period }}</p>
+  <p class="muted">Fields by kind: {% for k in design.kinds_total %}{{ k.kind }} {{ k.n }}{{ ' · ' if not loop.last else '' }}{% endfor %}</p>
+  <div class="tw"><table>
+    <thead><tr><th>Target</th><th>Source</th><th>Joins / filter</th><th class="n">Fields</th><th>Kinds</th><th>Rationale</th></tr></thead>
+    <tbody>
+    {% for t in design.tables %}
+      <tr>
+        <td><strong>{{ t.target }}</strong></td>
+        <td>← <code>{{ t.source }}</code></td>
+        <td class="wrap">{% for j in t.joins %}<code>{{ j }}</code><br>{% endfor %}{% if t.where %}<code>where {{ t.where }}</code>{% endif %}</td>
+        <td class="n">{{ t.n_fields }}</td><td class="wrap">{{ t.kinds }}</td><td class="wrap">{{ t.rationale }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% if design.custom_sql %}
+  <h3>Custom SQL steps</h3>
+  <ul class="plain">{% for c in design.custom_sql %}<li><code>{{ c.name }}</code> → {{ c.target }}: {{ c.rationale }}</li>{% endfor %}</ul>
+  {% endif %}
+  <h3>Assumptions</h3>
+  {% if design.assumptions %}<ul class="plain">{% for a in design.assumptions %}<li>{{ a }}</li>{% endfor %}</ul>{% else %}{{ empty('None recorded.') }}{% endif %}
+  <h3>Open questions</h3>
+  {% if design.open_questions %}<ul class="plain">{% for q in design.open_questions %}<li>{{ q }}</li>{% endfor %}</ul>{% else %}{{ empty('None.') }}{% endif %}
+  {% else %}{{ empty('Not run: no etl_spec.yaml in the workspace.') }}{% endif %}
+</section>
+
+{# ---------------------------------------------------------------- 5. vocabulary #}
+<section id="s5" class="card">
+  <h2><span class="sn">5</span>Vocabulary</h2>
+  {% if vocab %}
+  <p>Vocabulary version: <strong>{{ vocab.vocabulary_version or 'unknown' }}</strong> · {{ vocab.loaded|length }} vocabularies loaded · {{ vocab.required|length }} required, {{ vocab.n_missing }} missing</p>
+  {% if vocab.required %}
+  <div class="tw"><table>
+    <thead><tr><th>Required vocabulary</th><th>Present</th><th>Reason</th></tr></thead>
+    <tbody>{% for r in vocab.required %}<tr><td>{{ r.vocabulary_id }}</td><td>{{ badge('present', 'ok') if r.present else badge('missing', 'fail') }}</td><td class="wrap">{{ r.reason }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+  <h3>Code coverage</h3>
+  {% if vocab.coverage %}
+  <div class="tw"><table>
+    <thead><tr><th>Target field</th><th>Vocabulary</th><th>Source table</th><th class="n">Distinct codes</th><th class="n">Found</th><th class="n">Mapped to standard</th><th class="n">Records</th><th class="n">Records mapped</th><th class="n">%</th><th>Top unmatched</th></tr></thead>
+    <tbody>
+    {% for c in vocab.coverage %}
+      <tr><td><code>{{ c.target }}</code></td><td>{{ c.vocabulary_id }}</td><td>{{ c.source_table }}</td><td class="n">{{ c.distinct_codes|num }}</td><td class="n">{{ c.codes_found|num }}</td><td class="n">{{ c.codes_mapped|num }}</td><td class="n">{{ c.records|num }}</td><td class="n">{{ c.records_mapped|num }}</td><td class="n">{{ c.pct|pct }}</td><td class="wrap">{% if c.error %}{{ badge('error', 'fail') }} {{ c.error }}{% else %}{{ c.unmatched }}{% endif %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}{{ empty('No coded fields evaluated.') }}{% endif %}
+  {% if vocab.issues %}
+  <h3>Issues</h3>
+  <ul class="plain">{% for i in vocab.issues %}<li>{{ i }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% else %}{{ empty('Not run: no vocab_evaluation.json in the workspace.') }}{% endif %}
+</section>
+
+{# ---------------------------------------------------------------- 6. mapping #}
+<section id="s6" class="card">
+  <h2><span class="sn">6</span>Vocabulary mapping</h2>
+  {% if mapping %}
+  <div class="tw"><table>
+    <thead><tr><th>Source vocabulary</th><th class="n">Terms</th><th class="n">Approved</th><th class="n">Unchecked</th><th class="n">Flagged</th><th class="n">Rejected</th><th class="n">Unmapped (0)</th><th class="n">Suppressed</th><th class="n">Records mapped</th><th class="n">%</th></tr></thead>
+    <tbody>
+    {% for v in mapping.vocabularies + [mapping.totals] %}
+      <tr{% if loop.last %} class="total"{% endif %}><td>{{ v.source_vocabulary_id }}</td><td class="n">{{ v.terms|num }}</td><td class="n">{{ v.approved|num }}</td><td class="n">{{ v.unchecked|num }}</td><td class="n">{{ v.flagged|num }}</td><td class="n">{{ v.rejected|num }}</td><td class="n">{{ v.unmapped|num }}</td><td class="n">{{ v.suppressed|num }}</td><td class="n">{{ v.records_mapped|num }} / {{ v.records|num }}</td><td class="n">{{ v.pct|pct }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  <p class="muted">UNCHECKED mappings are {{ 'loaded into' if mapping.use_unchecked_in_etl else 'excluded from' }} the ETL (<code>mapping.use_unchecked_in_etl</code>).</p>
+  <h3>Terms needing human review ({{ mapping.review_total }})</h3>
+  {% if mapping.review %}
+  <div class="tw"><table>
+    <thead><tr><th>Status</th><th>Vocabulary</th><th>Code</th><th>Term</th><th class="n">Frequency</th><th>Proposed concept</th><th>Equivalence</th><th class="n">Confidence</th></tr></thead>
+    <tbody>
+    {% for r in mapping.review %}
+      <tr><td>{{ badge(r.status, 'warn' if r.status == 'UNCHECKED' else 'fail') }}</td><td>{{ r.vocabulary }}</td><td><code>{{ r.code }}</code></td><td class="wrap">{{ r.name }}</td><td class="n">{{ r.frequency }}</td><td class="wrap">{{ r.concept }}</td><td>{{ r.equivalence }}</td><td class="n">{{ r.confidence }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% if mapping.review_total > mapping.review|length %}<p class="muted">{{ mapping.review_total - mapping.review|length }} more in <code>mappings/*.csv</code>.</p>{% endif %}
+  {% else %}{{ empty('None: every term has been reviewed.') }}{% endif %}
+  {% else %}{{ empty('Not run: no mappings/decisions.json in the workspace.') }}{% endif %}
+</section>
+
+{# ---------------------------------------------------------------- 7. ETL run #}
+<section id="s7" class="card">
+  <h2><span class="sn">7</span>ETL run</h2>
+  {% if etl %}
+  <div class="stats">
+    <div class="stat"><div class="v">{{ etl.steps|length }}</div><div class="k">steps</div></div>
+    <div class="stat"><div class="v">{{ etl.total_rows|num }}</div><div class="k">rows loaded</div></div>
+    <div class="stat"><div class="v">{{ etl.n_errors }}</div><div class="k">errors</div></div>
+    <div class="stat"><div class="v">{{ etl.duration|secs }}</div><div class="k">duration</div></div>
+  </div>
+  <p class="muted">Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }}{% endif %}.</p>
+  <div class="tw"><table>
+    <thead><tr><th>Step</th><th>Table</th><th class="n">Rows inserted</th><th class="n">Source rows</th><th class="n">Retention</th><th class="n">Time</th><th>Error</th></tr></thead>
+    <tbody>
+    {% for s in etl.steps %}
+      <tr{% if s.error %} class="blocking"{% endif %}><td>{{ s.step }}</td><td>{{ s.table }}</td><td class="n">{{ s.rows|num }}</td><td class="n">{{ s.source_rows|num }}</td><td class="n">{{ s.retention|pct }}</td><td class="n">{{ s.seconds|secs }}</td><td class="err">{% if s.error %}{{ badge('error', 'fail') }} {{ s.error }}{% endif %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}{{ empty('Not run: no etl_run.json in the workspace.') }}{% endif %}
+</section>
+
+{# ---------------------------------------------------------------- 8. data quality #}
+<section id="s8" class="card">
+  <h2><span class="sn">8</span>Data quality</h2>
+  {% if dq %}
+  <div class="stats">
+    <div class="stat"><div class="v">{{ badge('passed', 'ok') if dq.passed else badge('failed', 'fail') }}</div><div class="k">gate</div></div>
+    <div class="stat"><div class="v">{{ dq.n_checks|num }}</div><div class="k">checks</div></div>
+    <div class="stat"><div class="v">{{ dq.failed|length }}</div><div class="k">failed</div></div>
+    <div class="stat"><div class="v">{{ dq.n_blocking }}</div><div class="k">blocking</div></div>
+    <div class="stat"><div class="v">{{ dq.errors|length }}</div><div class="k">errored</div></div>
+  </div>
+  <p class="muted">{{ dq.engine }} engine, run {{ dq.run_at }}.</p>
+  {% if dq.blocking_failures %}
+  <div class="callout"><strong>Blocking failures ({{ dq.blocking_failures|length }})</strong>
+    <ul class="plain">{% for b in dq.blocking_failures %}<li><code>{{ b }}</code></li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+  {% for title, rows in [('Severity', dq.by_severity), ('Kahn category', dq.by_category)] %}
+  <div class="tw"><table>
+    <thead><tr><th>{{ title }}</th><th class="n">Passed</th><th class="n">Failed</th><th class="n">Error</th><th class="n">Not applicable</th><th class="n">Total</th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr{% if loop.last %} class="total"{% endif %}><td>{{ r.name }}</td><td class="n">{{ r.passed }}</td><td class="n">{{ r.failed }}</td><td class="n">{{ r.error }}</td><td class="n">{{ r.not_applicable }}</td><td class="n">{{ r.total }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endfor %}
+  <h3>Failed checks</h3>
+  {% if dq.failed %}
+  <div class="tw"><table>
+    <thead><tr><th>Check</th><th>Severity</th><th>Category</th><th class="n">Violated rows</th><th class="n">% violated</th><th class="n">Threshold</th><th>Description</th></tr></thead>
+    <tbody>
+    {% for f in dq.failed %}
+      <tr{% if f.blocking %} class="blocking"{% endif %}>
+        <td class="wrap">{% if f.blocking %}{{ badge('blocking', 'fail') }}<br>{% endif %}<code>{{ f.key }}</code></td>
+        <td>{{ f.severity }}</td><td>{{ f.category }}</td>
+        <td class="n">{{ f.violated|num }} / {{ f.denominator|num }}</td><td class="n">{{ f.pct|pct(2) }}</td><td class="n">{{ f.threshold }}</td>
+        <td class="wrap">{{ f.description }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}{{ empty('None.') }}{% endif %}
+  {% if dq.errors %}
+  <h3>Checks that errored</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Check</th><th>Severity</th><th>Error</th></tr></thead>
+    <tbody>{% for e in dq.errors %}<tr{% if e.blocking %} class="blocking"{% endif %}><td><code>{{ e.key }}</code></td><td>{{ e.severity }}</td><td class="err">{{ e.error }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+  {% else %}{{ empty('Not run: no dq_results.json in the workspace.') }}{% endif %}
+</section>
+
+{# ---------------------------------------------------------------- 9. repairs #}
+<section id="s9" class="card">
+  <h2><span class="sn">9</span>Repair log</h2>
+  {% if repairs is none %}{{ empty('Not run: no repairs.json in the workspace.') }}
+  {% elif not repairs.iterations %}{{ empty('The repair agent made no changes.') }}
+  {% else %}
+  <p>{{ repairs.n_actions }} change(s) over {{ repairs.iterations|length }} iteration(s).</p>
+  {% for it in repairs.iterations %}
+  <h3>Iteration {{ it.iteration }}</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Field</th><th>Change</th><th>Rationale</th><th>Trigger</th></tr></thead>
+    <tbody>{% for a in it.actions %}<tr><td><code>{{ a.target }}</code></td><td class="wrap">{{ a.change }}</td><td class="wrap">{{ a.rationale }}</td><td class="wrap"><code>{{ a.trigger }}</code></td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% endfor %}
+  {% endif %}
+</section>
+
+{# ---------------------------------------------------------------- 10. CDM #}
+<section id="s10" class="card">
+  <h2><span class="sn">10</span>CDM characterization</h2>
+  {% if cdm %}
+  <p class="muted">Counts below {{ cdm.min_cell_count }} are shown as &lt;{{ cdm.min_cell_count }} and drawn without a bar.{% if cdm.cdm_source %} CDM source: {{ cdm.cdm_source.cdm_source_name }} (CDM {{ cdm.cdm_source.cdm_version }}, vocabulary {{ cdm.cdm_source.vocabulary_version }}).{% endif %}</p>
+  <h3>Record counts</h3>
+  {% if cdm.record_counts %}
+  <div class="tw"><table>
+    <thead><tr><th>Table</th><th class="n">Records</th><th><span class="muted">relative</span></th></tr></thead>
+    <tbody>{% for r in cdm.record_counts %}<tr><td>{{ r.table }}</td><td class="n">{{ r.display }}</td>{{ bar(r) }}</tr>{% endfor %}</tbody>
+  </table></div>
+  {% else %}{{ empty('The CDM tables are empty.') }}{% endif %}
+  {% if cdm.gender %}
+  <h3>Persons by gender</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Gender</th><th class="n">Concept id</th><th class="n">Persons</th><th></th></tr></thead>
+    <tbody>{% for r in cdm.gender %}<tr><td>{{ r.concept_name }}</td><td class="n">{{ r.concept_id }}</td><td class="n">{{ r.display }}</td>{{ bar(r) }}</tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+  {% if cdm.birth_decades %}
+  <h3>Year of birth by decade</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Decade</th><th class="n">Persons</th><th></th></tr></thead>
+    <tbody>{% for r in cdm.birth_decades %}<tr><td>{{ r.decade }}</td><td class="n">{{ r.display }}</td>{{ bar(r) }}</tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+  {% if cdm.observation_period %}
+  {% set op = cdm.observation_period %}
+  <h3>Observation period length</h3>
+  <div class="stats">
+    <div class="stat"><div class="v">{{ op.periods }}</div><div class="k">periods</div></div>
+    <div class="stat"><div class="v">{{ op.persons }}</div><div class="k">persons</div></div>
+    {% if op.suppressed %}
+    <div class="stat"><div class="v">—</div><div class="k">distribution withheld (fewer than {{ cdm.min_cell_count }} periods)</div></div>
+    {% else %}
+    <div class="stat"><div class="v">{{ op.median_days|num }} d</div><div class="k">median</div></div>
+    <div class="stat"><div class="v">{{ op.p10_days|num }} d</div><div class="k">10th percentile</div></div>
+    <div class="stat"><div class="v">{{ op.p90_days|num }} d</div><div class="k">90th percentile</div></div>
+    {% endif %}
+  </div>
+  {% endif %}
+  {% for t in cdm.top_concepts %}
+  <h3>Top concepts: {{ t.table }} <span class="muted">({{ t.field }})</span></h3>
+  <div class="tw"><table>
+    <thead><tr><th class="n">Concept id</th><th>Name</th><th class="n">Records</th><th></th></tr></thead>
+    <tbody>{% for r in t.rows %}<tr><td class="n">{{ r.concept_id }}</td><td class="wrap">{{ r.concept_name }}</td><td class="n">{{ r.display }}</td>{{ bar(r) }}</tr>{% endfor %}</tbody>
+  </table></div>
+  {% endfor %}
+  {% if cdm.errors %}
+  <h3>Queries that failed</h3>
+  <ul class="plain">{% for e in cdm.errors %}<li>{{ e }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% else %}{{ empty(cdm_note) }}{% endif %}
+</section>
+
+{# ---------------------------------------------------------------- 11. LLM #}
+<section id="s11" class="card">
+  <h2><span class="sn">11</span>LLM usage</h2>
+  <div class="stats">
+    <div class="stat"><div class="v">{{ llm.totals.calls }}</div><div class="k">calls</div></div>
+    <div class="stat"><div class="v">{{ llm.totals.input_tokens|num }}</div><div class="k">input tokens</div></div>
+    <div class="stat"><div class="v">{{ llm.totals.cache_read|num }}</div><div class="k">cache read</div></div>
+    <div class="stat"><div class="v">{{ llm.totals.output_tokens|num }}</div><div class="k">output tokens</div></div>
+    <div class="stat"><div class="v">{{ llm.totals.errors }}</div><div class="k">errors</div></div>
+  </div>
+  <p class="muted">Configured: {{ project.llm }}.</p>
+  {% if llm.stages %}
+  <div class="tw"><table>
+    <thead><tr><th>Stage</th><th class="n">Calls</th><th class="n">Input tokens</th><th class="n">Cache read</th><th class="n">Cache write</th><th class="n">Output tokens</th><th class="n">Errors</th><th class="n">Time</th></tr></thead>
+    <tbody>{% for s in llm.stages %}<tr><td>{{ s.stage }}</td><td class="n">{{ s.calls }}</td><td class="n">{{ s.input_tokens|num }}</td><td class="n">{{ s.cache_read|num }}</td><td class="n">{{ s.cache_write|num }}</td><td class="n">{{ s.output_tokens|num }}</td><td class="n">{{ s.errors }}</td><td class="n">{{ s.seconds|secs }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+  {% if llm.errors %}
+  <h3>LLM errors{% if llm.n_errors > llm.errors|length %} (first {{ llm.errors|length }} of {{ llm.n_errors }}){% endif %}</h3>
+  <ul class="plain">{% for e in llm.errors %}<li><code>{{ e.stage }} / {{ e.key }}</code>: {{ e.error }}</li>{% endfor %}</ul>
+  {% endif %}
+  <p>Every prompt and response is stored verbatim under <code>llm_calls/</code> ({{ llm.n_records }} record(s)). Prompts contain aggregate metadata only; no patient rows are sent.</p>
+</section>
+
+{# ---------------------------------------------------------------- 12. next steps #}
+<section id="s12" class="card">
+  <h2><span class="sn">12</span>Next steps</h2>
+  <ul class="checklist">
+  {% for s in next_steps %}
+    <li{% if s.done %} class="done"{% endif %}><span class="box" aria-hidden="true">{{ '✓' if s.done else '' }}</span><span class="txt">{{ s.text|inline_code }}{% if s.done %} <span class="muted">(done)</span>{% endif %}</span></li>
+  {% endfor %}
+  </ul>
+</section>
+
+<footer>omop-agent inspection report · {{ project.name }} · {{ project.generated_at }}</footer>
+</main>
+</body>
+</html>
