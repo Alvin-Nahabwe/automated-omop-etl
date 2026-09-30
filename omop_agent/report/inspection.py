@@ -82,7 +82,15 @@ def fmt_int(n: Any) -> str:
 
 
 def fmt_pct(x: float | None, digits: int = 1) -> str:
-    return "—" if x is None else f"{x:.{digits}f}%"
+    """Percentage that never rounds a partial value to 0% or 100%."""
+    if x is None:
+        return "—"
+    step = 10.0**-digits
+    if 0 < x < step / 2:
+        return f"<{step:.{digits}f}%"
+    if 100 - step / 2 <= x < 100:
+        return f">{100 - step:.{digits}f}%"
+    return f"{x:.{digits}f}%"
 
 
 def fmt_secs(s: float | None) -> str:
@@ -293,7 +301,19 @@ def _verdict(
     return PASSED, reasons
 
 
-def _timeline(stages: dict[str, dict[str, Any]], audit: list[dict[str, Any]]) -> dict[str, Any]:
+def _relative(v: Any, root: Path) -> Any:
+    """Shorten absolute paths inside the workspace to workspace-relative ones."""
+    if isinstance(v, str):
+        for prefix in {str(root).rstrip("/") + "/", str(root.resolve()).rstrip("/") + "/"}:
+            if v.startswith(prefix):
+                return v[len(prefix):]
+        return v
+    if isinstance(v, list):
+        return [_relative(x, root) for x in v]
+    return v
+
+
+def _timeline(stages: dict[str, dict[str, Any]], audit: list[dict[str, Any]], root: Path) -> dict[str, Any]:
     known = PIPELINE_STAGES + [s for s in STAGES if s not in PIPELINE_STAGES]
     extra = sorted((s for s in stages if s not in known), key=lambda s: str(stages[s].get("at", "")))
     rows = []
@@ -311,7 +331,7 @@ def _timeline(stages: dict[str, dict[str, Any]], audit: list[dict[str, Any]]) ->
         if e.get("event") != "human_approval":
             continue
         approved = e.get("approved")
-        rest = {k: v for k, v in e.items() if k not in ("ts", "event", "stage", "approved")}
+        rest = {k: _relative(v, root) for k, v in e.items() if k not in ("ts", "event", "stage", "approved")}
         approvals.append(
             {
                 "at": fmt_dt(e.get("ts")),
@@ -580,9 +600,38 @@ def _dq_section(dq: DQReport, cfg: ProjectConfig) -> dict[str, Any]:
     }
 
 
-def _repairs_section(actions: list[RepairAction]) -> dict[str, Any]:
+def _repair_events(audit: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Repair-agent runs from the audit log (including ones that changed nothing or failed)."""
+    events = []
+    for e in audit:
+        kind = e.get("event")
+        if kind == "repair":
+            detail = f"{e.get('actions', 0)} change(s)"
+            if e.get("summary"):
+                detail += f": {_short(e['summary'], 400)}"
+        elif kind == "repair_skipped":
+            detail = f"skipped: {_short(e.get('reason') or '', 400)}"
+        elif kind == "repair_error":
+            detail = f"error: {_short(e.get('error') or '', 400)}"
+        else:
+            continue
+        events.append(
+            {
+                "at": fmt_dt(e.get("ts")),
+                "iteration": e.get("iteration", ""),
+                "outcome": {"repair": "done", "repair_skipped": "skipped", "repair_error": "failed"}[kind],
+                "trigger": _short(e.get("trigger") or "", 200),
+                "detail": detail,
+            }
+        )
+    return events
+
+
+def _repairs_section(actions: list[RepairAction] | None, events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if actions is None and not events:
+        return None
     by_iter: dict[int, list[dict[str, str]]] = defaultdict(list)
-    for a in actions:
+    for a in actions or []:
         by_iter[a.iteration].append(
             {
                 "target": f"{a.target_table}.{a.target_field}" if a.target_field else f"{a.target_table}.*",
@@ -592,8 +641,10 @@ def _repairs_section(actions: list[RepairAction]) -> dict[str, Any]:
             }
         )
     return {
-        "n_actions": len(actions),
+        "has_file": actions is not None,
+        "n_actions": len(actions or []),
         "iterations": [{"iteration": i, "actions": by_iter[i]} for i in sorted(by_iter)],
+        "events": events,
     }
 
 
@@ -646,7 +697,6 @@ def _llm_section(cfg: ProjectConfig, ws: Workspace, audit: list[dict[str, Any]])
 
 
 def _next_steps(
-    cfg: ProjectConfig,
     verdict: str,
     spec: dict[str, Any] | None,
     notes: list[str],
@@ -654,6 +704,7 @@ def _next_steps(
     etl: dict[str, Any] | None,
     dq: dict[str, Any] | None,
     schemas: Schemas,
+    r_dqd_ran: bool,
 ) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
     if mapping is None:
@@ -689,7 +740,7 @@ def _next_steps(
         {
             "text": "Run the official OHDSI Achilles and DataQualityDashboard in R: set `quality.use_r_dqd: true` "
             "in the project config (Rscript and the OHDSI R packages must be installed) and re-run the checks.",
-            "done": bool(cfg.quality.use_r_dqd and dq and dq["engine"] == "dqd"),
+            "done": r_dqd_ran,
         }
     )
     steps.append(
@@ -889,6 +940,7 @@ def collect_report_data(
     dq_data = _dq_section(dq, cfg) if dq else None
     notes = list(annotations.notes) if annotations else []
     llm = _llm_section(cfg, ws, audit)
+    r_dqd_ran = (dq is not None and dq.engine == "dqd") or any(e.get("event") == "dqd_r_done" for e in audit)
 
     vocab_version = (vocab or {}).get("vocabulary_version") or (cdm or {}).get("vocabulary_version")
     cdm_version = spec.cdm_version if spec else ((cdm or {}).get("cdm_source") or {}).get("cdm_version") or "5.4"
@@ -907,7 +959,7 @@ def collect_report_data(
         },
         "verdict": verdict,
         "verdict_reasons": reasons,
-        "timeline": _timeline(stages, audit),
+        "timeline": _timeline(stages, audit, ws.root),
         "source": _source_section(profile, annotations) if profile else None,
         "annotations": {"notes": notes, "n_tables": len(annotations.tables)} if annotations else None,
         "design": design,
@@ -915,11 +967,11 @@ def collect_report_data(
         "mapping": mapping,
         "etl": etl,
         "dq": dq_data,
-        "repairs": _repairs_section(repairs) if repairs is not None else None,
+        "repairs": _repairs_section(repairs, _repair_events(audit)),
         "cdm": cdm,
         "cdm_note": cdm_note,
         "llm": llm,
-        "next_steps": _next_steps(cfg, verdict, design, notes, mapping, etl, dq_data, schemas),
+        "next_steps": _next_steps(verdict, design, notes, mapping, etl, dq_data, schemas, r_dqd_ran),
         "problems": problems,
     }
 

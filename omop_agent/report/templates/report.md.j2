@@ -232,7 +232,7 @@ _Not run: no etl_run.json in the workspace._
 ## 8. Data quality
 
 {% if dq %}
-{{ dq.n_checks }} checks ({{ dq.engine }} engine) run {{ dq.run_at }}: **{{ 'PASSED' if dq.passed else 'FAILED' }}**, {{ dq.failed|length }} failed, {{ dq.n_blocking }} blocking, {{ dq.errors|length }} errored.
+{{ dq.n_checks|num }} checks ({{ dq.engine }} engine) run {{ dq.run_at }}: **{{ 'PASSED' if dq.passed else 'FAILED' }}**, {{ dq.failed|length }} failed, {{ dq.n_blocking }} blocking, {{ dq.errors|length }} errored.
 {% if dq.blocking_failures %}
 
 > **Blocking failures ({{ dq.blocking_failures|length }})**
@@ -245,13 +245,13 @@ _Not run: no etl_run.json in the workspace._
 | Severity | Passed | Failed | Error | Not applicable | Total |
 |---|--:|--:|--:|--:|--:|
 {% for r in dq.by_severity %}
-| {{ '**total**' if loop.last else r.name }} | {{ r.passed }} | {{ r.failed }} | {{ r.error }} | {{ r.not_applicable }} | {{ r.total }} |
+| {{ '**total**' if loop.last else r.name }} | {{ r.passed|num }} | {{ r.failed|num }} | {{ r.error|num }} | {{ r.not_applicable|num }} | {{ r.total|num }} |
 {% endfor %}
 
 | Kahn category | Passed | Failed | Error | Not applicable | Total |
 |---|--:|--:|--:|--:|--:|
 {% for r in dq.by_category %}
-| {{ '**total**' if loop.last else r.name|md }} | {{ r.passed }} | {{ r.failed }} | {{ r.error }} | {{ r.not_applicable }} | {{ r.total }} |
+| {{ '**total**' if loop.last else r.name|md }} | {{ r.passed|num }} | {{ r.failed|num }} | {{ r.error|num }} | {{ r.not_applicable|num }} | {{ r.total|num }} |
 {% endfor %}
 
 **Failed checks**
@@ -282,10 +282,14 @@ _Not run: no dq_results.json in the workspace._
 
 {% if repairs is none %}
 _Not run: no repairs.json in the workspace._
+{% else %}
+{% if not repairs.has_file %}
+_No repairs.json in the workspace._
 {% elif not repairs.iterations %}
 _The repair agent made no changes._
 {% else %}
 {{ repairs.n_actions }} change(s) over {{ repairs.iterations|length }} iteration(s).
+{% endif %}
 {% for it in repairs.iterations %}
 
 **Iteration {{ it.iteration }}**
@@ -296,6 +300,16 @@ _The repair agent made no changes._
 | {{ a.target|md }} | {{ a.change|md }} | {{ a.rationale|md }} | {{ a.trigger|md }} |
 {% endfor %}
 {% endfor %}
+{% if repairs.events %}
+
+**Repair agent runs (audit log)**
+
+| Time | Iteration | Outcome | Trigger | Detail |
+|---|--:|---|---|---|
+{% for e in repairs.events %}
+| {{ e.at }} | {{ e.iteration|md }} | {{ e.outcome }} | {{ e.trigger|md }} | {{ e.detail|md }} |
+{% endfor %}
+{% endif %}
 {% endif %}
 
 ## 10. CDM characterization

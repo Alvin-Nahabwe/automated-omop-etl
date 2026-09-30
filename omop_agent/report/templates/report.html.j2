@@ -357,7 +357,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     <thead><tr><th>{{ title }}</th><th class="n">Passed</th><th class="n">Failed</th><th class="n">Error</th><th class="n">Not applicable</th><th class="n">Total</th></tr></thead>
     <tbody>
     {% for r in rows %}
-      <tr{% if loop.last %} class="total"{% endif %}><td>{{ r.name }}</td><td class="n">{{ r.passed }}</td><td class="n">{{ r.failed }}</td><td class="n">{{ r.error }}</td><td class="n">{{ r.not_applicable }}</td><td class="n">{{ r.total }}</td></tr>
+      <tr{% if loop.last %} class="total"{% endif %}><td>{{ r.name }}</td><td class="n">{{ r.passed|num }}</td><td class="n">{{ r.failed|num }}</td><td class="n">{{ r.error|num }}</td><td class="n">{{ r.not_applicable|num }}</td><td class="n">{{ r.total|num }}</td></tr>
     {% endfor %}
     </tbody>
   </table></div>
@@ -392,9 +392,11 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
 <section id="s9" class="card">
   <h2><span class="sn">9</span>Repair log</h2>
   {% if repairs is none %}{{ empty('Not run: no repairs.json in the workspace.') }}
-  {% elif not repairs.iterations %}{{ empty('The repair agent made no changes.') }}
   {% else %}
-  <p>{{ repairs.n_actions }} change(s) over {{ repairs.iterations|length }} iteration(s).</p>
+  {% if not repairs.has_file %}{{ empty('No repairs.json in the workspace.') }}
+  {% elif not repairs.iterations %}{{ empty('The repair agent made no changes.') }}
+  {% else %}<p>{{ repairs.n_actions }} change(s) over {{ repairs.iterations|length }} iteration(s).</p>
+  {% endif %}
   {% for it in repairs.iterations %}
   <h3>Iteration {{ it.iteration }}</h3>
   <div class="tw"><table>
@@ -402,6 +404,13 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     <tbody>{% for a in it.actions %}<tr><td><code>{{ a.target }}</code></td><td class="wrap">{{ a.change }}</td><td class="wrap">{{ a.rationale }}</td><td class="wrap"><code>{{ a.trigger }}</code></td></tr>{% endfor %}</tbody>
   </table></div>
   {% endfor %}
+  {% if repairs.events %}
+  <h3>Repair agent runs (audit log)</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Time</th><th class="n">Iteration</th><th>Outcome</th><th>Trigger</th><th>Detail</th></tr></thead>
+    <tbody>{% for e in repairs.events %}<tr><td class="n">{{ e.at }}</td><td class="n">{{ e.iteration }}</td><td>{{ badge(e.outcome, {'done': 'ok', 'skipped': 'warn', 'failed': 'fail'}[e.outcome]) }}</td><td class="wrap"><code>{{ e.trigger }}</code></td><td class="wrap">{{ e.detail }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
   {% endif %}
 </section>
 
