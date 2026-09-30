@@ -277,6 +277,11 @@ class SourceTerm(BaseModel):
     source_name: str
     frequency: int
     target_domain: str | None = None
+    units: list[ValueFreq] = Field(
+        default_factory=list,
+        description="Units recorded with this code (measurements/observations), each seen at least "
+        "min_cell_count times; they tell the mapper e.g. mass vs molar concentration.",
+    )
 
 
 class MappingDecision(BaseModel):

@@ -28,6 +28,7 @@ from omop_agent.models import (
 )
 from omop_agent.vocab import mapper
 from omop_agent.vocab.evaluate import evaluate_vocabulary, render_vocab_evaluation_md
+from omop_agent.vocab.mapper import build_prompt
 from omop_agent.vocab.mapper import (
     MAPPER_SYSTEM,
     collect_terms,
@@ -815,3 +816,18 @@ def test_fields_reading_the_same_column_do_not_double_count(staged):
     double = {t.source_code: t.frequency for t in collect_terms(conn, schemas, spec) if t.source_vocabulary_id == "SRC_DRUG"}
     assert double == single
     assert all(n < cfg.privacy.min_cell_count for code, n in double.items() if code in RARE[:2])
+
+
+@pytest.mark.postgres
+def test_lab_terms_carry_their_units(staged):
+    """The mapper needs units to choose e.g. Glucose [Moles/volume] (mmol/L) over [Mass/volume]."""
+    conn, schemas, cfg = staged
+    terms = {t.source_code: t for t in collect_terms(conn, schemas, load_spec(), privacy=cfg.privacy) if t.source_vocabulary_id == "SRC_LAB"}
+    assert [u.value for u in terms["HB"].units] == ["g/dL"]
+    assert [u.value for u in terms["RBS"].units] == ["mmol/L"]
+    assert terms["MRDT"].units == []  # qualitative test: no unit recorded
+    assert all(u.count >= cfg.privacy.min_cell_count for t in terms.values() for u in t.units)
+    prompt = build_prompt("SRC_LAB", [terms["RBS"]], {"RBS": []}, 10)
+    assert 'units recorded with it: "mmol/L" ×' in prompt
+    drugs = [t for t in collect_terms(conn, schemas, load_spec()) if t.source_vocabulary_id == "SRC_DRUG"]
+    assert all(t.units == [] for t in drugs)  # only measurement/observation concepts get units

@@ -52,6 +52,7 @@ from ..models import (
     SourceTerm,
     TableMapping,
     TermChoice,
+    ValueFreq,
 )
 from ..privacy import detect_pii, pii_columns, pii_references
 from ..sqlguard import strip_literals
@@ -94,6 +95,10 @@ when you are expanding an abbreviation or choosing between close options.
 - When no candidate fits, propose up to 3 better search phrases in retry_search_terms, such \
 as expanded abbreviations, generic drug names or full test names. The vocabulary will be \
 searched again with them.
+- When units recorded with a lab test or observation are listed, choose the concept whose \
+property matches them: g/dL, mg/dL and g/L are mass concentrations ([Mass/volume]), mmol/L and \
+umol/L are molar ([Moles/volume]), and so on. Prefer a concept that names the specimen (e.g. \
+in Blood) over a generic one when the term implies it.
 - Keep each rationale to one or two sentences.
 
 Return exactly one choice per source term, with source_code copied exactly as given."""
@@ -149,6 +154,47 @@ def _pii_fields(
             if fm.kind == "concept_map" and (fm.expression or "").strip():
                 if refs := _field_pii(tm, fm, profile, privacy):
                     out[(i, j)] = f"{tm.target_table}.{fm.target_field} reads {', '.join(refs)}"
+    return out
+
+
+UNIT_CONTEXT_FIELDS = {"measurement_concept_id", "observation_concept_id"}
+MAX_UNITS_PER_TERM = 3
+
+
+def _units_by_code(
+    conn: psycopg.Connection,
+    schemas: Schemas,
+    tm: TableMapping,
+    fm: FieldMapping,
+    expr: str,
+    privacy: PrivacyConfig | None,
+) -> dict[str, list[ValueFreq]]:
+    """Units recorded with each code of a measurement/observation concept field (the mapper needs
+    them to tell, e.g., Glucose [Mass/volume] from [Moles/volume]). Only (code, unit) pairs seen at
+    least ``min_cell_count`` times are returned, like any value that can reach the LLM."""
+    if fm.target_field not in UNIT_CONTEXT_FIELDS:
+        return {}
+    unit = next(
+        (f for f in tm.fields if f.target_field == "unit_source_value" and f.expression and f.kind in {"column", "expression"}),
+        None,
+    ) or next((f for f in tm.fields if f.target_field == "unit_concept_id" and f.expression and f.kind == "concept_map"), None)
+    if unit is None:
+        return {}
+    k = (privacy or PrivacyConfig()).min_cell_count
+    sql = (
+        f"SELECT code, unit, COUNT(*) AS n FROM (\nSELECT {paren(expr)}::text AS code, {paren(unit.expression or '')}::text AS unit\n"
+        f"{source_from_sql(tm)}\n) q\nWHERE code IS NOT NULL AND unit IS NOT NULL AND btrim(unit) <> ''\n"
+        f"GROUP BY code, unit HAVING COUNT(*) >= {int(k)} ORDER BY code, n DESC"
+    )
+    try:
+        rows = query_rows(conn, schemas.render(sql))
+    except psycopg.Error:
+        return {}  # context is optional: never block mapping on it
+    out: dict[str, list[ValueFreq]] = {}
+    for r in rows:
+        units = out.setdefault(r["code"], [])
+        if len(units) < MAX_UNITS_PER_TERM:
+            units.append(ValueFreq(value=r["unit"], count=int(r["n"])))
     return out
 
 
@@ -208,12 +254,14 @@ def collect_terms(
                 raise ValueError(
                     f"{tm.target_table}.{fm.target_field}: could not read source codes: {short_error(e)}"
                 ) from e
+            units = _units_by_code(conn, schemas, tm, fm, expr, privacy)
             for r in rows:
                 key = (vocab, r["code"])
                 if key in merged:
                     t = merged[key]
                     t.frequency = max(t.frequency, int(r["n"]))
                     t.target_domain = t.target_domain or fm.target_domain
+                    t.units = t.units or units.get(r["code"], [])
                 else:
                     merged[key] = SourceTerm(
                         source_vocabulary_id=vocab,
@@ -221,6 +269,7 @@ def collect_terms(
                         source_name=r["code"],
                         frequency=int(r["n"]),
                         target_domain=fm.target_domain,
+                        units=units.get(r["code"], []),
                     )
     return sorted(merged.values(), key=lambda t: (t.source_vocabulary_id, -t.frequency, t.source_code))
 
@@ -599,6 +648,8 @@ def _format_term(i: int, t: SourceTerm, hits: list[_Hit], k: int, phrases: list[
         lines.append(f"   description: {json.dumps(t.source_name, ensure_ascii=False)}")
     lines.append(f"   frequency: {t.frequency}")
     lines.append(f"   target domain: {t.target_domain or 'any'}")
+    if t.units:
+        lines.append("   units recorded with it: " + "; ".join(f"{json.dumps(u.value, ensure_ascii=False)} ×{u.count}" for u in t.units))
     if phrases:
         lines.append(f"   searched again for: {'; '.join(phrases)}")
     if hits:
