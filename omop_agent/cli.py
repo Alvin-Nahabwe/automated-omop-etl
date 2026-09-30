@@ -239,11 +239,14 @@ def check(config: Path = ConfigOpt) -> None:
 
 
 @app.command()
-def report(config: Path = ConfigOpt) -> None:
+def report(
+    config: Path = ConfigOpt,
+    shareable: bool = typer.Option(False, help="Also write report.shareable.* with rare source terms withheld."),
+) -> None:
     """Write the inspection report (report.md / report.html)."""
     p = _pipeline(config)
     try:
-        p.report()
+        p.report(shareable=shareable)
     finally:
         p.close()
 

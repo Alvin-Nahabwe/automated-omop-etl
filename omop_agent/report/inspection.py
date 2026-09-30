@@ -8,6 +8,11 @@ The overall verdict comes only from recorded results (``dq_results.json``, ``etl
 When a database connection is given, the loaded CDM is also characterised (an Achilles-lite
 summary). Every count in that summary below ``min_cell_count`` is shown as ``<N`` and its
 exact value is never stored.
+
+The report lists source codes and terms, rare ones included, because reviewers need them to
+check mappings; it says so at the top. ``build_report(..., shareable=True)`` writes a copy
+(``report.shareable.md`` / ``.html``) in which every source term seen fewer than
+``min_cell_count`` times is replaced by ``<withheld>``.
 """
 
 from __future__ import annotations
@@ -67,6 +72,15 @@ FIELD_KINDS = [
 ]
 MAX_REVIEW_ROWS = 100
 MAX_UNMATCHED_SHOWN = 5
+WITHHELD = "<withheld>"
+CONFIDENTIAL_NOTICE = (
+    "This report contains source codes and terms, including rare ones, needed for mapping review. "
+    "Share it only within your data-governance boundary."
+)
+SHAREABLE_NOTICE = (
+    "Source codes and terms seen fewer than {n} times are replaced by \"<withheld>\". Frequent source codes "
+    "and terms are still listed; check the report against your data-sharing rules before sharing it."
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -408,7 +422,14 @@ def _design_section(spec: ETLSpec) -> dict[str, Any]:
     }
 
 
-def _vocab_section(ev: dict[str, Any], min_cell_count: int) -> dict[str, Any]:
+def _term(value: Any, count: int | None, min_cell_count: int, shareable: bool) -> Any:
+    """A source code or term for display: withheld in a shareable report when it is rare."""
+    if shareable and (count is None or count < min_cell_count):
+        return WITHHELD
+    return value
+
+
+def _vocab_section(ev: dict[str, Any], min_cell_count: int, shareable: bool = False) -> dict[str, Any]:
     loaded = [
         {
             "vocabulary_id": str(v.get("vocabulary_id") or ""),
@@ -443,7 +464,8 @@ def _vocab_section(ev: dict[str, Any], min_cell_count: int) -> dict[str, Any]:
                 "pct": _ratio(mapped, records),
                 "error": _short(c["error"], 300) if c.get("error") else "",
                 "unmatched": ", ".join(
-                    f"{u.get('value')} ({small_cell(_int(u.get('count')), min_cell_count)['display']})"
+                    f"{_term(u.get('value'), _int(u.get('count')), min_cell_count, shareable)} "
+                    f"({small_cell(_int(u.get('count')), min_cell_count)['display']})"
                     for u in unmatched[:MAX_UNMATCHED_SHOWN]
                 )
                 + (f" +{len(unmatched) - MAX_UNMATCHED_SHOWN} more" if len(unmatched) > MAX_UNMATCHED_SHOWN else ""),
@@ -478,7 +500,7 @@ def _mapping_row(name: str, ds: list[MappingDecision]) -> dict[str, Any]:
     }
 
 
-def _mapping_section(decisions: list[MappingDecision], cfg: ProjectConfig) -> dict[str, Any]:
+def _mapping_section(decisions: list[MappingDecision], cfg: ProjectConfig, shareable: bool = False) -> dict[str, Any]:
     groups: dict[str, list[MappingDecision]] = defaultdict(list)
     for d in decisions:
         groups[d.source_vocabulary_id].append(d)
@@ -491,8 +513,8 @@ def _mapping_section(decisions: list[MappingDecision], cfg: ProjectConfig) -> di
         {
             "status": d.status,
             "vocabulary": d.source_vocabulary_id,
-            "code": d.source_code,
-            "name": d.source_name,
+            "code": _term(d.source_code, d.frequency, mcc, shareable),
+            "name": _term(d.source_name, d.frequency, mcc, shareable),
             "frequency": small_cell(d.frequency, mcc)["display"],
             "concept": (
                 f"{d.target_concept_id} {d.target_concept_name or ''}".strip() if d.target_concept_id else "none (0)"
@@ -928,9 +950,17 @@ def characterize_cdm(conn: psycopg.Connection, schemas: Schemas, min_cell_count:
 
 
 def collect_report_data(
-    cfg: ProjectConfig, ws: Workspace, conn: psycopg.Connection | None = None, schemas: Schemas | None = None
+    cfg: ProjectConfig,
+    ws: Workspace,
+    conn: psycopg.Connection | None = None,
+    schemas: Schemas | None = None,
+    shareable: bool = False,
 ) -> dict[str, Any]:
-    """Gather everything the report shows into one plain dict (the templates' only input)."""
+    """Gather everything the report shows into one plain dict (the templates' only input).
+
+    With ``shareable``, source codes and terms seen fewer than ``min_cell_count`` times are
+    replaced by ``<withheld>`` (mapping review table, unmatched codes).
+    """
     problems: list[str] = []
     schemas = schemas or Schemas.from_config(cfg.target)
     mcc = cfg.privacy.min_cell_count
@@ -956,8 +986,8 @@ def collect_report_data(
 
     verdict, reasons = _verdict(dq, etl_run, stages)
     design = _design_section(spec) if spec else None
-    vocab = _vocab_section(vocab_eval, mcc) if vocab_eval is not None else None
-    mapping = _mapping_section(decisions, cfg) if decisions is not None else None
+    vocab = _vocab_section(vocab_eval, mcc, shareable) if vocab_eval is not None else None
+    mapping = _mapping_section(decisions, cfg, shareable) if decisions is not None else None
     etl = _etl_section(etl_run) if etl_run else None
     dq_data = _dq_section(dq, cfg) if dq else None
     notes = list(annotations.notes) if annotations else []
@@ -978,6 +1008,10 @@ def collect_report_data(
             "min_cell_count": mcc,
             "cdm_schema": schemas.cdm,
             "vocab_schema": schemas.vocab,
+        },
+        "notice": {
+            "shareable": shareable,
+            "text": SHAREABLE_NOTICE.format(n=mcc) if shareable else CONFIDENTIAL_NOTICE,
         },
         "verdict": verdict,
         "verdict_reasons": reasons,
@@ -1032,11 +1066,27 @@ def render_html(data: dict[str, Any]) -> str:
     return _env(autoescape=True).get_template("report.html.j2").render(**data)
 
 
+def _shareable_path(p: Path) -> Path:
+    return p.with_name(f"{p.stem}.shareable{p.suffix}")
+
+
 def build_report(
-    cfg: ProjectConfig, ws: Workspace, conn: psycopg.Connection | None = None, schemas: Schemas | None = None
+    cfg: ProjectConfig,
+    ws: Workspace,
+    conn: psycopg.Connection | None = None,
+    schemas: Schemas | None = None,
+    shareable: bool = False,
 ) -> tuple[Path, Path]:
-    """Write ``report.md`` and ``report.html`` into the workspace and return their paths."""
-    data = collect_report_data(cfg, ws, conn, schemas)
-    ws.report_md.write_text(render_markdown(data), encoding="utf-8")
-    ws.report_html.write_text(render_html(data), encoding="utf-8")
-    return ws.report_md, ws.report_html
+    """Write ``report.md`` and ``report.html`` into the workspace and return their paths.
+
+    With ``shareable=True`` rare source terms are withheld (see :func:`collect_report_data`) and
+    the files are ``report.shareable.md`` / ``report.shareable.html``, so the full review copy is
+    kept.
+    """
+    data = collect_report_data(cfg, ws, conn, schemas, shareable=shareable)
+    md_path, html_path = ws.report_md, ws.report_html
+    if shareable:
+        md_path, html_path = _shareable_path(md_path), _shareable_path(html_path)
+    md_path.write_text(render_markdown(data), encoding="utf-8")
+    html_path.write_text(render_html(data), encoding="utf-8")
+    return md_path, html_path

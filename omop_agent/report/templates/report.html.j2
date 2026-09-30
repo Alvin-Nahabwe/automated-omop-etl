@@ -119,6 +119,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
 <header>
   <h1>OMOP ETL inspection report: {{ project.name }}</h1>
   <p class="sub">Generated {{ project.generated_at }} by omop-agent</p>
+  <div class="callout warn notice" role="note"><strong>{{ 'Shareable version' if notice.shareable else 'Confidential' }}.</strong> {{ notice.text }}</div>
 </header>
 
 {# ---------------------------------------------------------------- 1. summary #}

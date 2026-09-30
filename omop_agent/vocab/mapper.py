@@ -1,20 +1,24 @@
 """Map local source codes and labels to standard concepts (the Usagi step).
 
 Terms come from every ``concept_map`` field of the ETL spec, grouped by the field's
-``source_vocabulary_id`` (e.g. ``SRC_DRUG``). For each source vocabulary:
+``source_vocabulary_id`` (e.g. ``SRC_DRUG``). A field whose expression reads a direct identifier
+(a PII column of the profile, ``privacy.pii_columns`` or a PII-like column name) is skipped, so
+names or phone numbers are never collected as terms. For each source vocabulary:
 
 1. terms seen fewer than ``privacy.min_cell_count`` times are *suppressed*: they get lexical
    candidates for the reviewer, are never sent to the LLM, and stay unmapped;
 2. a term equal to the name or a synonym of exactly one standard concept in the target
    domain is mapped directly (method ``exact``);
 3. the other terms go to the LLM in batches, each with its top lexical candidates. The model
-   picks one concept id (or 0) and may suggest better search phrases;
+   picks one concept id (or 0) and may suggest better search phrases. A choice marked
+   UNMATCHED is kept unmapped whatever id came with it;
 4. terms left unmapped with suggested phrases are searched again and sent once more;
 5. every chosen id is checked against the vocabulary. An id that is not a valid standard
    concept of the target domain is rejected, and the term is FLAGGED for review.
 
-Without an LLM (provider ``none``, or no replay recording) the best lexical candidate is kept
-as an UNCHECKED suggestion when its score is at least ``LEXICAL_MIN_SCORE``.
+Without an LLM (provider ``none``, no replay recording, or ``privacy.send_values_to_llm: false``,
+which keeps every source value out of prompts) the best lexical candidate is kept as an
+UNCHECKED suggestion when its score is at least ``LEXICAL_MIN_SCORE``.
 
 Lexical search retrieves concepts with pg_trgm (or ILIKE when pg_trgm is missing). Small
 domains, such as units, are scored exhaustively. Every candidate is scored by the same Python
@@ -32,17 +36,22 @@ from typing import Iterable, Sequence
 import psycopg
 from rapidfuzz import fuzz
 
-from ..config import ProjectConfig
+from ..config import PrivacyConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, short_error
 from ..llm import LLMClient, LLMError, LLMUnavailable
 from ..models import (
     ConceptCandidate,
     ETLSpec,
+    FieldMapping,
     MappingBatchDecision,
     MappingDecision,
+    SourceProfile,
     SourceTerm,
+    TableMapping,
     TermChoice,
 )
+from ..privacy import detect_pii, pii_columns, pii_references
+from ..sqlguard import strip_literals
 from ..workspace import Workspace
 from .evaluate import paren, query_rows, source_from_sql
 from .loader import has_trigram
@@ -54,6 +63,7 @@ EXHAUSTIVE_DOMAIN_SIZE = 3000  # domains up to this many standard concepts are s
 TRGM_WORD_THRESHOLD = 0.3  # pg_trgm.word_similarity_threshold used to retrieve candidates
 POOL_SIZE = 300  # rows retrieved by trigram/ILIKE search before Python re-scoring
 MAX_RETRY_PHRASES = 3
+LLM_DISABLED_BY_PRIVACY = "LLM mapping is disabled by privacy.send_values_to_llm"
 
 MAPPER_SYSTEM = """\
 You are a terminology mapper for an OMOP CDM conversion, working the way an experienced Usagi \
@@ -91,17 +101,92 @@ Return exactly one choice per source term, with source_code copied exactly as gi
 # --------------------------------------------------------------------------------------
 
 
-def collect_terms(conn: psycopg.Connection, schemas: Schemas, spec: ETLSpec) -> list[SourceTerm]:
+_QUALIFIED = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b")
+# an identifier that is neither qualified (a.b), a qualifier, nor a function name
+_BARE = re.compile(r"(?<![\w.])([A-Za-z_][A-Za-z0-9_]*)(?![\w.]|\s*\()")
+
+
+def _field_pii(tm: TableMapping, fm: FieldMapping, profile: SourceProfile | None, privacy: PrivacyConfig) -> list[str]:
+    """``table.column`` direct identifiers read by one field's expression.
+
+    Uses :func:`omop_agent.privacy.pii_references` on the field alone (the mapping's WHERE and
+    join conditions filter rows but do not become terms), and also catches unqualified column
+    names and PII-like names when no profile is available.
+    """
+    only = tm.model_copy(
+        update={"fields": [fm], "where": None, "joins": [j.model_copy(update={"on": ""}) for j in tm.joins]}
+    )
+    hits = list(pii_references(only, profile, privacy))
+    tables = [tm.source.table] + [j.table for j in tm.joins]
+    aliases = {tm.source.alias.lower(): tm.source.table}
+    aliases.update({j.alias.lower(): j.table for j in tm.joins})
+    text = strip_literals(fm.expression or "")
+    refs = [(aliases.get(a.lower()), c) for a, c in _QUALIFIED.findall(text)]
+    refs += [(t, c) for c in _BARE.findall(text) for t in tables]
+    pii = pii_columns(profile, privacy)
+    for table, col in refs:
+        if table is None:
+            continue
+        name = table.split(".")[-1].lower()
+        if col.lower() in pii.get(name, set()) or detect_pii(name, col, [], privacy) is not None:
+            ref = f"{table.lower()}.{col.lower()}"
+            if ref not in hits:
+                hits.append(ref)
+    return hits
+
+
+def _pii_fields(
+    spec: ETLSpec, profile: SourceProfile | None, privacy: PrivacyConfig | None
+) -> dict[tuple[int, int], str]:
+    """(mapping index, field index) -> description of each concept_map field that reads PII."""
+    privacy = privacy or PrivacyConfig()
+    out: dict[tuple[int, int], str] = {}
+    for i, tm in enumerate(spec.table_mappings):
+        for j, fm in enumerate(tm.fields):
+            if fm.kind == "concept_map" and (fm.expression or "").strip():
+                if refs := _field_pii(tm, fm, profile, privacy):
+                    out[(i, j)] = f"{tm.target_table}.{fm.target_field} reads {', '.join(refs)}"
+    return out
+
+
+def pii_concept_fields(
+    spec: ETLSpec, profile: SourceProfile | None = None, privacy: PrivacyConfig | None = None
+) -> list[str]:
+    """``concept_map`` fields that :func:`collect_terms` skips because they read a direct identifier.
+
+    One line per field: ``'<target_table>.<target_field> reads <table.column>[, ...]'``. PII
+    columns come from the profile (``is_pii``), ``privacy.pii_columns`` and the PII name
+    patterns (``privacy`` defaults to :class:`PrivacyConfig`).
+    """
+    return list(_pii_fields(spec, profile, privacy).values())
+
+
+def collect_terms(
+    conn: psycopg.Connection,
+    schemas: Schemas,
+    spec: ETLSpec,
+    profile: SourceProfile | None = None,
+    privacy: PrivacyConfig | None = None,
+    ws: Workspace | None = None,
+) -> list[SourceTerm]:
     """Distinct values (with frequencies) of every ``concept_map`` expression in the spec.
 
     Values of fields that share a source vocabulary are merged and their counts summed.
     Sorted by (source_vocabulary_id, -frequency, code).
+
+    A field whose expression reads a direct identifier is skipped, so its values can never
+    reach the LLM or the mapping files: see :func:`pii_concept_fields` for the list (also
+    audited as ``vocab_pii_fields_skipped`` when ``ws`` is given). ``privacy`` defaults to
+    :class:`PrivacyConfig`, i.e. the default PII name patterns.
     """
+    skip = _pii_fields(spec, profile, privacy)
+    if skip and ws is not None:
+        ws.audit("vocab_pii_fields_skipped", fields=list(skip.values()))
     merged: dict[tuple[str, str], SourceTerm] = {}
-    for tm in spec.table_mappings:
-        for fm in tm.fields:
+    for i, tm in enumerate(spec.table_mappings):
+        for j, fm in enumerate(tm.fields):
             expr, vocab = (fm.expression or "").strip(), (fm.vocabulary or "").strip()
-            if fm.kind != "concept_map" or not expr or not vocab:
+            if fm.kind != "concept_map" or not expr or not vocab or (i, j) in skip:
                 continue
             sql = (
                 f"SELECT code, COUNT(*) AS n FROM (\nSELECT {paren(expr)}::text AS code\n{source_from_sql(tm)}\n) q\n"
@@ -547,6 +632,11 @@ def build_prompt(
     return "\n".join(lines)
 
 
+def _unmatched(ch: TermChoice) -> bool:
+    """The model found no fitting concept: id 0, or equivalence UNMATCHED whatever id came with it."""
+    return ch.chosen_concept_id == 0 or ch.equivalence == "UNMATCHED"
+
+
 def _match_choices(batch: Sequence[SourceTerm], choices: list[TermChoice]) -> dict[str, TermChoice]:
     exact = {t.source_code for t in batch}
     loose = {_exact_key(t.source_code): t.source_code for t in batch}
@@ -569,6 +659,8 @@ class _VocabMapper:
         self.k = max(1, cfg.mapping.candidates_per_term)
         self.hits: dict[str, list[_Hit]] = {}
         self.stats = {"llm_calls": 0, "llm_unavailable": 0, "retried": 0, "rejected_ids": 0}
+        # privacy.send_values_to_llm: false keeps every source value out of prompts
+        self.llm_disabled = None if cfg.privacy.send_values_to_llm else LLM_DISABLED_BY_PRIVACY
 
     def _call(self, key: str, prompt: str) -> MappingBatchDecision | str:
         """The model's answer, or the reason there is none."""
@@ -596,7 +688,8 @@ class _VocabMapper:
                 rationale="The model returned no choice for this term; map it manually.",
             )
         cid = ch.chosen_concept_id
-        if cid == 0:
+        if _unmatched(ch):
+            note = f" (Marked UNMATCHED, so concept_id {cid} was not used.)" if cid else ""
             return _decision(
                 t,
                 hits,
@@ -604,7 +697,7 @@ class _VocabMapper:
                 method="llm",
                 equivalence="UNMATCHED",
                 confidence=ch.confidence,
-                rationale=ch.rationale,
+                rationale=ch.rationale + note,
             )
         cand = next((h.candidate for h in hits if h.candidate.concept_id == cid), None)
         if cand is None:
@@ -621,7 +714,7 @@ class _VocabMapper:
                     confidence=0.0,
                     rationale=f"Rejected the model's choice: {why}. Model rationale: {ch.rationale}",
                 )
-        auto = ch.confidence >= self.cfg.mapping.auto_approve_confidence and ch.equivalence != "UNMATCHED"
+        auto = ch.confidence >= self.cfg.mapping.auto_approve_confidence
         return _decision(
             t,
             hits,
@@ -653,6 +746,10 @@ class _VocabMapper:
                 out[t.source_code] = d
             else:
                 pending.append(t)
+        if self.llm_disabled is not None:
+            for t in pending:
+                out[t.source_code] = _lexical(t, self.hits[t.source_code], self.llm_disabled)
+            return out
 
         # round 1: every pending term, in batches
         retry: list[SourceTerm] = []
@@ -668,7 +765,7 @@ class _VocabMapper:
                 ch = choices.get(t.source_code)
                 out[t.source_code] = self._apply(t, ch)
                 suggested = [p.strip() for p in (ch.retry_search_terms if ch else []) if p.strip()]
-                if ch is not None and ch.chosen_concept_id == 0 and suggested:
+                if ch is not None and _unmatched(ch) and suggested:
                     retry.append(t)
                     phrases[t.source_code] = suggested[:MAX_RETRY_PHRASES]
 
@@ -707,7 +804,9 @@ def map_terms(
     """Map every term to a standard concept (or 0). Returns decisions in the order of ``terms``.
 
     LLM calls are named ``vocab_map/<source_vocabulary_id>:batch<n>`` and ``...:retry<n>``.
-    Only terms seen at least ``privacy.min_cell_count`` times ever appear in a prompt.
+    Only terms seen at least ``privacy.min_cell_count`` times ever appear in a prompt. With
+    ``privacy.send_values_to_llm: false`` the LLM is never called: terms that are not exact
+    matches get the lexical fallback (method ``lexical``), and the audit records why.
     """
     searcher = _Searcher(conn, schemas)
     by_vocab: dict[str, list[SourceTerm]] = {}
@@ -727,6 +826,7 @@ def map_terms(
                 methods={m: sum(d.method == m for d in ds) for m in ("exact", "llm", "lexical", "suppressed")},
                 statuses={s: sum(d.status == s for d in ds) for s in ("APPROVED", "UNCHECKED", "FLAGGED")},
                 mapped=sum(d.target_concept_id != 0 for d in ds),
+                llm_disabled=vm.llm_disabled,
                 **vm.stats,
             )
     return [decided[(t.source_vocabulary_id, t.source_code)] for t in terms]

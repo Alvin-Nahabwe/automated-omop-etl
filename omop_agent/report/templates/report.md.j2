@@ -1,6 +1,8 @@
 {#- Inspection report (Markdown). Input: the dict from collect_report_data(). -#}
 # OMOP ETL inspection report: {{ project.name|md }}
 
+> **{{ 'Shareable version' if notice.shareable else 'Confidential' }}.** {{ notice.text|md }}
+
 ## 1. Summary
 
 **Verdict: {{ verdict }}**: {{ verdict_reasons|map('md')|join('; ') }}.

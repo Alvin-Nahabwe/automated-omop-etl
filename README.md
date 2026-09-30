@@ -52,7 +52,10 @@ cd my-project
 omop-agent run                        # stops for review after the design and after the mapping
 ```
 
-What `run` does, and the stage commands you can re-run on their own after editing an artifact:
+Re-running `omop-agent run` resumes. It reuses the staged source, the annotations, your edited
+`etl_spec.yaml` and your reviewed mappings. `--redesign` redrafts the spec (after backing up
+the current one as `etl_spec.<n>.yaml`), `--remap` maps every code again, and `--fresh` starts
+over. You can also run the stages one at a time:
 
 ```text
 omop-agent profile          # stage source -> src.*, write profile.md (scan report)
@@ -63,7 +66,7 @@ omop-agent map              # evaluate vocabulary + map codes -> mappings/*.csv 
 omop-agent apply-mappings   # load your CSV edits into source_to_concept_map
 omop-agent build            # compile + load + DQ checks + repair loop
 omop-agent check            # DQ checks only
-omop-agent report           # report.md / report.html
+omop-agent report [--shareable]   # report.md / report.html
 omop-agent status
 ```
 
@@ -87,21 +90,42 @@ repairs, `audit.jsonl`, and `llm_calls/` (every prompt and answer, verbatim).
 
 Health data is sensitive, so these rules are enforced in code rather than left to prompts:
 
-* **No patient rows reach the LLM.** Claude sees table and column names, types, counts,
-  ranges and frequent values only.
+* **No patient rows reach the LLM.** Claude sees table and column names, types, counts and
+  frequent values. Ranges are coarsened: dates to years, continuous numbers to two
+  significant figures. Code-like ranges whose end is a rare value are withheld.
 * **Small-cell suppression.** A value seen fewer than `min_cell_count` times is never shown to
-  the LLM. That covers the profile, vocabulary terms and repair-agent queries. Rare codes are
+  the LLM. That covers the profile, vocabulary terms and repair-agent results. Rare codes are
   left for human mapping.
-* **Direct identifiers are detected and withheld.** Names, phone numbers, national IDs,
-  addresses and GPS columns show no values at all. You can list extra identifier columns in
+* **Direct identifiers are detected and withheld.** That covers names, phone numbers,
+  national, hospital and record numbers, e-mail, addresses and GPS. Values of patient-key
+  columns are never listed. Direct-identifier columns can't be used in the ETL spec or sent
+  for mapping; the validator rejects them. You can list extra identifier columns in
   `privacy.pii_columns`.
-* **The repair agent can only run aggregates.** Each query must return a count column `n`.
-  Groups below the threshold are withheld, and queries that mention identifier columns are
-  refused. All queries run in read-only transactions.
-* **Nothing Claude produces is trusted blindly.** Concept ids are checked against the loaded
-  vocabulary, SQL is `EXPLAIN`ed before it's accepted, and DQ verdicts come from SQL.
-* **Everything is auditable.** `audit.jsonl` holds the full trail, `llm_calls/` holds every
-  prompt and answer, and `repairs.json` records every automatic change with its rationale.
+* **The repair agent can only count.** It can't write SQL to read data. Its `count_records`
+  tool takes a table, up to three grouping columns and typed filters, and the tool builds the
+  query itself with bound parameters. It returns `COUNT(*)` per group, withholds groups below
+  the threshold, and refuses identifiers, patient keys and record ids. Database error messages
+  are redacted before the model sees them.
+* **LLM-written SQL is checked before it runs.** Spec expressions must be single expressions
+  over the staged source and vocabulary. Statement separators and file, network or session
+  functions are rejected. They are `EXPLAIN`ed before they are accepted. For defence in depth,
+  set `target.etl_role` to a least-privilege role (SELECT on staging/vocabulary,
+  INSERT/TRUNCATE on CDM/ETL) and the build runs under it.
+* **Nothing Claude produces is trusted blindly.** Concept ids must exist in your vocabulary
+  as valid standard concepts in the right domain. Person and visit ids always come from the id
+  maps, so events can't attach to the wrong patient. A repair that makes results worse is
+  rolled back, and DQ verdicts come from SQL.
+* **Source files are staged exactly or not at all.** CSVs are decoded strictly: set
+  `source.encoding` for Latin-1 or cp1252 exports. Rows with the wrong number of fields stop
+  the run with their line numbers, unless you set `source.skip_ragged_rows`.
+* **Everything is auditable.** `audit.jsonl` holds the full trail. `llm_calls/` holds every
+  prompt, every tool result and the agent's intermediate messages, verbatim. `repairs.json`
+  records every automatic change with its rationale.
+* **Reports are marked confidential.** The inspection report lists source terms, rare ones
+  included, because reviewers need them. `omop-agent report --shareable` also writes a
+  version with the rare terms withheld.
+* `privacy.send_values_to_llm: false` goes further. Claude then sees statistics only, code
+  mapping is lexical only, and the repair agent can only group by concept ids.
 
 `provider: none` runs every deterministic stage (staging, profiling, lexical mapping, build,
 checks, report) with no LLM at all. In that mode you write `etl_spec.yaml` yourself.
@@ -113,8 +137,10 @@ The agent calls Claude through the official `anthropic` Python SDK (`omop_agent/
 * **Structured outputs**: annotation, design and mapping answers are parsed straight into
   pydantic models (`client.beta.messages.stream(..., output_format=Model)`).
 * **Tool use**: the repair agent runs on the SDK tool runner with six tools (read the mapping,
-  the CDM spec and the profile; run an aggregate query; update a field; replace a mapping).
-* **Adaptive thinking** at configurable `effort`, **prompt caching** of the system prompts,
+  the CDM spec and the profile; count records; update a field; replace a mapping). Tool input
+  errors go back to the model with details, and usage is summed over every turn.
+* **Adaptive thinking** at configurable `effort`, **prompt caching** of the system prompts
+  (including the design context shared by every per-table call),
   and **server-side refusal fallbacks** (`fallbacks: "default"`), which you can turn off with
   `llm.use_fallbacks: false`.
 * **Record and replay**: set `llm.record_dir` to capture a live run, then `provider: replay`
@@ -134,6 +160,8 @@ suite plus the offline demo against a `postgres:16` service.
 ## Limitations and roadmap
 
 * The target database is PostgreSQL only. Source databases can be anything SQLAlchemy reads.
+* Person and visit ids are kept stable across re-runs (the id maps are append-only). Filtered-out
+  people and visits are pruned from the maps after each load.
 * Records are not yet re-routed by domain: a source code that maps to a concept in another
   domain stays in the table the spec chose, and DQD flags it.
 * The eras (`condition_era`, `drug_era`), `visit_detail`, `note`/NLP and `cost` tables are not

@@ -262,6 +262,39 @@ def test_build_report_writes_both_formats(full_ws):
     assert "No database connection was given" in md
 
 
+def test_report_warns_that_it_lists_source_terms(full_ws):
+    cfg, ws = full_ws
+    md, html = (p.read_text() for p in build_report(cfg, ws))
+    notice = "Share it only within your data-governance boundary."
+    head = md.split("## 1. Summary")[0]
+    assert "**Confidential.**" in head and "including rare ones, needed for mapping review" in head and notice in head
+    assert notice in html.split('<section id="s1"')[0]
+    # the full report keeps rare terms: reviewers need them
+    assert "Mystery herb" in md and "Z999 (&lt;5)" in md and "Mystery herb" in html
+
+
+def test_shareable_report_withholds_rare_source_terms(full_ws):
+    cfg, ws = full_ws
+    data = collect_report_data(cfg, ws, shareable=True)
+    herb = next(r for r in data["mapping"]["review"] if r["frequency"] == "<5")
+    assert (herb["code"], herb["name"], herb["concept"]) == ("<withheld>", "<withheld>", "none (0)")
+    frequent = next(r for r in data["mapping"]["review"] if r["code"] == "PCM")
+    assert frequent["name"] == "Paracetamol 500mg"
+    assert data["vocab"]["coverage"][0]["unmatched"] == "J189 (97), <withheld> (<5)"
+
+    full_md, full_html = build_report(cfg, ws)
+    md_path, html_path = build_report(cfg, ws, shareable=True)
+    assert (md_path.name, html_path.name) == ("report.shareable.md", "report.shareable.html")
+    assert full_md.read_text() != md_path.read_text() and "Mystery herb" in full_md.read_text()  # full copy kept
+    md, html = md_path.read_text(), html_path.read_text()
+    for text in ("Mystery herb", "herb", "Z999"):
+        assert text not in md and text not in html, text
+    assert "&lt;withheld&gt;" in md and "&lt;withheld&gt;" in html
+    assert "**Shareable version.**" in md and "fewer than 5 times" in md and "Shareable version" in html
+    assert "data-governance boundary" not in md
+    assert "Paracetamol 500mg" in md and "J189" in md  # frequent terms are still shown
+
+
 def test_html_and_markdown_escape_untrusted_text(full_ws):
     cfg, ws = full_ws
     md_path, html_path = build_report(cfg, ws)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,18 @@ import yaml
 from omop_agent.db import execute, fetch_all
 from omop_agent.llm import LLMClient, NullLLM, ReplayLLM
 from omop_agent.llm.replay import save_recording
-from omop_agent.models import ConceptCandidate, ETLSpec, MappingBatchDecision, MappingDecision, SourceTerm
+from omop_agent.config import PrivacyConfig
+from omop_agent.models import (
+    ColumnProfile,
+    ConceptCandidate,
+    ETLSpec,
+    FieldMapping,
+    MappingBatchDecision,
+    MappingDecision,
+    SourceProfile,
+    SourceTerm,
+    TableProfile,
+)
 from omop_agent.vocab import mapper
 from omop_agent.vocab.evaluate import evaluate_vocabulary, render_vocab_evaluation_md
 from omop_agent.vocab.mapper import (
@@ -22,6 +34,7 @@ from omop_agent.vocab.mapper import (
     map_terms,
     mapping_summary,
     normalize,
+    pii_concept_fields,
     search_candidates,
     text_score,
     write_source_to_concept_map,
@@ -244,6 +257,62 @@ def test_collect_terms(staged):
     assert by_vocab["SRC_UNIT"] == {"mmHg", "g/dL", "mmol/L", "C", "kg"}  # NULL units are skipped
     va = [t for t in terms if t.source_vocabulary_id == "SRC_VA_CAUSE"]
     assert {t.source_code for t in va} >= {"Malaria", "Pneumonia"} and all(t.target_domain is None for t in va)
+
+
+@pytest.mark.postgres
+def test_collect_terms_skips_fields_that_read_identifiers(staged, tmp_path):
+    conn, schemas, cfg = staged
+    spec = load_spec()
+    person = spec.mapping_for("person")
+    person.fields += [
+        FieldMapping(target_field="race_source_concept_id", kind="concept_map", expression="i.first_name",
+                     vocabulary="SRC_NAME", target_domain="Race"),
+        # unqualified column, inside a function call
+        FieldMapping(target_field="ethnicity_source_concept_id", kind="concept_map", expression="upper(last_name)",
+                     vocabulary="SRC_SURNAME", target_domain="Ethnicity"),
+    ]
+    ws = Workspace(tmp_path / "work")
+    terms = collect_terms(conn, schemas, spec, None, cfg.privacy, ws)
+    vocabs = {t.source_vocabulary_id for t in terms}
+    assert vocabs == {"SRC_DRUG", "SRC_LAB", "SRC_RESULT", "SRC_UNIT", "SRC_VA_CAUSE"}
+    with (Path(cfg.source.path) / "individuals.csv").open() as fh:
+        names = {v for r in csv.DictReader(fh) for v in (r["first_name"], r["last_name"], r["last_name"].upper())}
+    assert not names & {t.source_code for t in terms}
+    skipped = [
+        "person.race_source_concept_id reads individuals.first_name",
+        "person.ethnicity_source_concept_id reads individuals.last_name",
+    ]
+    assert pii_concept_fields(spec, None, cfg.privacy) == skipped
+    assert next(e for e in ws.read_audit() if e["event"] == "vocab_pii_fields_skipped")["fields"] == skipped
+    # the old positional call applies the default PII name patterns too
+    assert {t.source_vocabulary_id for t in collect_terms(conn, schemas, spec)} == vocabs
+
+    # columns listed in privacy.pii_columns, or flagged in the profile, are skipped as well; a
+    # WHERE on an identifier only filters rows, its values do not become terms
+    drug = spec.mapping_for("drug_exposure")
+    drug.where = "p.individual_id IS NOT NULL"
+    privacy = PrivacyConfig(pii_columns=["prescriptions.individual_id", "lab_results.unit"])
+    profile = SourceProfile(
+        source_type="csv",
+        generated_at=datetime.now(timezone.utc),
+        min_cell_count=5,
+        tables=[
+            TableProfile(
+                name="deaths",
+                n_rows=10,
+                columns=[
+                    ColumnProfile(name="va_cause", inferred_type="string", n_rows=10, n_null=0, n_distinct=3,
+                                  unique=False, is_pii=True, pii_reason="test"),
+                ],
+            )
+        ],
+    )
+    vocabs = {t.source_vocabulary_id for t in collect_terms(conn, schemas, spec, profile, privacy)}
+    assert vocabs == {"SRC_DRUG", "SRC_LAB", "SRC_RESULT"}
+    assert pii_concept_fields(spec, profile, privacy)[2:] == [
+        "measurement.unit_concept_id reads lab_results.unit",
+        "death.cause_concept_id reads deaths.va_cause",
+    ]
 
 
 @pytest.fixture(params=["exhaustive", "trigram", "ilike"])
@@ -470,6 +539,63 @@ def test_map_terms_without_llm_falls_back_to_lexical(staged, tmp_path, which):
     assert by["SRC_VA_CAUSE", "Malaria"].method == "exact"  # no LLM needed
     assert by["SRC_DRUG", "Quinine inj 600mg"].method == "suppressed"
     assert all(d.status != "APPROVED" for d in by.values() if d.method == "lexical")
+
+
+@pytest.mark.postgres
+def test_send_values_to_llm_false_never_calls_the_llm(staged, tmp_path):
+    conn, schemas, cfg = staged
+    cfg.privacy.send_values_to_llm = False
+    ws = Workspace(tmp_path / "work")
+    spy = CapturingLLM()
+    replay = tmp_path / "replay"
+    demo_recordings(replay)  # a recording exists for every batch, and must not be used
+    terms = collect_terms(conn, schemas, load_spec())
+    for llm in (spy, ReplayLLM(replay, ws)):
+        by = {(d.source_vocabulary_id, d.source_code): d for d in map_terms(conn, schemas, terms, llm, cfg, ws)}
+        para = by["SRC_DRUG", "Paracetamol 500mg"]
+        assert (para.method, para.status, para.target_concept_id) == ("lexical", "UNCHECKED", ACETAMINOPHEN_500_TAB)
+        assert "privacy.send_values_to_llm" in para.rationale
+        hb = by["SRC_LAB", "HB"]
+        assert (hb.method, hb.target_concept_id) == ("lexical", 0) and "privacy.send_values_to_llm" in hb.rationale
+        assert by["SRC_VA_CAUSE", "Malaria"].method == "exact"  # a vocabulary lookup, not an LLM call
+        assert by["SRC_DRUG", "Quinine inj 600mg"].method == "suppressed"
+        assert {d.method for d in by.values()} == {"lexical", "exact", "suppressed"}
+    assert spy.calls == []
+    assert not (ws.root / "llm_calls").exists()
+    audit = [e for e in ws.read_audit() if e["event"] == "vocab_mapped"]
+    assert audit and all(e["llm_calls"] == 0 and "send_values_to_llm" in e["llm_disabled"] for e in audit)
+    assert not any(e["event"] == "llm_call" for e in ws.read_audit())
+
+
+@pytest.mark.postgres
+def test_unmatched_choice_is_never_mapped(staged, tmp_path):
+    conn, schemas, cfg = staged
+    terms = [
+        SourceTerm(source_vocabulary_id="SRC_X", source_code=code, source_name=code, frequency=freq,
+                   target_domain="Measurement")
+        for code, freq in [("SBP", 90), ("MRDT", 80)]
+    ]
+    unmatched = {"equivalence": "UNMATCHED", "confidence": 0.96, "rationale": "Not the same test."}
+    record(
+        tmp_path,
+        "SRC_X:batch1",
+        [
+            {"source_code": "SBP", "chosen_concept_id": 2000004006, **unmatched},
+            {"source_code": "MRDT", "chosen_concept_id": MALARIA, **unmatched, "retry_search_terms": ["malaria test"]},
+        ],
+    )
+    record(tmp_path, "SRC_X:retry1", [choice("MRDT", 2000004002, 0.95)])
+    by = {d.source_code: d for d in map_terms(conn, schemas, terms, ReplayLLM(tmp_path), cfg)}
+    sbp = by["SBP"]
+    assert (sbp.target_concept_id, sbp.target_concept_name, sbp.status, sbp.equivalence, sbp.method) == (
+        0, None, "UNCHECKED", "UNMATCHED", "llm"
+    )
+    assert sbp.rationale.startswith("Not the same test.") and "2000004006 was not used" in sbp.rationale
+    assert by["MRDT"].target_concept_id == 2000004002  # UNMATCHED with suggested phrases is searched again
+    assert write_source_to_concept_map(conn, schemas, list(by.values())) == 1
+    stcm = f"{schemas.etl}.source_to_concept_map"
+    rows = fetch_all(conn, f"SELECT source_code FROM {stcm} WHERE source_vocabulary_id = 'SRC_X'")
+    assert rows == [{"source_code": "MRDT"}]
 
 
 # --------------------------------------------------------------------------------------

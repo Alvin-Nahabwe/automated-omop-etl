@@ -44,6 +44,9 @@ class SourceConfig(_Base):
     tables: list[str] | None = Field(None, description="Only these tables; default is all.")
     delimiter: str = ","
     encoding: str = "utf-8"
+    skip_ragged_rows: bool = Field(
+        False, description="Stage CSV files even if some rows have the wrong number of fields (those rows are left out and counted)."
+    )
 
     @model_validator(mode="after")
     def _check(self) -> "SourceConfig":

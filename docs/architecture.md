@@ -31,11 +31,12 @@ flowchart LR
    choose among candidates or ids that exist. Generated SQL is `EXPLAIN`ed before it runs.
    Data-quality results come from SQL, never from the model.
 2. **Patient data never goes to the LLM.** Prompts contain aggregate metadata only: names,
-   types, counts, ranges and frequent values. Values seen fewer than `min_cell_count` times,
-   and every value of a detected direct identifier (names, phones, IDs, GPS), are withheld by
-   construction (`omop_agent/privacy.py`). The repair agent can only run aggregate queries
-   whose small groups are suppressed. Every prompt is stored verbatim in
-   `work/llm_calls/` for audit.
+   types, counts, coarsened ranges and frequent values. Values seen fewer than
+   `min_cell_count` times, and every value of a detected direct identifier (names, phones,
+   IDs, GPS), are withheld by construction (`omop_agent/privacy.py`). The repair agent can
+   only count records through a tool that builds the query itself, withholds small groups and
+   refuses identifiers. Database errors are redacted before they reach the model. Every prompt
+   and tool result is stored verbatim in `work/llm_calls/` for audit.
 3. **Human in the loop at the right places.** The ETL spec (`etl_spec.yaml`) and the
    vocabulary mappings (`mappings/*.csv`, Usagi-like columns) are plain files. `omop-agent
    run` stops after each one unless `--yes` is passed. Edits are picked up on the next step.
@@ -96,13 +97,18 @@ blocking severity (default `fatal`) fails and no ETL step errored. Otherwise the
 gets the failures and a set of tools:
 
 * `get_table_mapping`, `get_cdm_table`, `get_source_profile`: read context;
-* `run_aggregate_query`: read-only SQL that must return a count column `n`; groups with
-  `n < min_cell_count` are withheld and PII columns are refused;
+* `count_records`: counts only. The tool builds `SELECT g…, COUNT(*) AS n FROM <table>
+  WHERE <typed filters> GROUP BY g HAVING COUNT(*) >= min_cell_count` itself, with bound
+  parameters. Identifiers, patient keys and record ids can't be grouped or filtered.
+  Vocabulary tables are reference data and are not suppressed;
 * `update_field_mapping`, `replace_table_mapping`: change the spec. A change is applied only
-  if the table still compiles and `EXPLAIN`s cleanly.
+  if it passes the SQL guard (`sqlguard.py`) and the PII and person-link rules, and the table
+  still compiles and `EXPLAIN`s cleanly. An edit identical to the current mapping is a no-op.
 
-The ETL is rebuilt and re-checked, up to `quality.max_repair_iterations` times. Each change is
-recorded in `repairs.json` and the audit log.
+The ETL is rebuilt and re-checked, up to `quality.max_repair_iterations` times. An iteration
+that makes the result worse (an ETL error, or more failing checks) is rolled back to the last
+best spec. `etl_spec.before_repair.yaml` keeps the spec as it was before automatic repairs,
+and every change is recorded in `repairs.json` and the audit log.
 
 With `quality.use_r_dqd: true` and R available, the official Achilles and
 DataQualityDashboard packages also run through a generated R script. Their JSON results feed

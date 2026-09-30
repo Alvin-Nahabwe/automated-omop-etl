@@ -102,7 +102,7 @@ class Pipeline:
         from .profiling.render import render_profile_md
 
         def run() -> SourceProfile:
-            manifest = stage_source(self.cfg, self.conn, self.schemas, self.ws)
+            manifest = stage_source(self.cfg, self.conn, self.schemas, self.ws, strict=not self.cfg.source.skip_ragged_rows)
             self.log(f"  staged {len(manifest)} tables into schema '{self.schemas.src}'")
             profile = profile_staging(self.conn, self.schemas, self.cfg, manifest)
             self.ws.save_json(self.ws.profile_json, profile)
@@ -187,7 +187,13 @@ class Pipeline:
         are still present; only new terms are mapped. ``remap=True`` maps everything again.
         """
         from .vocab.evaluate import evaluate_vocabulary, render_vocab_evaluation_md
-        from .vocab.mapper import collect_terms, map_terms, mapping_summary, write_source_to_concept_map
+        from .vocab.mapper import (
+            collect_terms,
+            map_terms,
+            mapping_summary,
+            pii_concept_fields,
+            write_source_to_concept_map,
+        )
         from .vocab.review import export_review, import_review
 
         def run() -> list[MappingDecision]:
@@ -197,7 +203,10 @@ class Pipeline:
             (self.ws.root / "vocab_evaluation.md").write_text(render_vocab_evaluation_md(ev))
             for issue in ev.issues:
                 self.log(f"  vocabulary: {issue}")
-            terms = collect_terms(self.conn, self.schemas, spec)
+            profile = self.load_profile() if self.ws.profile_json.exists() else None
+            for f in pii_concept_fields(spec, profile, self.cfg.privacy):
+                self.log(f"  skipped {f}: direct identifiers are never mapped or loaded")
+            terms = collect_terms(self.conn, self.schemas, spec, profile, self.cfg.privacy, self.ws)
             prior: dict[tuple[str, str], MappingDecision] = {}
             if not remap and self.ws.decisions_json.exists():
                 prior = {(d.source_vocabulary_id, d.source_code): d for d in import_review(self.ws, self.conn, self.schemas)}
@@ -296,6 +305,8 @@ class Pipeline:
 
         if self.ws.repairs_json.exists():  # repairs.json describes this build session only
             self.ws.repairs_json.replace(self.ws.root / "repairs.previous.json")
+        if self.ws.spec_yaml.exists():  # the spec exactly as reviewed, before any automatic repair
+            (self.ws.root / "etl_spec.before_repair.yaml").write_text(self.ws.spec_yaml.read_text())
         spec = self.load_spec()
         profile = self.load_profile() if self.ws.profile_json.exists() else None
         max_iter = self.cfg.quality.max_repair_iterations
@@ -343,12 +354,15 @@ class Pipeline:
         sev = set(self.cfg.quality.repair_severities)
         return any((r.failed or r.error) and r.severity in sev and not r.not_applicable for r in report.results)
 
-    def report(self) -> None:
+    def report(self, shareable: bool = False) -> None:
         from .report.inspection import build_report
 
         def run() -> None:
             md, html = build_report(self.cfg, self.ws, self.conn, self.schemas)
             self.log(f"  inspection report: {md} and {html}")
+            if shareable:
+                md, html = build_report(self.cfg, self.ws, self.conn, self.schemas, shareable=True)
+                self.log(f"  shareable version (rare source terms withheld): {md} and {html}")
 
         self._run_stage("report", run)
 
