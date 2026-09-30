@@ -1,0 +1,79 @@
+concept_id	concept_name	domain_id	vocabulary_id	concept_class_id	standard_concept	concept_code	valid_start_date	valid_end_date	invalid_reason
+0	No matching concept	Metadata	None	Undefined		No matching concept	19700101	20991231	
+8507	MALE	Gender	Gender	Gender	S	M	19700101	20991231	
+8532	FEMALE	Gender	Gender	Gender	S	F	19700101	20991231	
+9201	Inpatient Visit	Visit	Visit	Visit	S	IP	19700101	20991231	
+9202	Outpatient Visit	Visit	Visit	Visit	S	OP	19700101	20991231	
+9203	Emergency Room Visit	Visit	Visit	Visit	S	ER	19700101	20991231	
+32817	EHR	Type Concept	Type Concept	Type Concept	S	OMOP4976890	19700101	20991231	
+2000001001	Malaria	Condition	SNOMED	Clinical Finding	S	FX2000001001	19700101	20991231	
+2000001002	Pneumonia	Condition	SNOMED	Clinical Finding	S	FX2000001002	19700101	20991231	
+2000001003	Gastroenteritis	Condition	SNOMED	Clinical Finding	S	FX2000001003	19700101	20991231	
+2000001004	Essential hypertension	Condition	SNOMED	Clinical Finding	S	FX2000001004	19700101	20991231	
+2000001005	Type 2 diabetes mellitus	Condition	SNOMED	Clinical Finding	S	FX2000001005	19700101	20991231	
+2000001006	Human immunodeficiency virus infection	Condition	SNOMED	Clinical Finding	S	FX2000001006	19700101	20991231	
+2000001007	Pulmonary tuberculosis	Condition	SNOMED	Clinical Finding	S	FX2000001007	19700101	20991231	
+2000001008	Anemia	Condition	SNOMED	Clinical Finding	S	FX2000001008	19700101	20991231	
+2000001009	Acute upper respiratory infection	Condition	SNOMED	Clinical Finding	S	FX2000001009	19700101	20991231	
+2000001011	Diarrhea	Condition	SNOMED	Clinical Finding	S	FX2000001011	19700101	20991231	
+2000001012	Plasmodium falciparum malaria	Condition	SNOMED	Clinical Finding	S	FX2000001012	19700101	20991231	
+2000001013	Viral pneumonia	Condition	SNOMED	Clinical Finding	S	FX2000001013	19700101	20991231	
+2000001010	Road traffic accident	Observation	SNOMED	Event	S	FX2000001010	19700101	20991231	
+2000002001	Unspecified malaria	Condition	ICD10	ICD10 code		B54	19700101	20991231	
+2000002002	Pneumonia, unspecified	Condition	ICD10	ICD10 code		J18.9	19700101	20991231	
+2000002003	Other gastroenteritis and colitis of infectious and unspecified origin	Condition	ICD10	ICD10 code		A09	19700101	20991231	
+2000002004	Essential (primary) hypertension	Condition	ICD10	ICD10 code		I10	19700101	20991231	
+2000002005	Type 2 diabetes mellitus without complications	Condition	ICD10	ICD10 code		E11.9	19700101	20991231	
+2000002006	HIV disease resulting in infectious and parasitic diseases	Condition	ICD10	ICD10 code		B20	19700101	20991231	
+2000002007	Tuberculosis of lung	Condition	ICD10	ICD10 code		A15.0	19700101	20991231	
+2000002008	Anaemia, unspecified	Condition	ICD10	ICD10 code		D64.9	19700101	20991231	
+2000002009	Acute upper respiratory infection, unspecified	Condition	ICD10	ICD10 code		J06.9	19700101	20991231	
+2000003101	artemether	Drug	RxNorm	Ingredient	S	FX2000003101	19700101	20991231	
+2000003102	lumefantrine	Drug	RxNorm	Ingredient	S	FX2000003102	19700101	20991231	
+2000003103	acetaminophen	Drug	RxNorm	Ingredient	S	FX2000003103	19700101	20991231	
+2000003104	amoxicillin	Drug	RxNorm	Ingredient	S	FX2000003104	19700101	20991231	
+2000003105	metformin	Drug	RxNorm	Ingredient	S	FX2000003105	19700101	20991231	
+2000003106	amlodipine	Drug	RxNorm	Ingredient	S	FX2000003106	19700101	20991231	
+2000003107	zinc sulfate	Drug	RxNorm	Ingredient	S	FX2000003107	19700101	20991231	
+2000003108	lamivudine	Drug	RxNorm	Ingredient	S	FX2000003108	19700101	20991231	
+2000003109	tenofovir disoproxil	Drug	RxNorm	Ingredient	S	FX2000003109	19700101	20991231	
+2000003110	dolutegravir	Drug	RxNorm	Ingredient	S	FX2000003110	19700101	20991231	
+2000003111	sulfamethoxazole	Drug	RxNorm	Ingredient	S	FX2000003111	19700101	20991231	
+2000003112	trimethoprim	Drug	RxNorm	Ingredient	S	FX2000003112	19700101	20991231	
+2000003113	quinine	Drug	RxNorm	Ingredient	S	FX2000003113	19700101	20991231	
+2000003114	ceftriaxone	Drug	RxNorm	Ingredient	S	FX2000003114	19700101	20991231	
+2000003115	sodium chloride	Drug	RxNorm	Ingredient	S	FX2000003115	19700101	20991231	
+2000003001	artemether 20 MG / lumefantrine 120 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	FX2000003001	19700101	20991231	
+2000003002	acetaminophen 500 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	FX2000003002	19700101	20991231	
+2000003003	amoxicillin 250 MG Oral Capsule	Drug	RxNorm	Clinical Drug	S	FX2000003003	19700101	20991231	
+2000003004	glucose / potassium chloride / sodium chloride / sodium citrate Powder for Oral Solution	Drug	RxNorm	Clinical Drug Form	S	FX2000003004	19700101	20991231	
+2000003005	zinc sulfate 20 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	FX2000003005	19700101	20991231	
+2000003006	metformin hydrochloride 500 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	FX2000003006	19700101	20991231	
+2000003007	amlodipine 5 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	FX2000003007	19700101	20991231	
+2000003008	dolutegravir 50 MG / lamivudine 300 MG / tenofovir disoproxil fumarate 300 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	FX2000003008	19700101	20991231	
+2000003009	sulfamethoxazole 800 MG / trimethoprim 160 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	FX2000003009	19700101	20991231	
+2000003010	quinine dihydrochloride 300 MG/ML Injectable Solution	Drug	RxNorm	Clinical Drug	S	FX2000003010	19700101	20991231	
+2000003011	ceftriaxone 1000 MG Injection	Drug	RxNorm	Clinical Drug	S	FX2000003011	19700101	20991231	
+2000003012	acetaminophen 325 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	FX2000003012	19700101	20991231	
+2000003013	amoxicillin 500 MG Oral Capsule	Drug	RxNorm	Clinical Drug	S	FX2000003013	19700101	20991231	
+2000003014	metformin hydrochloride 850 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	FX2000003014	19700101	20991231	
+2000003015	amlodipine 10 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	FX2000003015	19700101	20991231	
+2000004001	Hemoglobin [Mass/volume] in Blood	Measurement	LOINC	Lab Test	S	718-7	19700101	20991231	
+2000004002	Plasmodium sp Ag [Presence] in Blood by Rapid immunoassay	Measurement	LOINC	Lab Test	S	70569-9	19700101	20991231	
+2000004003	Glucose [Moles/volume] in Blood	Measurement	LOINC	Lab Test	S	15074-8	19700101	20991231	
+2000004004	Body weight	Measurement	LOINC	Clinical Observation	S	29463-7	19700101	20991231	
+2000004005	Body temperature	Measurement	LOINC	Clinical Observation	S	8310-5	19700101	20991231	
+2000004006	Systolic blood pressure	Measurement	LOINC	Clinical Observation	S	8480-6	19700101	20991231	
+2000004007	Diastolic blood pressure	Measurement	LOINC	Clinical Observation	S	8462-4	19700101	20991231	
+2000004008	Body height	Measurement	LOINC	Clinical Observation	S	8302-2	19700101	20991231	
+2000004009	Glucose [Mass/volume] in Serum or Plasma	Measurement	LOINC	Lab Test	S	2345-7	19700101	20991231	
+2000004010	Hemoglobin A1c/Hemoglobin.total in Blood	Measurement	LOINC	Lab Test	S	4548-4	19700101	20991231	
+2000005001	gram per deciliter	Unit	UCUM	Unit	S	g/dL	19700101	20991231	
+2000005002	millimole per liter	Unit	UCUM	Unit	S	mmol/L	19700101	20991231	
+2000005003	kilogram	Unit	UCUM	Unit	S	kg	19700101	20991231	
+2000005004	degree Celsius	Unit	UCUM	Unit	S	Cel	19700101	20991231	
+2000005005	millimeter mercury column	Unit	UCUM	Unit	S	mm[Hg]	19700101	20991231	
+2000005006	centimeter	Unit	UCUM	Unit	S	cm	19700101	20991231	
+2000005007	milligram per deciliter	Unit	UCUM	Unit	S	mg/dL	19700101	20991231	
+2000006001	Positive	Meas Value	LOINC	Answer	S	LA6576-8	19700101	20991231	
+2000006002	Negative	Meas Value	LOINC	Answer	S	LA6577-6	19700101	20991231	

@@ -1,0 +1,509 @@
+# Reference ETL spec for the demo dataset (contains two deliberate bugs for the repair loop).
+version: 1
+cdm_version: '5.4'
+person_key:
+  table: individuals
+  expression: individual_id
+visit_key:
+  table: clinic_visits
+  expression: visit_id
+observation_period: table_mapping
+observation_period_type_concept_id: 32817
+table_mappings:
+- target_table: person
+  source:
+    table: individuals
+    alias: i
+  joins: []
+  where: null
+  fields:
+  - target_field: person_id
+    kind: person_id
+    expression: i.individual_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Patient key resolved through the person id map.
+  - target_field: gender_concept_id
+    kind: expression
+    expression: CASE i.sex WHEN '1' THEN 8507 WHEN '2' THEN 8532 ELSE 0 END
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: 'HDSS sex codes: 1=male (8507), 2=female (8532), 9=unknown (0).'
+  - target_field: year_of_birth
+    kind: expression
+    expression: EXTRACT(YEAR FROM to_date(i.dob, 'DD/MM/YYYY'))::int
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: dob is written day-first (dd/mm/yyyy).
+  - target_field: month_of_birth
+    kind: expression
+    expression: EXTRACT(MONTH FROM to_date(i.dob, 'DD/MM/YYYY'))::int
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: day_of_birth
+    kind: expression
+    expression: EXTRACT(DAY FROM to_date(i.dob, 'DD/MM/YYYY'))::int
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: birth_datetime
+    kind: expression
+    expression: to_date(i.dob, 'DD/MM/YYYY')::timestamp
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: race_concept_id
+    kind: constant
+    expression: '0'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Race is not collected.
+  - target_field: ethnicity_concept_id
+    kind: constant
+    expression: '0'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Ethnicity is not collected.
+  - target_field: person_source_value
+    kind: column
+    expression: i.individual_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: gender_source_value
+    kind: column
+    expression: i.sex
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: gender_source_concept_id
+    kind: constant
+    expression: '0'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  rationale: One row per registered HDSS individual.
+- target_table: observation_period
+  source:
+    table: residency_episodes
+    alias: r
+  joins: []
+  where: null
+  fields:
+  - target_field: observation_period_id
+    kind: auto_id
+    expression: null
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Surrogate key.
+  - target_field: person_id
+    kind: person_id
+    expression: r.individual_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Patient key resolved through the person id map.
+  - target_field: observation_period_start_date
+    kind: expression
+    expression: r.start_date::date
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: observation_period_end_date
+    kind: expression
+    expression: r.end_date::date
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: period_type_concept_id
+    kind: constant
+    expression: '32817'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Type concept for the surveillance/clinic record.
+  rationale: HDSS residency episodes are the periods during which events would be captured.
+- target_table: visit_occurrence
+  source:
+    table: clinic_visits
+    alias: v
+  joins: []
+  where: null
+  fields:
+  - target_field: visit_occurrence_id
+    kind: visit_id
+    expression: v.visit_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Visit key resolved through the visit id map.
+  - target_field: person_id
+    kind: person_id
+    expression: v.individual_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Patient key resolved through the person id map.
+  - target_field: visit_concept_id
+    kind: expression
+    expression: CASE v.visit_type WHEN 'OPD' THEN 9202 WHEN 'IPD' THEN 9201 WHEN 'EMERG' THEN 9203 ELSE 0 END
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: OPD=Outpatient, IPD=Inpatient, EMERG=Emergency Room.
+  - target_field: visit_start_date
+    kind: expression
+    expression: v.visit_date::date
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: visit_start_datetime
+    kind: expression
+    expression: v.visit_date::timestamp
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: visit_end_date
+    kind: expression
+    expression: v.discharge_date::date
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Discharge date closes the visit.
+  - target_field: visit_type_concept_id
+    kind: constant
+    expression: '32817'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: EHR record from the clinic system (32817).
+  - target_field: visit_source_value
+    kind: column
+    expression: v.visit_type
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  rationale: One row per clinic visit.
+- target_table: condition_occurrence
+  source:
+    table: diagnoses
+    alias: d
+  joins: []
+  where: null
+  fields:
+  - target_field: condition_occurrence_id
+    kind: auto_id
+    expression: null
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Surrogate key.
+  - target_field: person_id
+    kind: person_id
+    expression: d.individual_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Patient key resolved through the person id map.
+  - target_field: condition_concept_id
+    kind: vocab_code
+    expression: d.icd10
+    vocabulary: ICD10
+    target_domain: null
+    concept_role: standard
+    rationale: ICD-10 codes follow 'Maps to' to SNOMED.
+  - target_field: condition_start_date
+    kind: expression
+    expression: d.dx_date::date
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: condition_start_datetime
+    kind: expression
+    expression: d.dx_date::timestamp
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: condition_type_concept_id
+    kind: constant
+    expression: '32817'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: EHR record from the clinic system (32817).
+  - target_field: visit_occurrence_id
+    kind: visit_id
+    expression: d.visit_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Links the record to its clinic visit.
+  - target_field: condition_source_value
+    kind: column
+    expression: d.icd10
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: condition_source_concept_id
+    kind: vocab_code
+    expression: d.icd10
+    vocabulary: ICD10
+    target_domain: null
+    concept_role: source
+    rationale: ''
+  rationale: One row per recorded ICD-10 diagnosis.
+- target_table: drug_exposure
+  source:
+    table: prescriptions
+    alias: p
+  joins: []
+  where: null
+  fields:
+  - target_field: drug_exposure_id
+    kind: auto_id
+    expression: null
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Surrogate key.
+  - target_field: person_id
+    kind: person_id
+    expression: p.individual_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Patient key resolved through the person id map.
+  - target_field: drug_concept_id
+    kind: concept_map
+    expression: p.drug
+    vocabulary: SRC_DRUG
+    target_domain: Drug
+    concept_role: standard
+    rationale: Local drug names need Usagi-style mapping to RxNorm.
+  - target_field: drug_exposure_start_date
+    kind: expression
+    expression: p.date_prescribed::date
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: drug_exposure_end_date
+    kind: expression
+    expression: p.date_prescribed::date + GREATEST(COALESCE(p.days::int, 1), 1) - 1
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Start date plus days supplied.
+  - target_field: drug_type_concept_id
+    kind: constant
+    expression: '32817'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: EHR record from the clinic system (32817).
+  - target_field: quantity
+    kind: expression
+    expression: p.qty::numeric
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: days_supply
+    kind: expression
+    expression: p.days::int
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: visit_occurrence_id
+    kind: visit_id
+    expression: p.visit_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Links the record to its clinic visit.
+  - target_field: drug_source_value
+    kind: column
+    expression: p.drug
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: drug_source_concept_id
+    kind: constant
+    expression: '0'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  rationale: One row per prescription line.
+- target_table: measurement
+  source:
+    table: lab_results
+    alias: r
+  joins: []
+  where: null
+  fields:
+  - target_field: measurement_id
+    kind: auto_id
+    expression: null
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Surrogate key.
+  - target_field: person_id
+    kind: person_id
+    expression: r.individual_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Patient key resolved through the person id map.
+  - target_field: measurement_concept_id
+    kind: concept_map
+    expression: r.test
+    vocabulary: SRC_LAB
+    target_domain: Measurement
+    concept_role: standard
+    rationale: Local test codes map to LOINC.
+  - target_field: measurement_date
+    kind: expression
+    expression: r.test_date::date
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: measurement_type_concept_id
+    kind: constant
+    expression: '32817'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: EHR record from the clinic system (32817).
+  - target_field: value_as_number
+    kind: expression
+    expression: CASE WHEN r.result ~ '^-?[0-9]+(\.[0-9]+)?$' THEN r.result::numeric END
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Numeric results only.
+  - target_field: value_as_concept_id
+    kind: concept_map
+    expression: CASE WHEN r.result !~ '^-?[0-9]+(\.[0-9]+)?$' THEN r.result END
+    vocabulary: SRC_RESULT
+    target_domain: Meas Value
+    concept_role: standard
+    rationale: Qualitative results (POS/NEG).
+  - target_field: unit_concept_id
+    kind: concept_map
+    expression: r.unit
+    vocabulary: SRC_UNIT
+    target_domain: Unit
+    concept_role: standard
+    rationale: Unit strings map to UCUM.
+  - target_field: visit_occurrence_id
+    kind: visit_id
+    expression: r.visit_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Links the record to its clinic visit.
+  - target_field: measurement_source_value
+    kind: column
+    expression: r.test
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: unit_source_value
+    kind: column
+    expression: r.unit
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: value_source_value
+    kind: column
+    expression: r.result
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  rationale: Lab results and vital signs; both are Measurement domain in OMOP.
+- target_table: death
+  source:
+    table: deaths
+    alias: x
+  joins: []
+  where: null
+  fields:
+  - target_field: person_id
+    kind: person_id
+    expression: x.individual_id
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Patient key resolved through the person id map.
+  - target_field: death_date
+    kind: expression
+    expression: x.dod::date
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: death_type_concept_id
+    kind: constant
+    expression: '32817'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: Type concept for the surveillance record.
+  - target_field: cause_concept_id
+    kind: concept_map
+    expression: x.va_cause
+    vocabulary: SRC_VA_CAUSE
+    target_domain: null
+    concept_role: standard
+    rationale: Verbal-autopsy causes are free-text categories.
+  - target_field: cause_source_value
+    kind: column
+    expression: x.va_cause
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  - target_field: cause_source_concept_id
+    kind: constant
+    expression: '0'
+    vocabulary: null
+    target_domain: null
+    concept_role: standard
+    rationale: ''
+  rationale: Deaths recorded by the HDSS with verbal-autopsy cause.
+custom_sql: []
+assumptions:
+- HDSS residency episodes define observation periods.
+- Sex code 9 means unknown and maps to concept 0.
+- EHR type concept (32817) is used for all records.
+open_questions:
+- Should care sites be created from clinic_visits.facility?

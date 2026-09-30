@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omop-agent"
+version = "0.1.0"
+description = "AI agent that automates the OHDSI ETL pipeline: profile source data, design the ETL, map vocabularies, generate and run SQL, and loop on data-quality checks until the OMOP CDM passes."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=1.9",
+    "pydantic>=2.7",
+    "psycopg[binary]>=3.1",
+    "sqlalchemy>=2.0",
+    "pandas>=2.1",
+    "rapidfuzz>=3.0",
+    "typer>=0.12",
+    "rich>=13",
+    "pyyaml>=6",
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+omop-agent = "omop_agent.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["omop_agent*"]
+
+[tool.setuptools.package-data]
+omop_agent = [
+    "resources/ohdsi/*",
+    "report/templates/*",
+    "quality/r/*",
+    "demo/fixtures/vocab/*",
+    "demo/fixtures/replay/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["postgres: needs a PostgreSQL database (set OMOP_AGENT_TEST_DB_URL)"]

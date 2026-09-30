@@ -1,0 +1,7 @@
+relationship_id	relationship_name	is_hierarchical	defines_ancestry	reverse_relationship_id	relationship_concept_id
+Maps to	Maps to	0	0	Mapped from	2000009300
+Mapped from	Mapped from	0	0	Maps to	2000009301
+Is a	Is a	1	1	Subsumes	2000009302
+Subsumes	Subsumes	1	1	Is a	2000009303
+RxNorm has ing	RxNorm has ing	0	1	RxNorm ing of	2000009304
+RxNorm ing of	RxNorm ing of	0	1	RxNorm has ing	2000009305
