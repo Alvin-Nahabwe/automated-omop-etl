@@ -81,7 +81,9 @@ a Rabbit-in-a-Hat document, and it compiles directly to SQL. Each `TableMapping`
 
 Concept lookups yield `0` when the source value exists but has no mapping. When the source
 value is NULL they yield NULL, or 0 if the CDM field is required. `varchar(n)` targets are
-truncated to `n` characters. Placeholders `{cdm}`, `{vocab}`, `{src}`, `{etl}`, `{results}` in
+truncated to `n` characters. The `cdm_source` row is generated from `cdm_source` in the config;
+`cdm_version_concept_id` is looked up in the vocabulary (CDM vocabulary, code `CDM v5.4`), or
+0 if that vocabulary isn't loaded. Placeholders `{cdm}`, `{vocab}`, `{src}`, `{etl}`, `{results}` in
 expressions and custom SQL resolve to the configured schemas.
 
 ## Quality gate and repair loop

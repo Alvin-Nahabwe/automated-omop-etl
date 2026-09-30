@@ -138,7 +138,8 @@ class FieldMapping(BaseModel):
       concept_map  local codes/labels mapped through the project's source_to_concept_map:
                    expression = the source code/label, vocabulary = the source_vocabulary_id to
                    create for it (e.g. 'SRC_DRUG'), target_domain = OMOP domain of the targets.
-                   Yields the standard target_concept_id (0 when unmapped).
+                   Yields the standard target_concept_id (0 when unmapped); with
+                   concept_role='source' it yields the map's source_concept_id instead.
       vocab_code   codes that already belong to an OMOP vocabulary: expression = the code as it
                    appears in the vocabulary's concept_code (normalise it in SQL if needed),
                    vocabulary = its vocabulary_id (e.g. 'ICD10'). concept_role='standard' follows
