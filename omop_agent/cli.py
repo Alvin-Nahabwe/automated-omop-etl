@@ -174,6 +174,27 @@ def vocab_load(config: Path = ConfigOpt, force: bool = typer.Option(False, help=
         p.close()
 
 
+@app.command("vocab-download")
+def vocab_download(
+    config: Path = ConfigOpt,
+    url_env: str = typer.Option("ATHENA_DOWNLOAD_URL", help="Environment variable holding Athena's download link."),
+    dest: Optional[Path] = typer.Option(None, help="Where to unpack (default: vocabulary.athena_dir from the config)."),
+) -> None:
+    """Download and unpack the Athena bundle from the link Athena e-mailed you (the link is never printed)."""
+    from .vocab.download import fetch_athena
+
+    cfg = load_config(config)
+    target = dest or cfg.vocabulary.athena_dir
+    if target is None:
+        raise typer.BadParameter("set vocabulary.athena_dir in the config or pass --dest")
+    try:
+        fetch_athena(Path(target), url_env, log=lambda m: console.print(m, highlight=False))
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(1)
+    console.print(f"Next: omop-agent vocab-load -c {config}")
+
+
 @app.command()
 def design(config: Path = ConfigOpt) -> None:
     """Draft the ETL specification (etl_spec.yaml / etl_spec.md)."""

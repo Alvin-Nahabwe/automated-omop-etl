@@ -60,6 +60,7 @@ over. You can also run the stages one at a time:
 ```text
 omop-agent profile          # stage source -> src.*, write profile.md (scan report)
 omop-agent annotate         # Claude interprets the profile -> annotations.json
+omop-agent vocab-download   # fetch + unpack the bundle from the link in $ATHENA_DOWNLOAD_URL
 omop-agent vocab-load       # load Athena CSVs
 omop-agent design           # Claude drafts etl_spec.yaml / etl_spec.md   <- review & edit
 omop-agent map              # evaluate vocabulary + map codes -> mappings/*.csv  <- review & edit
@@ -72,6 +73,24 @@ omop-agent status
 
 Everything lands in `work/`: the profile, spec, mappings, generated SQL, DQ results,
 repairs, `audit.jsonl`, and `llm_calls/` (every prompt and answer, verbatim).
+
+### Getting the vocabulary from Athena
+
+1. Log in at [athena.ohdsi.org](https://athena.ohdsi.org). On the **Download** tab, keep the
+   pre-selected infrastructure vocabularies and add the ones your source codes need. For
+   African HDSS or EMR data that usually means **ICD10** (WHO, not only ICD10CM), **SNOMED**,
+   **LOINC**, **UCUM** and **RxNorm**, plus **RxNorm Extension** for drug products outside
+   the US.
+2. Athena e-mails a download link when the bundle is ready. The link gives access to your
+   licensed download, so keep it out of the config file and chat: put it in the
+   `ATHENA_DOWNLOAD_URL` environment variable.
+3. Run `omop-agent vocab-download` (streams and unpacks into `vocabulary.athena_dir`; the link is
+   never printed), then `omop-agent vocab-load`. Athena may send the zip gzip-encoded; the
+   download command handles that. A full bundle is about 2 GB unpacked and takes several
+   minutes to load.
+
+`omop-agent map` reports which vocabularies your spec needs but the download lacks (for
+example WHO `ICD10` when only `ICD10CM` was selected).
 
 ### Configuration (`omop_agent.yaml`)
 
