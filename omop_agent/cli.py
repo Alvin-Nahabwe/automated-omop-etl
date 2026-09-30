@@ -246,12 +246,13 @@ def demo(
     db_url: str = typer.Option(..., "--db-url", envvar="OMOP_AGENT_DB_URL", help="PostgreSQL URL (schemas demo_* are created)."),
     provider: str = typer.Option("replay", help="replay (offline, recorded answers) or anthropic (live Claude)."),
     people: int = typer.Option(1500, help="Synthetic population size."),
+    schema_prefix: str = typer.Option("demo", help="Schemas are named <prefix>_cdm, <prefix>_vocab, ..."),
     run_pipeline: bool = typer.Option(True, "--run/--no-run", help="Run the pipeline after creating the project."),
 ) -> None:
     """Create and run a demo on synthetic HDSS + clinic data with a synthetic vocabulary."""
     from .demo import create_demo_project
 
-    cfg_path = create_demo_project(directory, db_url, provider=provider, n_people=people)
+    cfg_path = create_demo_project(directory, db_url, provider=provider, n_people=people, schema_prefix=schema_prefix)
     console.print(f"Demo project written to {directory} (config {cfg_path})")
     if run_pipeline:
         p = _pipeline(cfg_path, yes=True)
