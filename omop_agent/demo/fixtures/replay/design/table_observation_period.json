@@ -1,0 +1,60 @@
+{
+  "kind": "structured",
+  "output": {
+    "target_table": "observation_period",
+    "source": {
+      "table": "residency_episodes",
+      "alias": "r"
+    },
+    "joins": [],
+    "where": null,
+    "fields": [
+      {
+        "target_field": "observation_period_id",
+        "kind": "auto_id",
+        "expression": null,
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Surrogate key."
+      },
+      {
+        "target_field": "person_id",
+        "kind": "person_id",
+        "expression": "r.individual_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Patient key resolved through the person id map."
+      },
+      {
+        "target_field": "observation_period_start_date",
+        "kind": "expression",
+        "expression": "r.start_date::date",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "observation_period_end_date",
+        "kind": "expression",
+        "expression": "r.end_date::date",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "period_type_concept_id",
+        "kind": "constant",
+        "expression": "32817",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Type concept for the surveillance/clinic record."
+      }
+    ],
+    "rationale": "HDSS residency episodes are the periods during which events would be captured."
+  }
+}

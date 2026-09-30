@@ -1,0 +1,47 @@
+{
+  "kind": "structured",
+  "output": {
+    "choices": [
+      {
+        "source_code": "mmHg",
+        "chosen_concept_id": 2000005005,
+        "equivalence": "EQUAL",
+        "confidence": 0.98,
+        "rationale": "UCUM mm[Hg].",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "kg",
+        "chosen_concept_id": 2000005003,
+        "equivalence": "EQUAL",
+        "confidence": 0.98,
+        "rationale": "UCUM kg.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "g/dL",
+        "chosen_concept_id": 2000005001,
+        "equivalence": "EQUAL",
+        "confidence": 0.98,
+        "rationale": "UCUM g/dL.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "mmol/L",
+        "chosen_concept_id": 2000005002,
+        "equivalence": "EQUAL",
+        "confidence": 0.98,
+        "rationale": "UCUM mmol/L.",
+        "retry_search_terms": []
+      },
+      {
+        "source_code": "C",
+        "chosen_concept_id": 2000005004,
+        "equivalence": "EQUIVALENT",
+        "confidence": 0.9,
+        "rationale": "Temperatures around 36-40 in the source mean degrees Celsius (UCUM Cel).",
+        "retry_search_terms": []
+      }
+    ]
+  }
+}

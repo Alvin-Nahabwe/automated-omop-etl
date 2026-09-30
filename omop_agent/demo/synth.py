@@ -159,7 +159,7 @@ def generate(out_dir: str | Path, n_people: int = 1500, seed: int = 42) -> dict[
                     rx_rows.append([vid, pid, drug, qty, days, vdate.isoformat()])
 
             for test in rng.sample(LABS, k=rng.randrange(1, 4)):
-                labs.append([vid, pid, *_lab_result(rng, test, codes), vdate.isoformat()])
+                labs.append([vid, pid, test, *_lab_result(rng, test, codes), vdate.isoformat()])
 
     # Rare drug names: below the small-cell threshold, so never shown to the LLM.
     for drug in RARE_DRUGS:

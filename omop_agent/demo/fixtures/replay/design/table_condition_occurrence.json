@@ -1,0 +1,96 @@
+{
+  "kind": "structured",
+  "output": {
+    "target_table": "condition_occurrence",
+    "source": {
+      "table": "diagnoses",
+      "alias": "d"
+    },
+    "joins": [],
+    "where": null,
+    "fields": [
+      {
+        "target_field": "condition_occurrence_id",
+        "kind": "auto_id",
+        "expression": null,
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Surrogate key."
+      },
+      {
+        "target_field": "person_id",
+        "kind": "person_id",
+        "expression": "d.individual_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Patient key resolved through the person id map."
+      },
+      {
+        "target_field": "condition_concept_id",
+        "kind": "vocab_code",
+        "expression": "d.icd10",
+        "vocabulary": "ICD10",
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "ICD-10 codes follow 'Maps to' to SNOMED."
+      },
+      {
+        "target_field": "condition_start_date",
+        "kind": "expression",
+        "expression": "d.dx_date::date",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "condition_start_datetime",
+        "kind": "expression",
+        "expression": "d.dx_date::timestamp",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "condition_type_concept_id",
+        "kind": "constant",
+        "expression": "32817",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "EHR record from the clinic system (32817)."
+      },
+      {
+        "target_field": "visit_occurrence_id",
+        "kind": "visit_id",
+        "expression": "d.visit_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Links the record to its clinic visit."
+      },
+      {
+        "target_field": "condition_source_value",
+        "kind": "column",
+        "expression": "d.icd10",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "condition_source_concept_id",
+        "kind": "vocab_code",
+        "expression": "d.icd10",
+        "vocabulary": "ICD10",
+        "target_domain": null,
+        "concept_role": "source",
+        "rationale": ""
+      }
+    ],
+    "rationale": "One row per recorded ICD-10 diagnosis."
+  }
+}

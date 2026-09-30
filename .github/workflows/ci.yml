@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: omop
+          POSTGRES_PASSWORD: omop
+          POSTGRES_DB: omop_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U omop"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      OMOP_AGENT_TEST_DB_URL: postgresql://omop:omop@localhost:5432/omop_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Enable pg_trgm
+        run: PGPASSWORD=omop psql -h localhost -U omop -d omop_test -c "CREATE EXTENSION IF NOT EXISTS pg_trgm"
+      - name: Tests
+        run: pytest -q
+      - name: Offline end-to-end demo (recorded LLM answers)
+        run: omop-agent demo /tmp/omop-demo --db-url "$OMOP_AGENT_TEST_DB_URL"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: demo-report
+          path: |
+            /tmp/omop-demo/work/report.html
+            /tmp/omop-demo/work/report.md
+            /tmp/omop-demo/work/etl_spec.md
+            /tmp/omop-demo/work/dq_results.json
+            /tmp/omop-demo/work/sql/

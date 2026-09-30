@@ -1,0 +1,123 @@
+{
+  "kind": "structured",
+  "output": {
+    "target_table": "measurement",
+    "source": {
+      "table": "lab_results",
+      "alias": "r"
+    },
+    "joins": [],
+    "where": null,
+    "fields": [
+      {
+        "target_field": "measurement_id",
+        "kind": "auto_id",
+        "expression": null,
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Surrogate key."
+      },
+      {
+        "target_field": "person_id",
+        "kind": "person_id",
+        "expression": "r.individual_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Patient key resolved through the person id map."
+      },
+      {
+        "target_field": "measurement_concept_id",
+        "kind": "concept_map",
+        "expression": "r.test",
+        "vocabulary": "SRC_LAB",
+        "target_domain": "Measurement",
+        "concept_role": "standard",
+        "rationale": "Local test codes map to LOINC."
+      },
+      {
+        "target_field": "measurement_date",
+        "kind": "expression",
+        "expression": "r.test_date::date",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "measurement_type_concept_id",
+        "kind": "constant",
+        "expression": "32817",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "EHR record from the clinic system (32817)."
+      },
+      {
+        "target_field": "value_as_number",
+        "kind": "expression",
+        "expression": "CASE WHEN r.result ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN r.result::numeric END",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Numeric results only."
+      },
+      {
+        "target_field": "value_as_concept_id",
+        "kind": "concept_map",
+        "expression": "CASE WHEN r.result !~ '^-?[0-9]+(\\.[0-9]+)?$' THEN r.result END",
+        "vocabulary": "SRC_RESULT",
+        "target_domain": "Meas Value",
+        "concept_role": "standard",
+        "rationale": "Qualitative results (POS/NEG)."
+      },
+      {
+        "target_field": "unit_concept_id",
+        "kind": "concept_map",
+        "expression": "r.unit",
+        "vocabulary": "SRC_UNIT",
+        "target_domain": "Unit",
+        "concept_role": "standard",
+        "rationale": "Unit strings map to UCUM."
+      },
+      {
+        "target_field": "visit_occurrence_id",
+        "kind": "visit_id",
+        "expression": "r.visit_id",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": "Links the record to its clinic visit."
+      },
+      {
+        "target_field": "measurement_source_value",
+        "kind": "column",
+        "expression": "r.test",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "unit_source_value",
+        "kind": "column",
+        "expression": "r.unit",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      },
+      {
+        "target_field": "value_source_value",
+        "kind": "column",
+        "expression": "r.result",
+        "vocabulary": null,
+        "target_domain": null,
+        "concept_role": "standard",
+        "rationale": ""
+      }
+    ],
+    "rationale": "Lab results and vital signs; both are Measurement domain in OMOP."
+  }
+}

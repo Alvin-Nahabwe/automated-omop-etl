@@ -37,6 +37,7 @@ omop_agent = [
     "quality/r/*",
     "demo/fixtures/vocab/*",
     "demo/fixtures/replay/*",
+    "demo/fixtures/replay/*/*",
 ]
 
 [tool.pytest.ini_options]
