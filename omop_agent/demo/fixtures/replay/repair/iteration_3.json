@@ -2,23 +2,34 @@
   "kind": "agent",
   "tool_calls": [
     {
-      "name": "run_aggregate_query",
+      "name": "count_records",
       "input": {
-        "sql": "SELECT drug_source_value, COUNT(*) AS n FROM {cdm}.drug_exposure WHERE drug_concept_id = 0 GROUP BY 1 ORDER BY n DESC"
+        "table": "cdm.drug_exposure",
+        "group_by": [
+          "drug_source_value"
+        ],
+        "filters": [
+          {
+            "column": "drug_concept_id",
+            "op": "=",
+            "value": 0
+          }
+        ]
       }
     },
     {
-      "name": "run_aggregate_query",
+      "name": "count_records",
       "input": {
-        "sql": "SELECT COUNT(DISTINCT drug_source_value) AS distinct_values, COUNT(*) AS n FROM {cdm}.drug_exposure WHERE drug_concept_id = 0"
-      }
-    },
-    {
-      "name": "run_aggregate_query",
-      "input": {
-        "sql": "SELECT (cause_concept_id <> 0) AS cause_mapped, COUNT(*) AS n FROM {cdm}.death GROUP BY 1"
+        "table": "cdm.death",
+        "filters": [
+          {
+            "column": "cause_concept_id",
+            "op": "=",
+            "value": 0
+          }
+        ]
       }
     }
   ],
-  "final_text": "No spec change. The remaining failures are not ETL logic errors:\n1. drug_exposure.drug_source_concept_id and death.cause_source_concept_id are 0 for every record, which fails sourceConceptRecordCompleteness. The source values are local labels with no concept in the OMOP vocabularies. Fixing this properly means creating site-specific source concepts (concept_id >= 2,000,000,000) for the SRC_DRUG and SRC_VA_CAUSE labels, which is a curation decision for the data owner.\n2. drug_exposure.drug_source_value: 2 of 11 distinct drug names are unmapped. Both are too rare to be shown to me (every group is below the small-cell threshold), so they were never sent for automated mapping. A reviewer should map them in mappings/SRC_DRUG.csv and run `omop-agent apply-mappings`.\n3. death.cause_source_value is flagged for the same reason as (1). Every cause of death does map to a standard concept (cause_concept_id is never 0).\nNone of these are blocking (convention severity)."
+  "final_text": "No spec change. The remaining failures are not ETL logic errors:\n1. drug_exposure.drug_source_concept_id and death.cause_source_concept_id are 0 for every record, which fails sourceConceptRecordCompleteness. The source values are local labels with no concept in the OMOP vocabularies. Fixing this properly means creating site-specific source concepts (concept_id >= 2,000,000,000) for the SRC_DRUG and SRC_VA_CAUSE labels, which is a curation decision for the data owner.\n2. drug_exposure.drug_source_value: 2 of 11 distinct drug names are unmapped. Both are too rare to be shown to me (each has fewer than 5 records, so both groups were withheld), so they were never sent for automated mapping. A reviewer should map them in mappings/SRC_DRUG.csv and run `omop-agent apply-mappings`.\n3. death.cause_source_value is flagged for the same reason as (1). The causes of death do map to standard concepts: fewer than 5 death records, if any, have cause_concept_id 0.\nNone of these are blocking (convention severity)."
 }

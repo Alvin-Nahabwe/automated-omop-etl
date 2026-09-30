@@ -9,19 +9,21 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omop_agent.config import ProjectConfig
-from omop_agent.db import Schemas, list_columns, list_tables, row_count
+from omop_agent.config import PrivacyConfig, ProjectConfig
+from omop_agent.db import Schemas, execute, list_columns, list_tables, row_count
 from omop_agent.design.designer import DESIGN_SYSTEM, design_etl, reference_concepts_text
 from omop_agent.design.render import render_spec_md
-from omop_agent.design.validate import SpecIssue, validate_spec, validate_table_mapping
+from omop_agent.design.validate import SpecIssue, sql_safety_issues, validate_spec, validate_table_mapping
 from omop_agent.llm import NullLLM, ReplayLLM
 from omop_agent.llm.replay import save_recording
 from omop_agent.models import (
     ColumnProfile,
+    CustomSQL,
     ETLSpec,
     FieldMapping,
     JoinSpec,
     PlannedTable,
+    SourceAnnotations,
     SourceProfile,
     TablePlan,
     TableProfile,
@@ -66,6 +68,28 @@ def profile_from_db(conn, schemas) -> SourceProfile:
     return SourceProfile(source_type="csv", generated_at=datetime.now(timezone.utc), min_cell_count=5, tables=tables)
 
 
+DEMO_COLUMNS = {
+    "individuals": ["individual_id", "sex", "dob", "village", "hh_id", "first_name", "last_name", "phone"],
+    "residency_episodes": ["individual_id", "start_date", "start_event", "end_date", "end_event"],
+    "clinic_visits": ["visit_id", "individual_id", "visit_date", "discharge_date", "visit_type", "facility"],
+    "diagnoses": ["visit_id", "individual_id", "icd10", "dx_text", "dx_date"],
+    "prescriptions": ["visit_id", "individual_id", "drug", "qty", "days", "date_prescribed"],
+    "lab_results": ["visit_id", "individual_id", "test", "result", "unit", "test_date"],
+    "deaths": ["individual_id", "dod", "va_cause"],
+}
+PII = {"first_name", "last_name", "phone"}
+
+
+def demo_profile() -> SourceProfile:
+    """The demo dataset's tables and columns, with its direct identifiers flagged (no database)."""
+    def col(name: str) -> ColumnProfile:
+        return ColumnProfile(name=name, inferred_type="string", n_rows=10, n_null=0, n_distinct=10, unique=False,
+                             is_pii=name in PII, pii_reason="name" if name in PII else None)
+
+    tables = [TableProfile(name=t, n_rows=10, columns=[col(c) for c in cols]) for t, cols in DEMO_COLUMNS.items()]
+    return SourceProfile(source_type="csv", generated_at=datetime.now(timezone.utc), min_cell_count=5, tables=tables)
+
+
 def errors(issues: list[SpecIssue]) -> list[SpecIssue]:
     return [i for i in issues if i.severity == "error"]
 
@@ -83,10 +107,11 @@ def has(issues: list[SpecIssue], table: str | None, field: str | None, text: str
 
 
 def test_reference_spec_is_statically_valid():
-    issues = validate_spec(load_ref())
-    assert errors(issues) == []
-    # the verbal-autopsy cause mapping has no target domain: a warning, not an error
-    assert any(i.severity == "warning" and i.target_field == "cause_concept_id" for i in issues)
+    for profile in (None, demo_profile()):
+        issues = validate_spec(load_ref(), profile)
+        assert errors(issues) == []
+        # the verbal-autopsy cause mapping has no target domain: the only warning
+        assert [(i.target_table, i.target_field) for i in issues] == [("death", "cause_concept_id")]
 
 
 @pytest.mark.parametrize(
@@ -130,11 +155,187 @@ def test_static_spec_level_errors():
 
 
 def test_duplicate_aliases_and_function_qualifiers():
-    spec = set_field(load_ref(), "person", "birth_datetime", expression="pg_catalog.to_timestamp(i.dob, 'DD/MM/YYYY')")
-    assert errors(validate_spec(spec)) == []
+    spec = set_field(load_ref(), "person", "birth_datetime", expression="public.to_timestamp(i.dob, 'DD/MM/YYYY')")
+    assert errors(validate_spec(spec)) == []  # a schema-qualified function call is not an alias
     spec = spec.model_copy(deep=True)
     spec.mapping_for("person").joins.append(JoinSpec(table="individuals", alias="i", on="TRUE"))
     assert has(validate_spec(spec), "person", None, "alias 'i' is declared twice")
+    # system catalogs are refused by the SQL guard
+    spec = set_field(load_ref(), "person", "birth_datetime", expression="pg_catalog.to_timestamp(i.dob, 'DD/MM/YYYY')")
+    assert has(validate_spec(spec), "person", "birth_datetime", "not allowed in ETL SQL: pg_catalog")
+    # ... and public.<table> is not a silent read of another schema
+    spec = set_field(load_ref(), "person", "gender_source_value", expression="public.secrets.x")
+    assert has(validate_spec(spec), "person", "gender_source_value", "alias 'public' is not declared")
+
+
+# --------------------------------------------------------------------------------------
+# person/visit links, SQL safety, direct identifiers
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "make, table, field, text",
+    [
+        # an auto_id person_id follows row order, while events resolve the key through the map
+        (lambda s: set_field(s, "person", "person_id", kind="auto_id", expression=None), "person", "person_id",
+         "must use kind person_id"),
+        (lambda s: set_field(s, "person", "person_id", kind="column", expression="i.individual_id"), "person",
+         "person_id", "must use kind person_id"),
+        (lambda s: set_field(s, "measurement", "person_id", kind="expression", expression="r.individual_id::int"),
+         "measurement", "person_id", "must use kind person_id"),
+        (lambda s: drop_field(s, "death", "person_id"), "death", "person_id", "use kind person_id with the column"),
+        (lambda s: drop_field(s, "person", "person_id"), "person", "person_id", "use kind person_id with the source key"),
+        (lambda s: set_field(s, "visit_occurrence", "visit_occurrence_id", kind="column", expression="v.visit_id"),
+         "visit_occurrence", "visit_occurrence_id", "must use kind visit_id"),
+        (lambda s: set_field(s, "visit_occurrence", "visit_occurrence_id", kind="auto_id", expression=None),
+         "visit_occurrence", "visit_occurrence_id", "auto_id is not allowed here"),
+    ],
+)
+def test_person_and_visit_ids_come_from_the_id_maps(make, table, field, text):
+    assert has(validate_spec(make(load_ref())), table, field, text)
+
+
+def test_visit_links_without_a_visit_key():
+    spec = load_ref().model_copy(update={"visit_key": None}, deep=True)
+    for tm in spec.table_mappings:
+        tm.fields = [f for f in tm.fields if f.kind != "visit_id"]
+    spec = set_field(spec, "visit_occurrence", "visit_occurrence_id", kind="expression", expression="substr(v.visit_id, 2)::int")
+    assert errors(validate_spec(spec)) == []  # without a visit map any expression will do ...
+    spec = set_field(spec, "visit_occurrence", "visit_occurrence_id", kind="auto_id", expression=None)
+    assert has(validate_spec(spec), "visit_occurrence", "visit_occurrence_id", "auto_id is not allowed here")  # ... but not auto_id
+    # an event's visit link that bypasses the visit map is suspicious
+    spec = set_field(load_ref(), "measurement", "visit_occurrence_id", kind="expression", expression="r.visit_id::int")
+    issues = validate_spec(spec)
+    assert errors(issues) == []
+    assert any(i.severity == "warning" and i.target_field == "visit_occurrence_id" and "visit_id" in i.message for i in issues)
+
+
+@pytest.mark.parametrize(
+    "make, table, field, text",
+    [
+        (lambda s: set_field(s, "person", "gender_source_value", expression="pg_read_file('/etc/passwd')"),
+         "person", "gender_source_value", "pg_read_file()"),
+        (lambda s: set_field(s, "person", "gender_source_value", expression="i.sex); DROP TABLE x; SELECT (1"),
+         "person", "gender_source_value", "contains ';'"),
+        (lambda s: set_field(s, "person", "gender_source_value", expression="current_setting('server_version')"),
+         "person", "gender_source_value", "current_setting()"),
+        (lambda s: set_field(s, "person", "gender_source_value", expression="$$x$$"),
+         "person", "gender_source_value", "dollar-quoted"),
+        (lambda s: set_field(s, "person", "gender_source_value",
+                             expression="(SELECT MIN(p.gender_source_value) FROM {cdm}.person p)"),
+         "person", "gender_source_value", "table '{cdm}.person' may not be read"),
+        (lambda s: set_field(s, "person", "gender_source_value",
+                             expression="(SELECT MIN(r.rolname) FROM other.roles AS r)"),
+         "person", "gender_source_value", "table 'other.roles' may not be read"),
+        (lambda s: _replace(s, "death", where="EXISTS (SELECT 1 FROM information_schema.tables)"),
+         "death", None, "information_schema"),
+        (lambda s: _replace(s, "death", joins=[JoinSpec(table="{cdm}.person", alias="cp", on="cp.person_id = 1")]),
+         "death", None, "table '{cdm}.person' may not be read"),
+        (lambda s: _replace(s, "death", joins=[JoinSpec(table="individuals", alias="q", on="pg_sleep(10) IS NULL")]),
+         "death", None, "pg_sleep()"),
+        (lambda s: _replace(s, "death", source={"table": "cdm.death", "alias": "x"}), "death", None,
+         "table 'cdm.death' may not be read"),
+    ],
+)
+def test_unsafe_sql_is_rejected(make, table, field, text):
+    spec = load_ref().model_copy(deep=True)
+    assert has(validate_spec(make(spec)), table, field, text)
+
+
+def _replace(spec: ETLSpec, table: str, **update) -> ETLSpec:
+    spec = spec.model_copy(deep=True)
+    i = next(i for i, tm in enumerate(spec.table_mappings) if tm.target_table == table)
+    spec.table_mappings[i] = spec.table_mappings[i].model_validate({**spec.table_mappings[i].model_dump(), **update})
+    return spec
+
+
+def test_placeholders_and_keys():
+    spec = _replace(load_ref(), "death", source={"table": "{src}.deaths", "alias": "x"},
+                    joins=[JoinSpec(table="{vocab}.concept", alias="vc", on="vc.concept_code = x.va_cause")])
+    assert errors(validate_spec(spec, demo_profile())) == []
+    spec = load_ref().model_copy(deep=True)
+    spec.person_key.expression = "individual_id || current_setting('x')"
+    spec.visit_key.table = "{cdm}.visit_occurrence"
+    issues = errors(validate_spec(spec, demo_profile()))
+    assert any(i.message.startswith("person_key: unsafe SQL in the key expression") for i in issues)
+    assert any(i.message.startswith("visit_key: table '{cdm}.visit_occurrence' may not be read") for i in issues)
+    assert sql_safety_issues(spec.person_key) and sql_safety_issues(spec.visit_key)
+    assert sql_safety_issues(load_ref().person_key) == [] and sql_safety_issues(load_ref().mapping_for("death")) == []
+
+
+def test_custom_sql_is_reviewed_and_guarded():
+    spec = load_ref().model_copy(deep=True)
+    spec.custom_sql = [
+        CustomSQL(name="fix ends", target_table="drug_exposure", sql=(
+            "UPDATE {cdm}.drug_exposure SET drug_exposure_end_date = drug_exposure_start_date "
+            "WHERE drug_exposure_end_date < drug_exposure_start_date;\n"
+            "DELETE FROM {cdm}.drug_exposure WHERE drug_concept_id IS NULL;")),
+    ]
+    issues = validate_spec(spec)
+    assert errors(issues) == []  # several statements and DML are what custom SQL is for
+    assert any(i.severity == "warning" and "executed as written; review it" in i.message for i in issues)
+    spec.custom_sql.append(CustomSQL(name="evil", target_table="death",
+                                     sql="INSERT INTO {cdm}.death SELECT * FROM {src}.deaths; DROP TABLE {cdm}.person"))
+    spec.custom_sql.append(CustomSQL(name="files", target_table="note", sql="SELECT pg_read_file('/etc/passwd')"))
+    assert has(validate_spec(spec), "death", None, "custom SQL 'evil': unsafe custom SQL")
+    assert has(validate_spec(spec), "note", None, "pg_read_file()")
+    assert sql_safety_issues(spec.custom_sql[0]) == [] and "DROP" in sql_safety_issues(spec.custom_sql[1])[0]
+    # statements that could leave the ETL role or the step's transaction
+    for sql in ("RESET ROLE; DELETE FROM {cdm}.death", "SET ROLE NONE", "COMMIT; INSERT INTO {cdm}.death SELECT 1",
+                "DO 'BEGIN PERFORM 1; END'", "-- note\nCALL {etl}.p()"):
+        problems = sql_safety_issues(CustomSQL(name="x", target_table="death", sql=sql))
+        assert problems and all(p.startswith("custom SQL 'x': unsafe custom SQL") for p in problems), sql
+    ok = "WITH d AS (SELECT 1 AS x) SELECT x FROM d; -- trailing comment\n"
+    assert sql_safety_issues(CustomSQL(name="x", target_table="death", sql=ok)) == []
+
+
+def test_direct_identifiers_are_not_loaded():
+    profile = demo_profile()
+    spec = set_field(load_ref(), "person", "person_source_value", expression="i.first_name || ' ' || i.last_name")
+    issues = validate_spec(spec, profile)
+    assert has(issues, "person", None, "loads direct identifier column(s) individuals.first_name, individuals.last_name")
+    # identifiers in filters, join conditions and id-map keys are not loaded into the CDM
+    spec = _replace(load_ref(), "death", joins=[JoinSpec(table="individuals", alias="q", on="q.individual_id = x.individual_id")],
+                    where="q.phone IS NOT NULL")
+    assert errors(validate_spec(spec, profile)) == []
+    # privacy.pii_columns applies without a profile too
+    spec = set_field(load_ref(), "person", "gender_source_value", expression="i.village")
+    assert errors(validate_spec(spec)) == []
+    assert has(validate_spec(spec, None, privacy=PrivacyConfig(pii_columns=["individuals.village"])),
+               "person", None, "individuals.village")
+    # ... and through a correlated subquery
+    spec = set_field(load_ref(), "death", "cause_source_value",
+                     expression="(SELECT MIN(q.phone) FROM {src}.individuals q WHERE q.individual_id = x.individual_id)")
+    assert has(validate_spec(spec, profile), "death", "cause_source_value", "direct identifier column 'individuals.phone'")
+
+
+def test_correlated_subquery_aliases():
+    profile = demo_profile()
+    last_residence = (
+        "COALESCE(x.dod::date, (SELECT MAX(r.end_date::date) FROM {src}.residency_episodes r "
+        "WHERE r.individual_id = x.individual_id))"
+    )
+    spec = set_field(load_ref(), "death", "death_date", expression=last_residence)
+    assert errors(validate_spec(spec)) == [] and errors(validate_spec(spec, profile)) == []
+    joined = (
+        "(SELECT MIN(v.visit_date::date) FROM {src}.clinic_visits AS v JOIN {src}.diagnoses dd "
+        "ON dd.visit_id = v.visit_id WHERE v.individual_id = x.individual_id AND dd.icd10 = 'B54')"
+    )
+    spec = set_field(load_ref(), "death", "death_datetime", kind="expression", expression=joined)
+    assert errors(validate_spec(spec, profile)) == []
+    # columns of subquery aliases are still checked
+    spec = set_field(load_ref(), "death", "death_date", expression=last_residence.replace("r.end_date", "r.end_dt"))
+    assert has(validate_spec(spec, profile), "death", "death_date",
+               "column 'r.end_dt' does not exist in source table 'residency_episodes'")
+    # a bare source table inside an expression would be looked up in the search_path, not {src}
+    spec = set_field(load_ref(), "death", "death_date", expression=last_residence.replace("{src}.", ""))
+    assert has(validate_spec(spec, profile), "death", "death_date", "write the source table as {src}.residency_episodes")
+    # an alias used outside any declaration is still reported; EXTRACT(... FROM <column>) declares nothing
+    spec = set_field(load_ref(), "person", "year_of_birth",
+                     expression="EXTRACT(YEAR FROM to_date(i.dob, 'DD/MM/YYYY'))::int + 0 * EXTRACT(YEAR FROM z.dob::date)")
+    assert has(validate_spec(spec, profile), "person", "year_of_birth", "alias 'z' is not declared")
+    spec = set_field(load_ref(), "person", "year_of_birth", expression="EXTRACT(YEAR FROM i.dob::date AT TIME ZONE 'UTC')::int")
+    assert errors(validate_spec(spec, profile)) == []
 
 
 # --------------------------------------------------------------------------------------
@@ -206,6 +407,23 @@ def test_explain_and_source_table_errors(staged):
 
 
 @pytest.mark.postgres
+def test_correlated_subquery_against_db(staged):
+    conn, schemas, cfg = staged
+    spec = set_field(load_ref(), "death", "death_date", expression=(
+        "COALESCE(x.dod::date, (SELECT MAX(r.end_date::date) FROM {src}.residency_episodes r "
+        "WHERE r.individual_id = x.individual_id))"))
+    assert errors(validate_spec(spec, None, conn, schemas)) == []
+    spec = set_field(spec, "death", "death_datetime", kind="expression",
+                     expression="(SELECT MAX(r.end_date::timestamp) FROM residency_episodes r)")
+    issues = validate_spec(spec, None, conn, schemas)  # a bare name inside an expression is not the staged table
+    assert has(issues, "death", "death_datetime", "write the source table as {src}.residency_episodes")
+    spec = set_field(spec, "death", "death_datetime", expression="(SELECT MAX(r.x::timestamp) FROM elsewhere r)")
+    issues = validate_spec(spec, None, conn, schemas)  # unknown to the catalog: EXPLAIN reports it
+    assert any(i.target_table == "death" and "EXPLAIN failed" in i.message and "elsewhere" in i.message
+               for i in errors(issues))
+
+
+@pytest.mark.postgres
 def test_reference_concepts_text(staged):
     conn, schemas, cfg = staged
     text = reference_concepts_text(conn, schemas)
@@ -216,7 +434,22 @@ def test_reference_concepts_text(staged):
     assert "32817 | EHR | Type Concept | Type Concept" in lines
     assert not any("SNOMED" in ln for ln in lines)
     assert lines.index("8507 | MALE | Gender | Gender") < lines.index("9201 | Inpatient Visit | Visit | Visit")
-    assert len(reference_concepts_text(conn, schemas, limit_per_domain=1).splitlines()) == 1 + 3
+    assert len(reference_concepts_text(conn, schemas, limit_per_domain=1, type_concept_limit=1).splitlines()) == 1 + 3
+
+    # relevance, not concept_id: the domain's own vocabulary first, common provenance types first
+    execute(conn, f"""INSERT INTO {schemas.vocab}.concept (concept_id, concept_name, domain_id, vocabulary_id,
+        concept_class_id, standard_concept, concept_code, valid_start_date, valid_end_date) VALUES
+        (8, 'Ambulance - Land', 'Visit', 'CMS Place of Service', 'Visit', 'S', '41', '1970-01-01', '2099-12-31'),
+        (9, 'Aardvark legacy type', 'Type Concept', 'Type Concept', 'Type Concept', 'S', 'X1', '1970-01-01', '2099-12-31'),
+        (10, 'Registry', 'Type Concept', 'Type Concept', 'Type Concept', 'S', 'X2', '1970-01-01', '2099-12-31')""")
+    lines = reference_concepts_text(conn, schemas).splitlines()
+    visits = [ln.split(" | ")[1] for ln in lines if " | Visit | " in ln]
+    assert visits == ["Emergency Room Visit", "Inpatient Visit", "Outpatient Visit", "Ambulance - Land"]
+    types = [ln.split(" | ")[1] for ln in lines if " | Type Concept | " in ln]
+    assert types == ["EHR", "Registry", "Aardvark legacy type"]
+    lines = reference_concepts_text(conn, schemas, limit_per_domain=1, type_concept_limit=2).splitlines()
+    assert [ln.split(" | ")[1] for ln in lines[1:]] == ["FEMALE", "Emergency Room Visit", "EHR", "Registry"]
+    conn.rollback()
 
 
 # --------------------------------------------------------------------------------------
@@ -268,12 +501,36 @@ def test_design_reproduces_reference_spec(staged, tmp_path):
     calls = sorted((ws.root / "llm_calls").glob("*.json"))
     assert len(calls) == 1 + len(ref.table_mappings)
     person_call = json.loads(next(c for c in calls if c.name.endswith("table_person.json")).read_text())
-    assert person_call["system"] == DESIGN_SYSTEM
+    # one system prompt for every call (cached by the provider): instructions + shared reference
+    system = person_call["system"]
+    assert system.startswith(DESIGN_SYSTEM)
+    assert {json.loads(c.read_text())["system"] for c in calls} == {system}
+    assert "concept_map  local codes" in system and "8507 | MALE" in system
+    assert "all columns typed text" in system and "VOCABULARIES LOADED: " in system
+    assert "to_date(x, 'DD/MM/YYYY')" in system and "Never pass a strftime pattern" in system
+    assert "never auto_id" in system and "normally kind auto_id" not in system
     prompt = person_call["prompt"]
     assert "TABLE person:" in prompt and "SOURCE TABLE individuals" in prompt
     assert "SOURCE TABLE diagnoses" not in prompt  # only this table's sources
-    assert "concept_map  local codes" in prompt and "8507 | MALE" in prompt
-    assert "all columns typed text" in prompt
+    assert "concept_map  local codes" not in prompt and "8507 | MALE" not in prompt  # not repeated per table
+    assert "Person key: individuals.individual_id" in prompt
+
+
+@pytest.mark.postgres
+def test_design_prompts_carry_the_notes(staged, tmp_path):
+    conn, schemas, cfg = staged
+    ref = load_ref()
+    replay = tmp_path / "replay"
+    record_reference(replay, ref)
+    ws = Workspace(tmp_path / "work")
+    notes = ["individuals.sex code 9 means unknown.", "12 lab results belong to people missing from the registry."]
+    annotations = SourceAnnotations(tables=[], columns=[], notes=notes)
+    design_etl(profile_from_db(conn, schemas), annotations, cfg, ReplayLLM(replay, ws), conn, schemas, ws)
+    calls = [json.loads(c.read_text()) for c in (ws.root / "llm_calls").glob("*.json")]
+    assert len(calls) == 1 + len(ref.table_mappings)
+    for call in calls:  # the plan and every table see the notes
+        assert "NOTES ON THE SOURCE DATA" in call["system"]
+        assert all(f"- {n}" in call["system"] for n in notes)
 
 
 @pytest.mark.postgres

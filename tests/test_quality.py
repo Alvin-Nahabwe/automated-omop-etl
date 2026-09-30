@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,7 +26,14 @@ from omop_agent.models import (
 )
 from omop_agent.quality import dqd_r
 from omop_agent.quality.checks import etl_checks, gate, run_builtin_checks, translate_sqlrender
-from omop_agent.quality.repair import RepairState, build_repair_tools, redact_error, repair_spec, repair_triggers
+from omop_agent.quality.repair import (
+    RepairState,
+    build_repair_prompt,
+    build_repair_tools,
+    redact_error,
+    repair_spec,
+    repair_triggers,
+)
 from omop_agent.workspace import Workspace
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -141,6 +149,44 @@ def test_redact_error():
         'duplicate key value violates unique constraint "xpk_person" DETAIL: (withheld: may contain record values) HINT: h'
     )
     assert redact_error("date field value out of range: 1800-13-01") == "date field value out of range: <value withheld>"
+    assert redact_error('date/time field value out of range: "1800-13-01"') == (
+        'date/time field value out of range: "<value withheld>"'
+    )
+
+    # a value cast to regclass comes back as a relation name: only real identifiers are kept
+    assert redact_error('relation "KH000001" does not exist', "SELECT i.individual_id::regclass") == (
+        'relation "<value withheld>" does not exist'
+    )
+    assert redact_error('relation "cdm_x.person" does not exist', known={"cdm_x"}) == 'relation "cdm_x.person" does not exist'
+    assert redact_error('relation "KH01.person" does not exist') == 'relation "<value withheld>" does not exist'
+    assert redact_error('relation "visit_occurrence" does not exist') == 'relation "visit_occurrence" does not exist'
+    assert redact_error('column "sex" does not exist', known={"sex"}) == 'column "sex" does not exist'
+    assert redact_error('column "Sex" does not exist', known={"sex"}) == 'column "<value withheld>" does not exist'
+    # HINT text is redacted the same way
+    assert redact_error('column "x" does not exist HINT: Perhaps you meant "KH000001".', "SELECT x") == (
+        'column "x" does not exist HINT: Perhaps you meant "<value withheld>".'
+    )
+    assert redact_error('column v.vx does not exist HINT: Perhaps you meant to reference the column "v.visit_date".',
+                        "SELECT v.vx, v.visit_date") == (
+        'column v.vx does not exist HINT: Perhaps you meant to reference the column "v.visit_date".'
+    )
+    # value slots are always withheld, even when the value happens to be an identifier
+    assert redact_error('invalid input syntax for type integer: "person"') == (
+        'invalid input syntax for type integer: "<value withheld>"'
+    )
+    assert redact_error('value "99999999999" is out of range for type integer') == (
+        'value "<value withheld>" is out of range for type integer'
+    )
+    # values that contain double quotes cannot smuggle text between "known" tokens
+    for crafted in ('invalid input syntax for type integer: "person" KH000001 "person"',
+                    'relation "person" of relation "person" KH000001" does not exist',
+                    'relation "person" KH000001 "visit_occurrence" does not exist'):
+        out = redact_error(crafted)
+        assert "KH0" not in out and "<value withheld>" in out, out
+    # literals in the SQL context are not identifiers
+    assert redact_error('relation "OPD" does not exist', "SELECT 'OPD'::regclass") == (
+        'relation "<value withheld>" does not exist'
+    )
 
 
 def test_repair_triggers(tmp_path):
@@ -378,14 +424,21 @@ def test_builtin_checks_without_spec_and_sql_errors(staged):
 
 
 def _profile() -> SourceProfile:
-    def col(name, pii=False):
-        return ColumnProfile(name=name, inferred_type="string", n_rows=400, n_null=0, n_distinct=10, unique=False,
-                             is_pii=pii, pii_reason="column name" if pii else None)
+    def col(name, pii=False, n_distinct=10, unique=False):
+        return ColumnProfile(name=name, inferred_type="string", n_rows=400, n_null=0, n_distinct=n_distinct,
+                             unique=unique, is_pii=pii, pii_reason="column name" if pii else None)
 
     return SourceProfile(
         source_type="csv", generated_at=NOW, min_cell_count=5,
-        tables=[TableProfile(name="individuals", n_rows=400,
-                             columns=[col("individual_id"), col("sex"), col("first_name", pii=True), col("phone", pii=True)])],
+        tables=[
+            TableProfile(name="individuals", n_rows=400,
+                         columns=[col("individual_id", n_distinct=400, unique=True), col("sex", n_distinct=3),
+                                  col("village", n_distinct=6), col("hh_id", n_distinct=124), col("dob", n_distinct=390),
+                                  col("first_name", pii=True), col("phone", pii=True)]),
+            TableProfile(name="clinic_visits", n_rows=890,
+                         columns=[col("visit_id", n_distinct=890, unique=True), col("individual_id", n_distinct=380),
+                                  col("visit_type", n_distinct=3), col("discharge_date", n_distinct=90)]),
+        ],
     )
 
 
@@ -395,41 +448,174 @@ def repair_env(staged):
     state = RepairState(spec=load_ref(), conn=conn, schemas=schemas, cfg=cfg, profile=_profile(), iteration=1,
                         actions=[], trigger="isRequired.visit_occurrence.visit_end_date")
     tools = {t.name: t for t in build_repair_tools(state)}
-    assert set(tools) == {"get_table_mapping", "get_cdm_table", "get_source_profile", "run_aggregate_query",
+    assert set(tools) == {"get_table_mapping", "get_cdm_table", "get_source_profile", "count_records",
                           "update_field_mapping", "replace_table_mapping"}
     return state, tools
 
 
+def _set_field(state: RepairState, table: str, field: str, expression: str) -> None:
+    """Change one field of the spec directly (as a human or the designer could)."""
+    tm = state.spec.mapping_for(table)
+    for fm in tm.fields:
+        if fm.target_field == field:
+            fm.expression, fm.kind = expression, "expression"
+
+
 @pytest.mark.postgres
-def test_run_aggregate_query(repair_env):
+def test_count_records_suppression(repair_env):
     state, tools = repair_env
-    q = tools["run_aggregate_query"].invoke
+    count = tools["count_records"].invoke
 
-    out = q({"sql": "SELECT CASE WHEN individual_id = 'KH000001' THEN 'tiny_group' ELSE 'rest' END AS grp, "
-                    "COUNT(*) AS n FROM {src}.individuals GROUP BY 1 ORDER BY 1;"})
-    assert "rest" in out and "399" in out and "tiny_group" not in out
-    assert "1 row(s) withheld because n < 5" in out
+    # 202 x '2', 196 x '1' and 2 x '9': the rare group is withheld and only its number is reported
+    out = count({"table": "src.individuals", "group_by": ["sex"]})
+    assert out.splitlines()[0] == "src.individuals GROUP BY sex"
+    assert "202" in out and "196" in out and "| 2\n" not in out and "\n9 " not in out
+    assert "(2 group(s) shown; 1 group(s) with fewer than 5 records withheld (small-cell suppression))" in out
+    lines = out.splitlines()
+    assert lines[1].split() == ["sex", "|", "n"] and lines[3].split()[0] == "2"  # largest group first
 
-    assert q({"sql": "SELECT COUNT(*) AS n FROM {src}.individuals WHERE false GROUP BY sex"}) == "0 rows."
-    refused = q({"sql": "SELECT first_name, COUNT(*) AS n FROM {src}.individuals GROUP BY 1"})
-    assert refused.startswith("ERROR: refused") and "first_name" in refused
-    assert "PII" in q({"sql": 'SELECT "Phone", COUNT(*) AS n FROM {src}.individuals GROUP BY 1'})
-    assert "named n" in q({"sql": "SELECT sex, COUNT(*) AS cnt FROM {src}.individuals GROUP BY 1"})
-    assert q({"sql": "DELETE FROM {src}.individuals"}).startswith("ERROR: only a single")
-    assert q({"sql": "SELECT 1 AS n; SELECT 2 AS n"}).startswith("ERROR: only one statement")
-    assert "SELECT *" in q({"sql": "SELECT *, 100 AS n FROM {src}.individuals"})
-    assert "string_agg" in q({"sql": "SELECT string_agg(sex, ',') AS s, 100 AS n FROM {src}.individuals"})
-    assert q({"sql": "SELECT no_such_column, COUNT(*) AS n FROM {src}.individuals GROUP BY 1"}).startswith("ERROR: column")
-    # values quoted in error messages are withheld
-    out = q({"sql": "SELECT individual_id::int AS x, COUNT(*) AS n FROM {src}.individuals GROUP BY 1"})
-    assert out.startswith("ERROR: invalid input syntax") and "<value withheld>" in out and "KH0" not in out
-    # data-modifying CTEs pass the text checks but fail in the read-only transaction
-    out = q({"sql": "WITH d AS (DELETE FROM {src}.individuals RETURNING 1) SELECT COUNT(*) AS n FROM d"})
-    assert out.startswith("ERROR:") and "read-only" in out
+    # totals: exact when >= k, "<k" below k (including 0)
+    assert count({"table": "src.individuals"}) == "src.individuals: n = 400"
+    small = count({"table": "src.individuals", "filters": [{"column": "sex", "op": "=", "value": "9"}]})
+    assert small == "src.individuals WHERE sex = '9': n < 5 (totals below the minimum cell count of 5 are not shown)"
+    none = count({"table": "src.individuals", "filters": [{"column": "sex", "op": "=", "value": "no such"}]})
+    assert "n < 5" in none
+
+    # filters combine with AND; in / is_null / like
+    out = count({"table": "src.clinic_visits", "group_by": ["visit_type"],
+                 "filters": [{"column": "discharge_date", "op": "is_null"}]})
+    assert "OPD" in out and "EMERG" in out and "IPD" not in out and "0 group(s) with fewer" in out
+    out = count({"table": "src.individuals", "filters": [{"column": "sex", "op": "in", "values": ["1", 2]},
+                                                         {"column": "village", "op": "like", "value": "T%"}]})
+    assert out.startswith("src.individuals WHERE sex IN ('1', 2) AND village LIKE 'T%': n = ")
+    assert int(out.rsplit("= ", 1)[1]) == scalar(
+        state.conn, f"SELECT COUNT(*) FROM {qi(state.schemas.src)}.individuals WHERE sex IN ('1','2') AND village LIKE 'T%'")
+
+    # limit: the largest groups are shown and the rest is announced
+    out = count({"table": "src.individuals", "group_by": ["village"], "limit": 2})
+    assert "Tumaini" in out and "Neema" in out and "Amani" not in out
+    assert "(2 group(s) shown of 6; raise limit" in out
+
+    # two group columns; a column may be written as table.column
+    out = count({"table": "{src}.clinic_visits", "group_by": ["clinic_visits.visit_type", "discharge_date"],
+                 "filters": [{"column": "visit_type", "op": "<>", "value": "IPD"}]})
+    assert "OPD" in out and "NULL" in out
+
+
+@pytest.mark.postgres
+def test_count_records_refusals(repair_env):
+    state, tools = repair_env
+    count = tools["count_records"].invoke
+
+    def refused(inp, *words):
+        out = count(inp)
+        assert out.startswith("REFUSED:"), out
+        for w in words:
+            assert w in out, (w, out)
+
+    # patient / visit keys: grouping by them would list patients with >= k records
+    refused({"table": "src.clinic_visits", "group_by": ["individual_id"]}, "individual_id", "patient, visit or record key")
+    refused({"table": "src.clinic_visits", "filters": [{"column": "individual_id", "op": "=", "value": "KH000001"}]})
+    refused({"table": "src.clinic_visits", "group_by": ["visit_id"]}, "visit_id")
+    refused({"table": "src.individuals", "group_by": ["hh_id"]}, "hh_id")
+    # direct identifiers (from the profile, the name patterns, any case)
+    refused({"table": "src.individuals", "group_by": ["first_name"]}, "direct identifier (PII)")
+    refused({"table": "src.individuals", "group_by": ["Phone"]}, "phone")
+    refused({"table": "src.individuals", "filters": [{"column": "last_name", "op": "like", "value": "A%"}]}, "PII")
+    # CDM: person ids and every *_id except *_concept_id
+    refused({"table": "cdm.person", "group_by": ["person_id"]}, "person identifier")
+    refused({"table": "cdm.person", "filters": [{"column": "person_source_value", "op": "=", "value": "KH000001"}]})
+    refused({"table": "cdm.visit_occurrence", "group_by": ["visit_occurrence_id"]}, "CDM *_id column")
+    refused({"table": "cdm.condition_occurrence", "group_by": ["visit_occurrence_id"]})
+    refused({"table": "cdm.drug_exposure", "filters": [{"column": "provider_id", "op": "is_null"}]})
+    assert count({"table": "cdm.condition_occurrence", "group_by": ["condition_concept_id"]}).startswith("cdm.")
+    assert count({"table": "cdm.visit_occurrence", "group_by": ["visit_source_value"]}).startswith("cdm.")
+    # CDM fields that the spec fills from an identifier, from whole rows or across records
+    _set_field(state, "visit_occurrence", "visit_source_value", "v.individual_id")
+    refused({"table": "cdm.visit_occurrence", "group_by": ["visit_source_value"]}, "individual_id")
+    _set_field(state, "visit_occurrence", "visit_source_value", "substr(v::text, 10, 8)")
+    refused({"table": "cdm.visit_occurrence", "group_by": ["visit_source_value"]}, "whole source rows")
+    _set_field(state, "visit_occurrence", "visit_source_value", "max(v.visit_type) OVER ()")
+    refused({"table": "cdm.visit_occurrence", "filters": [{"column": "visit_source_value", "op": "like", "value": "O%"}]},
+            "across records")
+    # the id maps are never counted; the source_to_concept_map is
+    refused({"table": "etl.person_map"}, "etl.person_map")
+    refused({"table": "etl.visit_map", "group_by": ["person_source_value"]})
+    assert count({"table": "etl.source_to_concept_map"}).startswith("etl.source_to_concept_map: n")
+    # only known tables, as <schema>.<table>
+    assert count({"table": "individuals"}).startswith("ERROR: table must be '<schema>.<table>'")
+    assert count({"table": "public.individuals"}).startswith("ERROR: table must be")
+    assert count({"table": "vocab.person"}).startswith("ERROR: no table vocab.person")
+    assert count({"table": "cdm.concept"}).startswith("ERROR: no table cdm.concept")
+    assert count({"table": "src.nope"}).startswith("ERROR: no table src.nope")
+    out = count({"table": "src.individuals", "group_by": ["nope"]})
+    assert out.startswith("ERROR: src.individuals has no column 'nope'") and "village" in out
+    with pytest.raises(Exception):  # at most 3 group columns, no unknown input fields
+        count({"table": "src.individuals", "group_by": ["sex", "village", "dob", "sex"]})
+    with pytest.raises(Exception):
+        count({"table": "src.individuals", "sql": "SELECT 1"})
+
+    # without a profile, identifiers are recognised by name
+    state.profile = None
+    refused({"table": "src.clinic_visits", "group_by": ["individual_id"]}, "patient, visit or record key")
+    refused({"table": "src.clinic_visits", "group_by": ["visit_id"]})
+    refused({"table": "src.individuals", "group_by": ["first_name"]}, "PII")
+    assert "OPD" in count({"table": "src.clinic_visits", "group_by": ["visit_type"]})
+
+
+@pytest.mark.postgres
+def test_count_records_vocabulary_is_not_suppressed(repair_env):
+    state, tools = repair_env
+    count = tools["count_records"].invoke
+    out = count({"table": "vocab.concept", "group_by": ["vocabulary_id"]})
+    assert "Visit" in out and "Gender" in out and "Type Concept" in out  # 3, 2 and 1 concepts
+    assert "not suppressed" in out and "withheld" not in out
+    out = count({"table": "vocab.concept", "group_by": ["concept_code"],
+                 "filters": [{"column": "vocabulary_id", "op": "=", "value": "ICD10"},
+                             {"column": "concept_code", "op": "in", "values": ["J18.9", "J189", "E11.9", "E119"]}]})
+    rows = out.splitlines()[3:-1]
+    assert [r.split() for r in rows] == [["E11.9", "|", "1"], ["J18.9", "|", "1"]] and "(2 group(s) shown" in out
+    assert count({"table": "vocab.concept", "filters": [{"column": "concept_id", "op": "=", "value": 8507}]}) == (
+        "vocab.concept WHERE concept_id = 8507: n = 1")
+    assert count({"table": "vocab.source_to_concept_map"}).startswith("ERROR: no table")
+
+
+@pytest.mark.postgres
+def test_count_records_without_values(repair_env):
+    state, tools = repair_env
+    state.cfg = state.cfg.model_copy(update={"privacy": state.cfg.privacy.model_copy(update={"send_values_to_llm": False})})
+    count = tools["count_records"].invoke
+    out = count({"table": "src.clinic_visits", "group_by": ["visit_type"]})
+    assert out.startswith("REFUSED: privacy.send_values_to_llm is false") and "OPD" not in out
+    assert count({"table": "cdm.condition_occurrence", "group_by": ["condition_concept_id"]}).startswith("cdm.")
+    assert "Visit" in count({"table": "vocab.concept", "group_by": ["vocabulary_id"]})
+    assert count({"table": "src.clinic_visits", "filters": [{"column": "visit_type", "op": "=", "value": "OPD"}]}) == (
+        "src.clinic_visits WHERE visit_type = 'OPD': n = 720")
+
+
+@pytest.mark.postgres
+def test_count_records_binds_values(repair_env):
+    state, tools = repair_env
+    count = tools["count_records"].invoke
+    evil = "x'; DROP TABLE y; --"
+    execute(state.conn, f"CREATE TABLE {qi(state.schemas.src)}.y (a int)")
+    state.conn.commit()
+    out = count({"table": "src.individuals", "filters": [{"column": "sex", "op": "=", "value": evil}]})
+    assert out.startswith("src.individuals WHERE sex = ") and "n < 5" in out
+    out = count({"table": "src.individuals", "group_by": ["sex"],
+                 "filters": [{"column": "village", "op": "not_in", "values": [evil, "') OR TRUE --"]}]})
+    assert "202" in out
+    assert count({"table": "src.individuals", "group_by": ['sex"; DROP TABLE y; --']}).startswith("ERROR: src.individuals has no column")
+    assert count({"table": 'src.y"; DROP TABLE y; --'}).startswith("ERROR")
+    assert scalar(state.conn, f"SELECT COUNT(*) FROM {qi(state.schemas.src)}.y") == 0  # still there
+    # wrong value types come back as (redacted) database errors
+    out = count({"table": "cdm.condition_occurrence", "filters": [{"column": "condition_concept_id", "op": "=",
+                                                                   "value": "abc"}]})
+    assert out.startswith("ERROR: invalid input syntax for type integer")
+    assert count({"table": "src.individuals", "filters": [{"column": "sex", "op": "="}]}).startswith(
+        "ERROR: filter on sex: op '=' needs a `value`")
+    assert count({"table": "src.individuals", "filters": [{"column": "sex", "op": "in"}]}).startswith("ERROR")
     assert scalar(state.conn, f"SELECT COUNT(*) FROM {qi(state.schemas.src)}.individuals") == 400
-
-    state.profile = None  # without a profile the configured name patterns guard identifiers
-    assert "PII" in q({"sql": "SELECT last_name, COUNT(*) AS n FROM {src}.individuals GROUP BY 1"})
 
 
 @pytest.mark.postgres
@@ -466,6 +652,11 @@ def test_update_field_mapping(repair_env):
                    "expression": "v.visit_date", "rationale": "x"}).startswith("REJECTED: does not compile")
     assert state.spec is original and state.actions == []
 
+    # the current logic again (whatever the rationale) is a no-op, not a repair
+    out = update({"target_table": "visit_occurrence", "target_field": "visit_end_date", "kind": "expression",
+                  "expression": "v.discharge_date::date", "rationale": "same"})
+    assert out.startswith("UNCHANGED:") and state.spec is original and state.actions == []
+
     out = update({"target_table": "visit_occurrence", "target_field": "visit_end_date", "kind": "expression",
                   "expression": VISIT_END_FIX, "rationale": "Outpatient visits end on their start date."})
     assert out.startswith("OK:")
@@ -477,6 +668,9 @@ def test_update_field_mapping(repair_env):
     assert (action.iteration, action.target_table, action.target_field) == (1, "visit_occurrence", "visit_end_date")
     assert action.change == f"expression: v.discharge_date::date → expression: {VISIT_END_FIX}"
     assert action.trigger == "isRequired.visit_occurrence.visit_end_date"
+    again = update({"target_table": "visit_occurrence", "target_field": "visit_end_date", "kind": "expression",
+                    "expression": VISIT_END_FIX, "rationale": "a different rationale"})
+    assert again.startswith("UNCHANGED:") and len(state.actions) == 1
 
     # a field that was not mapped yet is added
     out = update({"target_table": "visit_occurrence", "target_field": "visit_end_datetime", "kind": "expression",
@@ -485,11 +679,47 @@ def test_update_field_mapping(repair_env):
 
 
 @pytest.mark.postgres
+def test_update_field_mapping_rejects_unsafe_sql(repair_env):
+    state, tools = repair_env
+    before = state.spec
+
+    def rejected(inp, *words):
+        base = {"target_table": "visit_occurrence", "target_field": "visit_end_date", "kind": "expression",
+                "rationale": "x"}
+        out = tools["update_field_mapping"].invoke({**base, **inp})
+        assert out.startswith("REJECTED:"), out
+        for w in words:
+            assert w in out, (w, out)
+
+    rejected({"expression": "v.visit_date::date; DROP TABLE x"}, "';'")
+    rejected({"expression": "pg_read_file('/etc/passwd')::date"}, "pg_read_file")
+    rejected({"expression": "(SELECT max(x) FROM pg_catalog.pg_authid)::date"}, "pg_catalog")
+    # direct identifiers are never loaded into the CDM (qualified or not)
+    rejected({"target_table": "person", "target_field": "gender_source_value", "expression": "i.first_name"},
+             "individuals.first_name", "never be loaded")
+    rejected({"target_table": "person", "target_field": "gender_source_value", "expression": "upper(phone)"}, "phone")
+    # the person and visit keys must come from the id maps
+    rejected({"target_table": "person", "target_field": "person_id", "kind": "auto_id"}, "cannot be auto_id",
+             "person_id must use kind person_id")
+    rejected({"target_field": "visit_occurrence_id", "kind": "auto_id"}, "cannot be auto_id", "visit id map")
+    rejected({"target_table": "condition_occurrence", "target_field": "person_id", "expression": "d.individual_id::int"},
+             "condition_occurrence.person_id must use kind person_id")
+    assert state.spec is before and state.actions == []
+
+
+@pytest.mark.postgres
 def test_replace_table_mapping(repair_env):
     state, tools = repair_env
     replace = tools["replace_table_mapping"].invoke
     tm = state.spec.mapping_for("condition_occurrence").model_dump(mode="json")
     normalised = "CASE WHEN d.icd10 ~ '^[A-Z][0-9]{3}$' THEN substr(d.icd10,1,3)||'.'||substr(d.icd10,4) ELSE d.icd10 END"
+
+    # the same mapping (rationales aside) is a no-op
+    same = {**tm, "rationale": "reworded", "fields": list(reversed(tm["fields"]))}
+    assert replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(same),
+                    "rationale": "x"}).startswith("UNCHANGED:")
+    assert state.actions == []
+
     for fm in tm["fields"]:
         if fm["target_field"] == "condition_concept_id":
             fm["expression"] = normalised
@@ -504,6 +734,24 @@ def test_replace_table_mapping(repair_env):
     assert replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(tm), "rationale": "x",
                     "mapping_index": 5}).startswith("REJECTED: condition_occurrence has 1 mapping")
 
+    # source and join tables: staged tables or {src}/{vocab}/{etl}-qualified only
+    for table in ["{cdm}.person", "pg_catalog.pg_authid", f"{state.schemas.src}.diagnoses",
+                  "(SELECT * FROM {src}.individuals)", "no_such_table"]:
+        bad = {**tm, "source": {"table": table, "alias": "d"}}
+        out = replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(bad), "rationale": "x"})
+        assert out.startswith("REJECTED:") and "table" in out, (table, out)
+    join = {**copy.deepcopy(tm), "joins": [{"table": "{src}.individuals", "alias": "i", "join_type": "left",
+                                            "on": "i.individual_id = d.individual_id"}]}
+    for fm in join["fields"]:
+        if fm["target_field"] == "condition_source_value":
+            fm["expression"] = "i.first_name"
+    out = replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(join), "rationale": "x"})
+    assert out.startswith("REJECTED:") and "individuals.first_name" in out
+    bad_where = {**tm, "where": "d.icd10 IS NOT NULL; DELETE FROM x"}
+    assert "';'" in replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(bad_where),
+                             "rationale": "x"})
+    assert state.actions == []
+
     out = replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(tm),
                    "rationale": "ICD-10 codes are sometimes written without the dot."})
     assert out.startswith("OK:"), out
@@ -511,6 +759,31 @@ def test_replace_table_mapping(repair_env):
     assert action.target_field is None and "condition_concept_id: vocab_code: d.icd10" in action.change
     assert "where: (none) → d.icd10 IS NOT NULL" in action.change
     assert state.spec.mapping_for("condition_occurrence").where == "d.icd10 IS NOT NULL"
+
+
+def test_repair_prompt_suppresses_small_counts(tmp_path):
+    cfg = plain_config(tmp_path)
+    spec = load_ref()
+    small = CheckResult(check_name="isRequired", check_level="FIELD", table="visit_occurrence", field="visit_end_date",
+                        description="The number and percent of records with a NULL value", severity="fatal",
+                        num_violated_rows=3, num_denominator_rows=1000, pct_violated_rows=0.003, failed=True)
+    tiny = CheckResult(check_name="etlRecordRetention", check_level="ETL", table="death", severity="convention",
+                       description="... 'death': 2 of 4 records dropped (for example ...).", num_violated_rows=2,
+                       num_denominator_rows=4, pct_violated_rows=0.5, threshold_pct=5, failed=True)
+    big = CheckResult(check_name="isRequired", check_level="FIELD", table="person", field="year_of_birth",
+                      description="d", severity="fatal", num_violated_rows=12, num_denominator_rows=400,
+                      pct_violated_rows=0.03, failed=True)
+    prompt = build_repair_prompt(spec, 1, [], [small, tiny, big], cfg)
+    assert "isRequired.visit_occurrence.visit_end_date (fatal): <5 of 1000 (<0.50%) violated" in prompt
+    assert "3 of 1000" not in prompt and "0.30%" not in prompt
+    assert "etlRecordRetention.death (convention): <5 of <5 (percentage withheld) violated" in prompt
+    assert "'death': <5 of <5 records dropped" in prompt and " 2 of 4 " not in prompt
+    assert "isRequired.person.year_of_birth (fatal): 12 of 400 (3.00%) violated, threshold 0%" in prompt
+
+    step = TableLoadResult(target_table="death", step="09_death", source_rows=3, sql="INSERT INTO cdm.death ...",
+                           error='invalid input syntax for type date: "31/02/1990"')
+    prompt = build_repair_prompt(spec, 1, [step], [], cfg)
+    assert "source rows: <5" in prompt and "31/02/1990" not in prompt and '"<value withheld>"' in prompt
 
 
 @pytest.mark.postgres
@@ -522,8 +795,8 @@ def test_repair_spec_replay(staged, tmp_path):
         "kind": "agent",
         "tool_calls": [
             {"name": "get_table_mapping", "input": {"target_table": "visit_occurrence"}},
-            {"name": "run_aggregate_query", "input": {"sql": "SELECT v.visit_type, COUNT(*) AS n FROM {src}.clinic_visits v "
-                                                             "WHERE v.discharge_date IS NULL GROUP BY 1 ORDER BY 1"}},
+            {"name": "count_records", "input": {"table": "src.clinic_visits", "group_by": ["visit_type"],
+                                                "filters": [{"column": "discharge_date", "op": "is_null"}]}},
             {"name": "update_field_mapping", "input": {
                 "target_table": "visit_occurrence", "target_field": "visit_end_date", "kind": "expression",
                 "expression": VISIT_END_FIX,
@@ -555,10 +828,22 @@ def test_repair_spec_replay(staged, tmp_path):
     assert NOT_NULL_ERROR in call["prompt"] and "INSERT INTO cdm.visit_occurrence" in call["prompt"]
     assert "Failing row" not in call["prompt"] and "2019-04-22" not in call["prompt"]  # no record values
     assert "visit_occurrence (mapping_index 0) <- {src}.clinic_visits v" in call["prompt"]
+    assert "count_records" in call["system"] and "run_aggregate_query" not in call["system"]
     results = [c["result"] for c in call["tool_calls"]]
     assert "INSERT INTO" in results[0] and "OPD" in results[1] and results[2].startswith("OK:")
+    assert "KH0" not in json.dumps(call)
     audit = [e for e in ws.read_audit() if e["event"] == "repair"]
     assert audit and audit[-1]["actions"] == 1 and "falls back" in audit[-1]["summary"]
+
+    # replaying the same repair on the repaired spec changes nothing and leaves a reviewer's edits alone
+    reviewed = "# reviewed by a human\n" + ws.spec_yaml.read_text()
+    ws.spec_yaml.write_text(reviewed)
+    same_spec, no_actions = repair_spec(new_spec, iteration=1, dq=None, etl_result=etl, llm=llm, conn=conn,
+                                        schemas=schemas, cfg=cfg, ws=ws, profile=None)
+    assert no_actions == [] and same_spec == new_spec and ws.spec_yaml.read_text() == reviewed
+    unchanged = [json.loads(p.read_text()) for p in sorted((ws.root / "llm_calls").glob("*repair*.json"))][-1]
+    assert unchanged["tool_calls"][2]["result"].startswith("UNCHANGED:")
+    assert len(json.loads(ws.repairs_json.read_text())) == 1
 
     # a second iteration appends to repairs.json
     dq = DQReport(run_at=NOW, passed=True, results=[CheckResult(

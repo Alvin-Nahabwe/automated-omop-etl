@@ -7,7 +7,10 @@ aliases, source columns, concept ids, ``EXPLAIN``), and mappings with errors go 
 model with the validator's findings, up to ``max_revisions`` times. Problems that remain are
 recorded for the human reviewer rather than raised.
 
-Prompts carry aggregate profile data only (``privacy.profile_prompt_text``).
+Prompts carry aggregate profile data only (``privacy.profile_prompt_text``). Every design call
+shares one system prompt: ``DESIGN_SYSTEM`` followed by the reference material all tables need
+(field kinds, staging conventions, loaded vocabularies, notes on the data, reference concepts),
+so the provider can cache it; each user prompt carries only what is specific to its table.
 """
 
 from __future__ import annotations
@@ -104,13 +107,23 @@ reviewer needs into the rationale fields, briefly.
 STAGING_CONVENTIONS = """\
 Staging conventions for the SQL you write:
 - Every source table has been copied to schema {src} with all columns typed text. Cast \
-explicitly: ::date or ::timestamp for ISO dates, to_date(x, '<format>') for other date \
-formats shown in the profile, ::integer or ::numeric for numbers.
+explicitly: ::date or ::timestamp for ISO dates (YYYY-MM-DD), ::integer or ::numeric for \
+numbers. For any other date format the profile shows the PostgreSQL template to use, for \
+example "format %d/%m/%Y (PostgreSQL: to_date(x, 'DD/MM/YYYY'))": write to_date(x, \
+'DD/MM/YYYY'). Never pass a strftime pattern such as '%d/%m/%Y' to to_date or to_timestamp: \
+PostgreSQL does not reject it and silently returns a wrong date.
 - Empty source values were loaded as NULL.
 - Refer to columns through the aliases you declare in source.alias and joins[].alias (for \
-example v.visit_date::date). Join other source tables by their bare name; use the placeholders \
-{src}, {cdm}, {vocab}, {etl} if you need another schema.
-- Constant concept ids must come from the reference concept list below, or be 0.
+example v.visit_date::date). Join other source tables by their bare name, and vocabulary or \
+ETL tables as {vocab}.<table> or {etl}.<table>. Inside an expression (a correlated subquery) \
+qualify source tables as {src}.<table>. Nothing else may be read: not the CDM being built, not \
+system catalogs, not other schemas.
+- Each expression, where and join condition is a single SQL expression: no ';', no DDL or \
+DML, no functions that read server files or settings. The validator rejects them.
+- Never load direct identifiers (columns marked PII in the profile: names, phone numbers, \
+national ids, addresses, GPS) into any CDM field. A patient key column may still be used with \
+kind person_id, because only the resulting integer person_id is stored.
+- Constant concept ids must come from the reference concept list, or be 0.
 - Use kind concept_map for local codes, labels and free-text categories. Name the \
 vocabulary 'SRC_<NAME>' (for example 'SRC_DRUG') and set target_domain to the OMOP domain of \
 the concepts they should map to; the codes are mapped to standard concepts in a later step.
@@ -118,9 +131,12 @@ the concepts they should map to; the codes are mapped to standard concepts in a 
 LOINC, RxNorm, SNOMED, ...). The expression must produce the code exactly as it appears in \
 concept.concept_code, so normalise the format in SQL when the profile shows it differs (for \
 example, add the dot to ICD-10 codes written without one).
-- Map every required field. The primary key is normally kind auto_id; visit_occurrence_id in \
-visit_occurrence uses kind visit_id with the visit key so that other tables can link to it. \
-person_id always uses kind person_id with the column holding the patient key.
+- Map every required field. person_id always uses kind person_id with the column holding the \
+patient key, in every table including person itself; visit_occurrence_id in \
+visit_occurrence uses kind visit_id with the visit key. These two keys come from the id maps \
+that every other table links through, so they are never auto_id: an auto_id person_id would \
+follow row order and attach every event to the wrong person. Other tables' own primary keys \
+(condition_occurrence_id, drug_exposure_id, measurement_id, ...) use kind auto_id.
 - Use where to keep only the rows that belong in this table when one source table feeds \
 several CDM tables.
 """
@@ -131,23 +147,49 @@ several CDM tables.
 # --------------------------------------------------------------------------------------
 
 
-def reference_concepts_text(conn: psycopg.Connection | None, schemas: Schemas, limit_per_domain: int = 80) -> str:
-    """Standard, valid concepts of the Gender, Race, Ethnicity, Visit and Type Concept domains."""
+# Type concepts a source dataset most often needs (EHR, registries, surveys, ...), listed first.
+_PREFERRED_TYPE_CONCEPTS = (
+    r"\m(EHR|registry|survey|self-report|case report form|death certificate|verbal autopsy|"
+    r"clinical study|research|lab|healthcare|claim|prescription|dispens|administration)"
+)
+
+
+def reference_concepts_text(
+    conn: psycopg.Connection | None, schemas: Schemas, limit_per_domain: int = 80, type_concept_limit: int = 150
+) -> str:
+    """Standard, valid concepts of the Gender, Race, Ethnicity, Visit and Type Concept domains.
+
+    Within a domain the most relevant concepts come first: those of the domain's own vocabulary
+    (e.g. vocabulary Visit before CMS Place of Service), then, for Type Concept, the common
+    provenance types (EHR, registry, survey, ...), then by name. Type Concept is a large domain,
+    so it has its own, higher limit.
+    """
     if conn is None:
         return "(no vocabulary connection: use 0 for concept constants)"
     sql = f"""
         SELECT concept_id, concept_name, domain_id, vocabulary_id FROM (
             SELECT c.concept_id, c.concept_name, c.domain_id, c.vocabulary_id,
-                   ROW_NUMBER() OVER (PARTITION BY c.domain_id ORDER BY c.concept_id) AS rn
+                   ROW_NUMBER() OVER (
+                       PARTITION BY c.domain_id
+                       ORDER BY (c.vocabulary_id = c.domain_id) DESC,
+                                (c.domain_id = 'Type Concept' AND c.concept_name ~* %(preferred)s) DESC,
+                                c.concept_name, c.concept_id
+                   ) AS rn
             FROM {qi(schemas.vocab)}.concept c
             WHERE c.domain_id = ANY(%(domains)s)
               AND c.standard_concept = 'S' AND c.invalid_reason IS NULL
         ) x
-        WHERE rn <= %(limit)s
-        ORDER BY array_position(%(domains)s::text[], domain_id), concept_id"""
+        WHERE rn <= CASE WHEN domain_id = 'Type Concept' THEN %(type_limit)s ELSE %(limit)s END
+        ORDER BY array_position(%(domains)s::text[], domain_id), rn"""
+    params = {
+        "domains": REFERENCE_DOMAINS,
+        "limit": limit_per_domain,
+        "type_limit": type_concept_limit,
+        "preferred": _PREFERRED_TYPE_CONCEPTS,
+    }
     try:
         with conn.transaction():
-            rows = fetch_all(conn, sql, {"domains": REFERENCE_DOMAINS, "limit": limit_per_domain})
+            rows = fetch_all(conn, sql, params)
     except psycopg.Error as e:
         return f"(reference concepts unavailable: {short_error(e)})"
     if not rows:
@@ -172,6 +214,36 @@ def _vocabularies_text(conn: psycopg.Connection | None, schemas: Schemas) -> str
     return ", ".join(r["vocabulary_id"] for r in rows) or "(none)"
 
 
+def _notes_text(annotations: SourceAnnotations | None) -> str:
+    if annotations is None or not annotations.notes:
+        return "(none)"
+    return "\n".join(f"- {n}" for n in annotations.notes)
+
+
+def design_system(reference: str, vocabularies: str, annotations: SourceAnnotations | None) -> str:
+    """The system prompt of every design call: instructions plus the shared reference material.
+
+    It is identical for the plan and every table (and revision) call of a run, so the provider
+    caches it once; table-specific content goes into the user prompt.
+    """
+    return f"""{DESIGN_SYSTEM}
+The reference material below applies to every request in this design.
+
+FIELD KINDS (TableMapping.fields[].kind)
+{inspect.cleandoc(FieldMapping.__doc__ or '')}
+
+{STAGING_CONVENTIONS}
+VOCABULARIES LOADED: {vocabularies}
+
+NOTES ON THE SOURCE DATA (from the interpretation of the profile; they apply to every table \
+they mention)
+{_notes_text(annotations)}
+
+REFERENCE CONCEPTS (standard, valid)
+{reference}
+"""
+
+
 def _annotations_text(annotations: SourceAnnotations | None, tables: list[str] | None = None) -> str:
     if annotations is None:
         return "(no interpretation available)"
@@ -191,9 +263,6 @@ def _annotations_text(annotations: SourceAnnotations | None, tables: list[str] |
                 continue
             coding = f", coding system {c.coding_system}" if c.coding_system else ""
             lines.append(f"  - {c.column}: {c.semantic_type}{coding}. {c.description}")
-    if annotations.notes and tables is None:
-        lines.append("NOTES:")
-        lines += [f"  - {n}" for n in annotations.notes]
     return "\n".join(lines) or "(none)"
 
 
@@ -222,7 +291,7 @@ def _keys_text(person_key: KeySpec, visit_key: KeySpec | None) -> str:
     return "\n".join(lines)
 
 
-def _plan_prompt(profile_text: str, annotations_text: str, reference: str) -> str:
+def _plan_prompt(profile_text: str, annotations_text: str) -> str:
     return f"""\
 Plan the ETL of the source dataset below into OMOP CDM v5.4.
 
@@ -246,9 +315,6 @@ INTERPRETATION OF THE PROFILE
 
 CDM TABLES YOU CAN TARGET
 {_cdm_tables_text()}
-
-REFERENCE CONCEPTS (standard, valid)
-{reference}
 """
 
 
@@ -258,8 +324,6 @@ def _table_prompt(
     profile: SourceProfile,
     annotations: SourceAnnotations | None,
     cfg: ProjectConfig,
-    reference: str,
-    vocabularies: str,
 ) -> str:
     cdm = load_cdm_spec()
     others = [f"{t.target_table} <- {', '.join(t.source_tables)}" for t in plan.tables if t is not pt]
@@ -282,14 +346,7 @@ SOURCE PROFILE (aggregates only)
 INTERPRETATION
 {_annotations_text(annotations, pt.source_tables)}
 
-FIELD KINDS
-{inspect.cleandoc(FieldMapping.__doc__ or '')}
-
-{STAGING_CONVENTIONS}
-VOCABULARIES LOADED: {vocabularies}
-
-REFERENCE CONCEPTS (standard, valid)
-{reference}
+Follow the field kinds, staging conventions and notes on the source data in the system prompt.
 """
 
 
@@ -361,17 +418,14 @@ def design_etl(
     max_revisions: int = 2,
 ) -> ETLSpec:
     """Plan, map each table, validate and revise. Returns the spec (also saved to ``ws``)."""
-    reference = reference_concepts_text(conn, schemas)
-    vocabularies = _vocabularies_text(conn, schemas)
+    system = design_system(reference_concepts_text(conn, schemas), _vocabularies_text(conn, schemas), annotations)
 
     try:
         plan = llm.structured(
             stage="design",
             key="plan",
-            system=DESIGN_SYSTEM,
-            prompt=_plan_prompt(
-                profile_prompt_text(profile, cfg.privacy), _annotations_text(annotations), reference
-            ),
+            system=system,
+            prompt=_plan_prompt(profile_prompt_text(profile, cfg.privacy), _annotations_text(annotations)),
             output=TablePlan,
         )
     except LLMUnavailable as e:
@@ -386,9 +440,9 @@ def design_etl(
     for pt in plan.tables:
         seen[pt.target_table] = seen.get(pt.target_table, 0) + 1
         key = f"table:{pt.target_table}" + (f":{seen[pt.target_table]}" if seen[pt.target_table] > 1 else "")
-        prompt = _table_prompt(pt, plan, profile, annotations, cfg, reference, vocabularies)
+        prompt = _table_prompt(pt, plan, profile, annotations, cfg)
         try:
-            tm = llm.structured(stage="design", key=key, system=DESIGN_SYSTEM, prompt=prompt, output=TableMapping)
+            tm = llm.structured(stage="design", key=key, system=system, prompt=prompt, output=TableMapping)
         except LLMUnavailable as e:
             raise _need_llm(e) from e
         keys.append(key)
@@ -411,7 +465,7 @@ def design_etl(
     for i in range(len(mappings)):
         for n in range(1, max_revisions + 1):
             errors = [
-                x for x in validate_table_mapping(spec.table_mappings[i], spec, profile, conn, schemas)
+                x for x in validate_table_mapping(spec.table_mappings[i], spec, profile, conn, schemas, cfg.privacy)
                 if x.severity == "error"
             ]
             if not errors:
@@ -421,7 +475,7 @@ def design_etl(
                 revised = llm.structured(
                     stage="design",
                     key=rkey,
-                    system=DESIGN_SYSTEM,
+                    system=system,
                     prompt=_revision_prompt(prompts[i], spec.table_mappings[i], errors),
                     output=TableMapping,
                 )
@@ -434,7 +488,7 @@ def design_etl(
             if ws is not None:
                 ws.audit("design_revision", key=rkey, issues=[str(x) for x in errors])
 
-    issues = validate_spec(spec, profile, conn, schemas)
+    issues = validate_spec(spec, profile, conn, schemas, cfg.privacy)
     if ws is not None:
         save_design(ws, spec, issues)
         ws.audit(
@@ -468,6 +522,7 @@ def save_design(ws: Workspace, spec: ETLSpec, issues: list[SpecIssue]) -> None:
 __all__ = [
     "DESIGN_SYSTEM",
     "design_etl",
+    "design_system",
     "reference_concepts_text",
     "save_design",
 ]

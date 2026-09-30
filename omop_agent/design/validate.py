@@ -2,9 +2,18 @@
 
 Static checks need only the spec (and optionally the source profile): tables and fields exist
 in CDM v5.4, required fields are mapped, aliases and source columns resolve, field kinds carry
-what they need. With a database connection the validator also checks concept constants against
-the loaded vocabulary, checks that ``vocab_code`` vocabularies are loaded, and ``EXPLAIN``s each
-compiled INSERT inside a transaction that is always rolled back.
+what they need, and person/visit keys come from the id maps (``person_id`` / ``visit_id``
+kinds, never ``auto_id``) so that events link to the right person and visit. Because the spec's
+SQL is written by an LLM and executed by the build, the static checks also refuse unsafe SQL
+(``sqlguard.fragment_issues``: statement separators, server-file/session functions, catalog
+access, DDL/DML), tables outside the staged source, vocabulary and ETL schemas, and mappings
+that load direct identifiers (``privacy.pii_references``) into the CDM. Custom SQL is executed as
+written, so it always gets a review warning. ``sql_safety_issues`` is the subset the ETL
+runner re-checks before it executes a spec.
+
+With a database connection the validator also checks concept constants against the loaded
+vocabulary, checks that ``vocab_code`` vocabularies are loaded, and ``EXPLAIN``s each compiled
+INSERT inside a transaction that is always rolled back.
 
 Semantic problems (a code format that does not match the vocabulary) and runtime problems (a
 NOT NULL violation that only shows up with real rows) are left to the build and the
@@ -21,15 +30,38 @@ from pydantic import BaseModel
 
 from ..cdm.ddl import create_cdm_tables, create_etl_tables
 from ..cdm.spec import CdmTable, load_cdm_spec
+from ..config import PrivacyConfig
 from ..db import Schemas, execute, fetch_all, list_columns, qi, rollback_only, short_error
-from ..etl.compiler import CompileError, alias_refs, compile_table
+from ..etl.compiler import ID_MAP_KEYS, CompileError, alias_refs, compile_table, source_ref
 from ..models import CustomSQL, ETLSpec, KeySpec, SourceProfile, TableMapping
+from ..privacy import pii_columns, pii_references
+from ..sqlguard import fragment_issues, strip_literals
 
 # Qualifiers that are schemas, not table aliases (e.g. pg_catalog.to_char(...)::pg_catalog.text).
-_NOT_ALIASES = {"pg_catalog", "public", "information_schema"}
+# (Both are also refused by the SQL guard; ``public`` is not listed, so ``public.t`` is an
+# undeclared alias rather than a silent read of another schema.)
+_NOT_ALIASES = {"pg_catalog", "information_schema"}
 _CASE_INT = re.compile(r"\bTHEN\s+(\d+)|\bELSE\s+(\d+)", re.I)
 _INT_LITERAL = re.compile(r"^\(*\s*'?\s*(-?\d+)\s*'?\s*\)*$")
 _NEEDS_EXPRESSION = {"column", "expression", "constant", "concept_map", "vocab_code", "person_id", "visit_id"}
+
+# Schemas that spec SQL may read, as placeholders; bare table names are staged source tables.
+_READABLE = ("{src}", "{vocab}", "{etl}")
+_PLACEHOLDER_TABLE = re.compile(r'(\{\w+\})\s*\.\s*([A-Za-z_][A-Za-z0-9_]*|"[^"]+")')
+_FROM_JOIN = re.compile(r"\b(?:from|join)\s+", re.I)
+_TABLE_TOKEN = re.compile(r'\{\w+\}\s*\.\s*(?:[A-Za-z_]\w*|"[^"]+")|[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?|"[^"]+"')
+# Words that can follow FROM/JOIN <x> without being an alias (and are never table names).
+_SQL_WORDS = {
+    "all", "and", "any", "as", "asc", "at", "between", "by", "case", "cross", "desc", "distinct", "else", "end",
+    "except", "false", "fetch", "for", "from", "full", "group", "having", "ilike", "in", "inner", "intersect", "into",
+    "is", "isnull", "join", "lateral", "left", "like", "limit", "natural", "not", "notnull", "null", "offset", "on",
+    "only", "or", "order", "outer", "returning", "right", "select", "set", "similar", "tablesample", "then", "true",
+    "union", "using", "values", "when", "where", "window", "with", "without",
+}
+# DML is what custom SQL is for; the SQL guard's other rules still apply to it. Its statements
+# must be plain DML/queries: SET ROLE, COMMIT, DO '...' and the like could leave the ETL role.
+_DML = re.compile(r"\b(insert|update|delete)\b", re.I)
+_CUSTOM_STATEMENTS = {"insert", "update", "delete", "select", "with"}
 
 
 class SpecIssue(BaseModel):
@@ -81,21 +113,160 @@ class _SourceCatalog:
         return cols
 
 
-def _is_qualified(table: str) -> bool:
-    return "." in table or "{" in table
+def _staged_name(table: str) -> str | None:
+    """The staged source table a table reference names (bare or ``{src}.``-qualified), else None."""
+    t = table.strip()
+    if "." not in t and "{" not in t:
+        return t
+    m = _PLACEHOLDER_TABLE.fullmatch(t)
+    if m and m.group(1) == "{src}":
+        return m.group(2).strip('"')
+    return None
+
+
+def table_ref_issue(table: str) -> str | None:
+    """Why a source/join/key table reference may not be read (None when it is allowed).
+
+    Bare names are staged source tables; otherwise only the ``{src}``, ``{vocab}`` and ``{etl}``
+    placeholders may qualify a table, so spec SQL cannot read the CDM being built, system
+    catalogs or any other schema.
+    """
+    t = table.strip()
+    if "." not in t and "{" not in t:
+        return None
+    m = _PLACEHOLDER_TABLE.fullmatch(t)
+    if m and m.group(1) in _READABLE:
+        return None
+    return (
+        f"table '{t}' may not be read: use a staged source table by its bare name, or qualify the table "
+        "with {src}, {vocab} or {etl}"
+    )
+
+
+def _inner_tables(expr: str) -> list[tuple[str, str | None]]:
+    """``(table, alias)`` declared by ``FROM``/``JOIN`` inside an expression (correlated subqueries).
+
+    Function calls (``EXTRACT(YEAR FROM f(x))``, ``FROM generate_series(...)``) and casts are
+    skipped. A dotted name may also be a column (``EXTRACT(YEAR FROM p.dob)``); callers decide.
+    """
+    text = strip_literals(expr)
+    out: list[tuple[str, str | None]] = []
+    for m in _FROM_JOIN.finditer(text):
+        rest = text[m.end():]
+        t = _TABLE_TOKEN.match(rest)
+        if not t:
+            continue
+        after = rest[t.end():]
+        if re.match(r"\s*(\(|::|\[)", after):
+            continue
+        table = re.sub(r"\s+", "", t.group(0))
+        if table.lower() in _SQL_WORDS:
+            continue
+        a = re.match(r"\s+(?:as\s+)?([A-Za-z_]\w*)", after, re.I)
+        alias = a.group(1).lower() if a and a.group(1).lower() not in _SQL_WORDS else None
+        out.append((table, alias))
+    return out
+
+
+def _fragments(tm: TableMapping) -> list[tuple[str | None, str, str]]:
+    """``(field, what, sql)`` for every SQL fragment of a table mapping."""
+    out: list[tuple[str | None, str, str]] = [
+        (fm.target_field, "expression", fm.expression) for fm in tm.fields if fm.expression
+    ]
+    out += [(None, f"join '{j.alias}' condition", j.on) for j in tm.joins]
+    if tm.where:
+        out.append((None, "where", tm.where))
+    return out
+
+
+def _mapping_sql_problems(tm: TableMapping) -> list[tuple[str | None, str]]:
+    """``(field, problem)``: unsafe fragments and tables the mapping may not read."""
+    out: list[tuple[str | None, str]] = []
+    for table in [tm.source.table] + [j.table for j in tm.joins]:
+        issue = table_ref_issue(table)
+        if issue:
+            out.append((None, issue))
+    declared = {tm.source.alias.lower()} | {j.alias.lower() for j in tm.joins}
+    for field, what, sql in _fragments(tm):
+        out += [(field, f"unsafe SQL in {what}: {x}") for x in fragment_issues(sql)]
+        for table, alias in _inner_tables(sql):
+            if "{" not in table and "." in table and (table.split(".")[0].lower() in declared or alias is None):
+                continue  # a column (EXTRACT(YEAR FROM p.dob)); an unknown qualifier is an undeclared alias
+            if "." in table or "{" in table:
+                issue = table_ref_issue(table)
+                if issue:
+                    out.append((field, f"{what}: {issue}"))
+    return out
+
+
+def _key_sql_problems(key: KeySpec) -> list[str]:
+    out = [x for x in [table_ref_issue(key.table)] if x]
+    out += [f"unsafe SQL in the key expression: {x}" for x in fragment_issues(key.expression)]
+    return out
+
+
+def _custom_sql_problems(cs: CustomSQL) -> list[str]:
+    """Custom SQL may hold several INSERT/UPDATE/DELETE/SELECT/WITH statements; everything else
+    the guard refuses is refused, and so is any other kind of statement."""
+    out = [
+        f"unsafe custom SQL: {x}"
+        for x in fragment_issues(_DML.sub(" ", cs.sql))
+        if not x.startswith("contains ';'")
+    ]
+    for stmt in strip_literals(cs.sql).split(";"):
+        words = stmt.split()
+        if words and words[0].lower() not in _CUSTOM_STATEMENTS:
+            out.append(f"unsafe custom SQL: a '{words[0]}' statement is not allowed "
+                       "(only INSERT, UPDATE, DELETE, SELECT or WITH)")
+    return out
+
+
+def sql_safety_issues(obj: TableMapping | KeySpec | CustomSQL) -> list[str]:
+    """Reasons the spec SQL of ``obj`` must not be executed (empty when it may run).
+
+    Used by the validator and, again, by the ETL runner right before a build, because the spec
+    can change after validation (hand edits, the repair agent).
+    """
+    if isinstance(obj, TableMapping):
+        return [f"{obj.target_table}{'.' + f if f else ''}: {msg}" for f, msg in _mapping_sql_problems(obj)]
+    if isinstance(obj, KeySpec):
+        return [f"key {obj.table}.{obj.expression}: {msg}" for msg in _key_sql_problems(obj)]
+    if isinstance(obj, CustomSQL):
+        return [f"custom SQL '{obj.name}': {msg}" for msg in _custom_sql_problems(obj)]
+    return []
 
 
 def _check_source_table(cat: _SourceCatalog, table: str, tt: str | None, what: str) -> SpecIssue | None:
-    if not cat.available or _is_qualified(table):
+    name = _staged_name(table)
+    if not cat.available or name is None:
         return None
-    if cat.columns(table) is None:
+    if cat.columns(name) is None:
         where = "in the source profile" if cat.profile is not None else "in the staging schema"
         return SpecIssue(severity="error", target_table=tt, message=f"{what} '{table}' does not exist {where}")
     return None
 
 
-def _static_mapping(tm: TableMapping, spec: ETLSpec, cat: _SourceCatalog) -> list[SpecIssue]:
+def _pii_loaded(tm: TableMapping, profile: SourceProfile | None, privacy: PrivacyConfig) -> list[str]:
+    """Direct-identifier columns whose values a mapping loads into the CDM.
+
+    Fields of kind person_id / visit_id only resolve the key through the id maps (the CDM gets
+    the integer id), and join conditions and filters only select rows, so those are not counted.
+    """
+    loading = tm.model_copy(
+        update={
+            "fields": [f for f in tm.fields if f.kind not in ("person_id", "visit_id")],
+            "where": None,
+            "joins": [j.model_copy(update={"on": "TRUE"}) for j in tm.joins],
+        }
+    )
+    return pii_references(loading, profile, privacy)
+
+
+def _static_mapping(
+    tm: TableMapping, spec: ETLSpec, cat: _SourceCatalog, privacy: PrivacyConfig | None = None
+) -> list[SpecIssue]:
     cdm = load_cdm_spec()
+    privacy = privacy or PrivacyConfig()
     tt = tm.target_table
     issues: list[SpecIssue] = []
 
@@ -125,7 +296,12 @@ def _static_mapping(tm: TableMapping, spec: ETLSpec, cat: _SourceCatalog) -> lis
             continue
         fm = mapped.get(f.name)
         if fm is None:
-            hint = " (use kind auto_id for a surrogate key)" if f.is_pk else ""
+            if (tt, f.name) in ID_MAP_KEYS:
+                hint = f" (use kind {ID_MAP_KEYS[(tt, f.name)]} with the source key)"
+            elif f.name == "person_id":
+                hint = " (use kind person_id with the column that holds the patient key)"
+            else:
+                hint = " (use kind auto_id for a surrogate key)" if f.is_pk else ""
             err(f"required field is not mapped{hint}", f.name)
         elif fm.kind == "null":
             err("required field is mapped to NULL", f.name)
@@ -152,6 +328,36 @@ def _static_mapping(tm: TableMapping, spec: ETLSpec, cat: _SourceCatalog) -> lis
             err("kind visit_id needs a visit_key in the spec", f.name)
         if fm.kind == "person_id" and f.name != "person_id":
             warn("kind person_id is meant for the person_id field", f.name)
+        # links: person and visit ids must come from the id maps, or events attach to the wrong rows
+        if f.name == "person_id" and fm.kind not in ("person_id", "null"):
+            err(
+                f"person_id must use kind person_id (the patient key resolved through the person id map), "
+                f"not '{fm.kind}': any other value does not link to the person table's ids",
+                f.name,
+            )
+        if (tt, f.name) == ("visit_occurrence", "visit_occurrence_id"):
+            if fm.kind == "auto_id":
+                err("auto_id is not allowed here: visit_occurrence_id must come from the visit id map "
+                    "(kind visit_id with the visit key), or events link to the wrong visits", f.name)
+            elif spec.visit_key is not None and fm.kind != "visit_id":
+                err(f"visit_occurrence_id must use kind visit_id (the visit key resolved through the visit id map), "
+                    f"not '{fm.kind}', so that other tables' visit_id fields link to it", f.name)
+        elif (
+            f.name == "visit_occurrence_id"
+            and spec.visit_key is not None
+            and fm.kind not in ("visit_id", "null")
+        ):
+            warn(f"visit_occurrence_id is kind '{fm.kind}': only kind visit_id links to the loaded visits", f.name)
+
+    # SQL safety: fragments and the tables they read
+    for field, msg in _mapping_sql_problems(tm):
+        err(msg, field)
+    pii = _pii_loaded(tm, cat.profile, privacy)
+    if pii:
+        err(
+            f"loads direct identifier column(s) {', '.join(pii)} into the CDM; direct identifiers must never be "
+            "loaded (leave these fields unmapped or NULL)"
+        )
 
     # tables and aliases
     aliases: dict[str, str] = {tm.source.alias.lower(): tm.source.table}
@@ -164,22 +370,44 @@ def _static_mapping(tm: TableMapping, spec: ETLSpec, cat: _SourceCatalog) -> lis
         if issue:
             issues.append(issue)
 
-    exprs: list[tuple[str | None, str]] = [(fm.target_field, fm.expression or "") for fm in tm.fields]
-    exprs += [(None, j.on) for j in tm.joins]
-    if tm.where:
-        exprs.append((None, tm.where))
+    pii_cols = pii_columns(cat.profile, privacy)
     reported: set[tuple[str, str]] = set()
-    for field, expr in exprs:
+    for field, _, expr in _fragments(tm):
+        # aliases declared inside the expression (correlated subqueries): alias -> staged table,
+        # or None when it cannot be resolved or shadows an outer alias
+        inner: dict[str, str | None] = {}
+        schemas_used: set[str] = set()
+        for table, alias in _inner_tables(expr):
+            dotted = "{" not in table and "." in table
+            if dotted and (table.split(".")[0].lower() in aliases or table.split(".")[0].lower() in inner):
+                continue  # a column: EXTRACT(YEAR FROM p.dob)
+            if dotted and alias is not None:
+                schemas_used.add(table.split(".")[0].lower())  # reported above as a table it may not read
+            if "." not in table and "{" not in table and alias is not None and cat.available \
+                    and cat.columns(table.strip('"')) is not None:
+                # only source/join tables get {src} added; inside an expression the name would be
+                # looked up in the search_path
+                err(f"inside an expression write the source table as {{src}}.{table}, not '{table}'", field)
+            if alias is not None:
+                inner[alias] = None if alias in aliases else _staged_name(table)
         for alias, column in alias_refs(expr):
-            if alias in _NOT_ALIASES:
+            if alias in _NOT_ALIASES or alias in schemas_used:
                 continue
-            if alias not in aliases:
+            if alias in inner:
+                src = inner[alias]
+            elif alias in aliases:
+                src = _staged_name(aliases[alias])
+            else:
                 if (alias, "") not in reported:
                     reported.add((alias, ""))
                     err(f"alias '{alias}' is not declared (declared: {', '.join(sorted(aliases))})", field)
                 continue
-            src = aliases[alias]
-            if not cat.available or _is_qualified(src):
+            if src is None:
+                continue
+            if alias in inner and column in pii_cols.get(src.lower(), set()) and (alias, column) not in reported:
+                reported.add((alias, column))
+                err(f"reads direct identifier column '{src}.{column}'; direct identifiers must never be loaded", field)
+            if not cat.available:
                 continue
             cols = cat.columns(src)
             if cols is not None and column not in cols and (alias, column) not in reported:
@@ -194,10 +422,14 @@ def _static_spec(spec: ETLSpec, cat: _SourceCatalog) -> list[SpecIssue]:
     for key, what in [(spec.person_key, "person_key"), (spec.visit_key, "visit_key")]:
         if key is None:
             continue
+        unsafe = _key_sql_problems(key)
+        issues += [SpecIssue(severity="error", message=f"{what}: {x}") for x in unsafe]
+        if unsafe:
+            continue
         issue = _check_source_table(cat, key.table, None, f"{what} table")
         if issue:
             issues.append(issue)
-        elif cat.available and not _is_qualified(key.table):
+        elif cat.available and _staged_name(key.table) is not None:
             issues += _key_columns(key, cat, what)
     if not spec.mapping_for("person"):
         issues.append(SpecIssue(severity="error", target_table="person", message="no table mapping loads person"))
@@ -227,13 +459,21 @@ def _static_spec(spec: ETLSpec, cat: _SourceCatalog) -> list[SpecIssue]:
             issues.append(
                 SpecIssue(severity="error", target_table=cs.target_table, message=f"custom SQL '{cs.name}' targets a non-CDM table")
             )
+        issues.append(
+            SpecIssue(severity="warning", target_table=cs.target_table,
+                      message=f"custom SQL '{cs.name}' is executed as written; review it")
+        )
+        issues += [
+            SpecIssue(severity="error", target_table=cs.target_table, message=f"custom SQL '{cs.name}': {x}")
+            for x in _custom_sql_problems(cs)
+        ]
     return issues
 
 
 def _key_columns(key: KeySpec, cat: _SourceCatalog, what: str) -> list[SpecIssue]:
     """A key over a single bare column must name an existing column."""
     expr = key.expression.strip()
-    cols = cat.columns(key.table) or set()
+    cols = cat.columns(_staged_name(key.table) or key.table) or set()
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expr) and expr.lower() not in cols:
         return [SpecIssue(severity="error", message=f"{what} column '{expr}' does not exist in '{key.table}'")]
     return []
@@ -367,12 +607,9 @@ def _explain_all(
                 create_cdm_tables(conn, schemas, include_vocab=False)
                 create_etl_tables(conn, schemas)
             for key, what in [(spec.person_key, "person_key"), (spec.visit_key, "visit_key")]:
-                if key is None or not keys:
+                if key is None or not keys or _key_sql_problems(key):
                     continue
-                probe = schemas.render(
-                    f"SELECT DISTINCT ({key.expression})::text FROM "
-                    + (key.table if _is_qualified(key.table) else "{src}." + qi(key.table))
-                )
+                probe = schemas.render(f"SELECT DISTINCT ({key.expression})::text FROM {source_ref(key.table)}")
                 error = _explain(conn, probe)
                 if error:
                     issues.append(SpecIssue(severity="error", message=f"{what} expression fails: {error}"))
@@ -404,10 +641,11 @@ def validate_table_mapping(
     profile: SourceProfile | None = None,
     conn: psycopg.Connection | None = None,
     schemas: Schemas | None = None,
+    privacy: PrivacyConfig | None = None,
 ) -> list[SpecIssue]:
     """Issues of one table mapping, in the context of ``spec`` (its keys)."""
     cat = _SourceCatalog(profile, conn, schemas)
-    issues = _static_mapping(tm, spec, cat)
+    issues = _static_mapping(tm, spec, cat, privacy)
     if conn is not None and schemas is not None:
         issues += _db_concepts(tm, conn, schemas)
         if not any(i.severity == "error" for i in issues):
@@ -420,19 +658,26 @@ def validate_spec(
     profile: SourceProfile | None = None,
     conn: psycopg.Connection | None = None,
     schemas: Schemas | None = None,
+    privacy: PrivacyConfig | None = None,
 ) -> list[SpecIssue]:
-    """All issues found in ``spec``. Errors block the build; warnings are for review."""
+    """All issues found in ``spec``. Errors block the build; warnings are for review.
+
+    ``privacy`` (default ``PrivacyConfig()``) decides, with the profile's PII flags, which
+    source columns are direct identifiers that must not be loaded.
+    """
     cat = _SourceCatalog(profile, conn, schemas)
     issues = _static_spec(spec, cat)
     clean: list[TableMapping] = []
     for tm in spec.table_mappings:
-        table_issues = _static_mapping(tm, spec, cat)
+        table_issues = _static_mapping(tm, spec, cat, privacy)
         if conn is not None and schemas is not None:
             table_issues += _db_concepts(tm, conn, schemas)
         issues += table_issues
         if not any(i.severity == "error" for i in table_issues):
             clean.append(tm)
     if conn is not None and schemas is not None:
-        customs = [c for c in spec.custom_sql if load_cdm_spec().has_table(c.target_table)]
+        customs = [
+            c for c in spec.custom_sql if load_cdm_spec().has_table(c.target_table) and not _custom_sql_problems(c)
+        ]
         issues += _explain_all(spec, clean, customs, conn, schemas)
     return issues

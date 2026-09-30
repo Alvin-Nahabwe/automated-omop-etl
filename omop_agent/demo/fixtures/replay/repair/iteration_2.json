@@ -2,15 +2,45 @@
   "kind": "agent",
   "tool_calls": [
     {
-      "name": "run_aggregate_query",
+      "name": "count_records",
       "input": {
-        "sql": "SELECT condition_source_value AS code, COUNT(*) AS n FROM {cdm}.condition_occurrence WHERE condition_concept_id = 0 GROUP BY 1 ORDER BY n DESC"
+        "table": "cdm.condition_occurrence",
+        "group_by": [
+          "condition_source_value"
+        ],
+        "filters": [
+          {
+            "column": "condition_concept_id",
+            "op": "=",
+            "value": 0
+          }
+        ]
       }
     },
     {
-      "name": "run_aggregate_query",
+      "name": "count_records",
       "input": {
-        "sql": "SELECT c.concept_code, COUNT(*) AS n FROM {vocab}.concept c WHERE c.vocabulary_id = 'ICD10' AND c.concept_code IN ('J18.9', 'J189', 'E11.9', 'E119') GROUP BY 1"
+        "table": "vocab.concept",
+        "group_by": [
+          "concept_code"
+        ],
+        "filters": [
+          {
+            "column": "vocabulary_id",
+            "op": "=",
+            "value": "ICD10"
+          },
+          {
+            "column": "concept_code",
+            "op": "in",
+            "values": [
+              "J18.9",
+              "J189",
+              "E11.9",
+              "E119"
+            ]
+          }
+        ]
       }
     },
     {
@@ -44,5 +74,5 @@
       }
     }
   ],
-  "final_text": "condition_concept_id was 0 for about 13% of records. Every unmapped code was a valid ICD-10 code written without its dot (J189, J069, D649, E119, A150); the vocabulary stores them as J18.9, J06.9, ... I normalised the code in the lookup expression for both condition_concept_id and condition_source_concept_id. condition_source_value keeps the code exactly as recorded."
+  "final_text": "condition_concept_id was 0 for about 13% of records. Every unmapped code was a valid ICD-10 code written without its dot (J069, J189, D649, E119, A150; no rarer codes were withheld); the vocabulary stores them as J06.9, J18.9, ... (it has J18.9 and E11.9 but not J189 or E119). I normalised the code in the lookup expression for both condition_concept_id and condition_source_concept_id. condition_source_value keeps the code exactly as recorded."
 }

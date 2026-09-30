@@ -9,14 +9,20 @@ corresponding DQD SQL file, so results line up with the official R package:
   ``isStandardValidConcept``, ``measureValueCompleteness``, ``standardConceptRecordCompleteness``,
   ``sourceConceptRecordCompleteness``, ``sourceValueCompleteness``, ``plausibleValueLow/High``,
   ``plausibleStartBeforeEnd``, ``plausibleAfterBirth``, ``plausibleBeforeDeath``,
-  ``plausibleDuringLife``;
+  ``plausibleDuringLife``, ``withinVisitDates``;
 * ETL level (ours): ``etlRecordRetention`` (source rows that never reached the CDM) and
   ``etlStepError`` (an ETL step that failed).
 
+The other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``, ``plausibleTemporalAfter``,
+``measureConditionEraCompleteness`` and the concept-level checks) are reported once per
+populated table as not applicable, pointing to the R package (``quality.use_r_dqd``).
+
 A check fails when ``pct_violated_rows * 100 > threshold``. Checks on tables the ETL does not
 populate, on empty tables, and (except ``isRequired`` / ``measureValueCompleteness``) on
-all-NULL fields are marked ``not_applicable``, as DQD does. Every check runs as one query in
-its own rolled-back savepoint, and the rendered SQL is kept on the result.
+all-NULL fields are marked ``not_applicable``, as DQD does. A table without rows gets its
+table-level checks plus one ``fieldLevelChecks`` summary instead of one result per field and
+check, which keeps ``dq_results.json`` small. Every check runs as one query in its own
+rolled-back savepoint, and the rendered SQL is kept on the result.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ from ..cdm.ddl import schema_for
 from ..cdm.spec import RESOURCE_PKG, load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, execute, fetch_all, fetch_one, qi, ql, short_error
+from ..etl.compiler import target_tables
 from ..models import CheckResult, DQReport, ETLRunResult, ETLSpec, TableLoadResult
 from ..workspace import utcnow
 
@@ -61,7 +68,12 @@ FIELD_CHECKS: list[tuple[str, Any]] = [
     ("plausibleAfterBirth", lambda r: r.get("plausibleAfterBirth") == _YES),
     ("plausibleBeforeDeath", lambda r: r.get("plausibleBeforeDeath") == _YES),
     ("plausibleDuringLife", lambda r: r.get("plausibleDuringLife") == _YES),
+    ("withinVisitDates", lambda r: r.get("withinVisitDates") == _YES),
 ]
+TABLE_CHECKS = ["measurePersonCompleteness", "measureObservationPeriodOverlap"]
+IMPLEMENTED = {name for name, _ in FIELD_CHECKS} | set(TABLE_CHECKS)
+NOT_IMPLEMENTED = "not implemented by the built-in engine; use the R DataQualityDashboard (quality.use_r_dqd)"
+FIELD_SUMMARY = "fieldLevelChecks"
 
 # Checks that still apply when the field is entirely NULL (DQD's applyNotApplicable).
 _RUN_ON_EMPTY_FIELD = {"isRequired", "measureValueCompleteness"}
@@ -94,6 +106,7 @@ class CheckInfo:
     category: str
     subcategory: str
     severity: str
+    evaluation_filter: str = ""
 
 
 def _read_dqd(name: str) -> list[dict[str, str]]:
@@ -116,6 +129,7 @@ def check_catalog() -> dict[str, CheckInfo]:
             category=r.get("kahnCategory", ""),
             subcategory=r.get("kahnSubcategory", ""),
             severity=severity if severity in {"fatal", "convention", "characterization"} else "convention",
+            evaluation_filter=r.get("evaluationFilter", ""),
         )
     return out
 
@@ -131,6 +145,29 @@ def dqd_field_level() -> dict[str, list[dict[str, str]]]:
     for r in _read_dqd("DQD_OMOP_CDMv5.4_Field_Level.csv"):
         out.setdefault(r["cdmTableName"].lower(), []).append(r)
     return out
+
+
+@lru_cache(maxsize=1)
+def dqd_concept_level() -> dict[str, list[dict[str, str]]]:
+    out: dict[str, list[dict[str, str]]] = {}
+    for r in _read_dqd("DQD_OMOP_CDMv5.4_Concept_Level.csv"):
+        out.setdefault(r["cdmTableName"].lower(), []).append(r)
+    return out
+
+
+_FILTER_CLAUSE = re.compile(r"^\s*(\w+)\s*(==|!=)\s*'([^']*)'\s*$")
+
+
+def _matches_filter(row: dict[str, str], evaluation_filter: str) -> bool:
+    """Evaluate a DQD ``evaluationFilter`` such as ``isForeignKey=='Yes' & fkDomain!= ''``."""
+    for clause in evaluation_filter.split("&"):
+        m = _FILTER_CLAUSE.match(clause)
+        if not m:
+            return False
+        value = row.get(m.group(1), "")
+        if (value == m.group(3)) != (m.group(2) == "=="):
+            return False
+    return True
 
 
 def _threshold(row: dict[str, str], check: str) -> float:
@@ -322,6 +359,17 @@ def _field_sql(ctx: _Ctx, check: str, table: str, fld: str, row: dict[str, str])
             denom = f"SELECT COUNT(*) FROM {T} t WHERE t.person_id IN (SELECT person_id FROM {D})"
         return _q(violated, denom)
 
+    if check == "withinVisitDates":
+        # DQD: records more than a week before the start or after the end of their visit
+        if "visit_occurrence" not in ctx.populated or not ctx.n_rows.get("visit_occurrence"):
+            raise _NotApplicable
+        ctx.need_column(table, "visit_occurrence_id")
+        join = f"FROM {T} t JOIN {ctx.t('visit_occurrence')} vo ON vo.visit_occurrence_id = t.visit_occurrence_id"
+        return _q(
+            f"SELECT COUNT(*) {join} WHERE {as_date} < vo.visit_start_date - 7 OR {as_date} > vo.visit_end_date + 7",
+            f"SELECT COUNT(*) {join}",
+        )
+
     raise ValueError(f"unknown check {check}")
 
 
@@ -392,8 +440,9 @@ def _evaluate(ctx: _Ctx, res: CheckResult, sql: str) -> CheckResult:
 
 def _populated_tables(conn: psycopg.Connection, schemas: Schemas, existing: set[str], spec: ETLSpec | None) -> set[str]:
     if spec is not None:
+        # every table the compiled spec writes, incl. the derived observation_period and cdm_source
         names = {m.target_table for m in spec.table_mappings} | {c.target_table for c in spec.custom_sql}
-        return {n.lower() for n in names} | {"person", "observation_period"}
+        return {n.lower() for n in names} | set(target_tables(spec)) | {"person", "observation_period", "cdm_source"}
     out = set()
     for t in existing:
         if fetch_one(conn, f"SELECT 1 AS x FROM {qi(schemas.cdm)}.{qi(t)} LIMIT 1"):
@@ -439,7 +488,9 @@ def _table_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
 def _field_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
     out: list[CheckResult] = []
     catalog = check_catalog()
-    populated = table in ctx.populated and bool(ctx.n_rows.get(table))
+    if table not in ctx.populated or not ctx.n_rows.get(table):
+        summary = _field_summary(ctx, table)
+        return [summary] if summary else []
     for row in dqd_field_level().get(table, []):
         fld = row["cdmFieldName"].lower()
         extra = {k: row.get(k, "").lower() if k.endswith("Name") else row.get(k, "") for k in _DESCRIPTION_KEYS}
@@ -447,9 +498,6 @@ def _field_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
             if check not in catalog or not applies(row):
                 continue
             res = _new(check, "FIELD", table, fld, _threshold(row, check), extra)
-            if not populated:
-                out.append(res.model_copy(update={"not_applicable": True}))
-                continue
             if fld not in ctx.columns.get(table, set()):
                 out.append(res.model_copy(update={"error": f"column {table}.{fld} does not exist"}))
                 continue
@@ -465,6 +513,62 @@ def _field_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
                 out.append(res.model_copy(update={"error": str(e)}))
                 continue
             out.append(_evaluate(ctx, res, sql))
+    return out
+
+
+def _field_summary(ctx: _Ctx, table: str) -> CheckResult | None:
+    """One not-applicable result standing for every field-level check of a table without rows."""
+    catalog = check_catalog()
+    names: list[str] = []
+    n = 0
+    for row in dqd_field_level().get(table, []):
+        for check, applies in FIELD_CHECKS:
+            if check in catalog and applies(row):
+                n += 1
+                if check not in names:
+                    names.append(check)
+    if not n:
+        return None
+    reason = "the ETL does not populate it" if table not in ctx.populated else "it has no rows"
+    return CheckResult(
+        check_name=FIELD_SUMMARY,
+        check_level="TABLE",
+        table=table,
+        description=f"The {n} field-level checks of {table} ({', '.join(names)}) are not applicable: {reason}.",
+        not_applicable=True,
+    )
+
+
+def _not_implemented_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
+    """One not-applicable result per DQD check that applies to a populated table but is not built in."""
+    if table not in ctx.populated or not ctx.n_rows.get(table):
+        return []  # covered by the table's field-level summary
+    rows_by_level = {
+        "TABLE": [r for r in [dqd_table_level().get(table)] if r],
+        "FIELD": dqd_field_level().get(table, []),
+        "CONCEPT": dqd_concept_level().get(table, []),
+    }
+    unit = {"TABLE": "table", "FIELD": "field", "CONCEPT": "concept"}
+    out: list[CheckResult] = []
+    for info in check_catalog().values():
+        if info.name in IMPLEMENTED or info.level not in rows_by_level:
+            continue
+        n = sum(_matches_filter(r, info.evaluation_filter) for r in rows_by_level[info.level])
+        if not n:
+            continue
+        what = "" if info.level == "TABLE" else f" ({n} {unit[info.level]}{'s' if n > 1 else ''} of {table})"
+        out.append(
+            CheckResult(
+                check_name=info.name,
+                check_level=info.level,  # type: ignore[arg-type]
+                table=table,
+                description=f"{info.name}{what}: {NOT_IMPLEMENTED}",
+                category=info.category,
+                subcategory=info.subcategory,
+                severity=info.severity,  # type: ignore[arg-type]
+                not_applicable=True,
+            )
+        )
     return out
 
 
@@ -494,8 +598,21 @@ def etl_checks(etl_result: ETLRunResult) -> list[CheckResult]:
 
 def _retention(s: TableLoadResult) -> CheckResult:
     source = int(s.source_rows or 0)
-    dropped = max(source - s.rows_inserted, 0)
+    if s.retained_rows is not None:
+        # rows lost before the vocabulary lookups; a code mapped to several concepts inserts
+        # several rows, and that fan-out must not hide real drops
+        dropped = max(source - s.retained_rows, 0)
+        fan_out = max(s.rows_inserted - s.retained_rows, 0)
+    else:  # older results: net comparison
+        dropped = max(source - s.rows_inserted, 0)
+        fan_out = 0
     pct = dropped / source if source else 0.0
+    extra = (
+        f" Another {fan_out} rows were added by 1-to-many vocabulary mappings ('Maps to' or "
+        f"source_to_concept_map rows with several targets): {s.rows_inserted} rows inserted."
+        if fan_out
+        else ""
+    )
     return CheckResult(
         check_name="etlRecordRetention",
         check_level="ETL",
@@ -503,7 +620,7 @@ def _retention(s: TableLoadResult) -> CheckResult:
         description=(
             f"The number and percent of source rows of ETL step '{s.step}' that were not loaded into "
             f"{s.target_table}: {dropped} of {source} records dropped (for example rows whose person key has "
-            f"no matching person, rows lost in an inner join, or rows removed by a filter)."
+            f"no matching person, rows lost in an inner join, or rows removed by a filter).{extra}"
         ),
         category="Completeness",
         subcategory="ETL",
@@ -559,8 +676,9 @@ def run_builtin_checks(
 ) -> DQReport:
     """Run the built-in DQD subset over the CDM tables in ``schemas.cdm``.
 
-    "Populated" tables are the spec's targets plus person and observation_period (or, without a
-    spec, the tables that have rows); checks on other tables are reported as not applicable.
+    "Populated" tables are every table the compiled spec writes (``compiler.target_tables``,
+    which includes cdm_source) plus person and observation_period, or, without a spec, the
+    tables that have rows; checks on other tables are reported as not applicable.
     All statements run in a transaction that is rolled back, so the connection is left as found.
     """
     cdm = load_cdm_spec()
@@ -586,6 +704,7 @@ def run_builtin_checks(
         for t in cdm_tables:
             if t in existing:
                 results.extend(_field_checks(ctx, t))
+                results.extend(_not_implemented_checks(ctx, t))
     if etl_result is not None:
         results.extend(etl_checks(etl_result))
     passed, blocking = gate(results, cfg, etl_result)

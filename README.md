@@ -159,6 +159,16 @@ suite plus the offline demo against a `postgres:16` service.
 
 ## Limitations and roadmap
 
+* **Residual privacy risk in the repair agent.** `count_records` returns exact counts for groups
+  of `min_cell_count` or more. By comparing the totals of several filters it chooses (for
+  example "all records" against "all but one value"), a model could infer a small count, and
+  learn whether some rare value matches a filter, without ever seeing the value itself.
+  Closing this fully needs noisy or rounded counts. Until then, if that residual is not
+  acceptable, set `quality.max_repair_iterations: 0` (no repair agent) or
+  `privacy.send_values_to_llm: false`.
+* Site-specific concepts loaded into the vocabulary schema (ids of 2,000,000,000 and above)
+  are treated as reference data and are not suppressed.
+
 * The target database is PostgreSQL only. Source databases can be anything SQLAlchemy reads.
 * Person and visit ids are kept stable across re-runs (the id maps are append-only). Filtered-out
   people and visits are pruned from the maps after each load.

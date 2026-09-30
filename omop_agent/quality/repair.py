@@ -2,15 +2,35 @@
 
 The agent never touches the data. It reads context through tools (the table mapping and its
 compiled SQL, the CDM table conventions, the privacy-filtered source profile), tests hypotheses
-with aggregate-only SQL, and edits the ``ETLSpec`` through two tools that apply a change only
-if the table still compiles and ``EXPLAIN``s cleanly. Each applied change is recorded as a
-``RepairAction`` (``repairs.json`` and the audit log); the pipeline then rebuilds and re-checks.
+with ``count_records``, and edits the ``ETLSpec`` through two tools that apply a change only if
+it passes the static SQL and privacy checks and the table still compiles and ``EXPLAIN``s
+cleanly. Each applied change is recorded as a ``RepairAction`` (``repairs.json`` and the audit
+log); the pipeline then rebuilds and re-checks.
 
-Privacy: ``run_aggregate_query`` accepts one read-only SELECT that returns a count column ``n``.
-Rows with ``n < min_cell_count`` are withheld, and queries that mention a direct-identifier
-column (from the profile or ``privacy.pii_columns``), select ``*``, or use row-concatenating or
-file-access functions are refused. Database error messages shown to the model (failed ETL steps,
-check and query errors) have record values redacted (``redact_error``).
+Privacy:
+
+* ``count_records`` is not SQL. The model names a table, up to three columns to group by and a
+  few filters; the tool builds the query itself (identifiers quoted, values bound as
+  parameters) and runs it read-only. It returns counts only: groups with fewer than
+  ``min_cell_count`` records are withheld (their number is reported) and a total below the
+  threshold is shown as ``<k``. Patient, visit and record keys, direct identifiers (PII), CDM
+  ``*_id`` columns (except ``*_concept_id``), CDM fields the spec derives from identifiers or
+  computes across records, and the person/visit id maps can never be grouped or filtered.
+  Vocabulary tables are public reference data and are not suppressed. With
+  ``privacy.send_values_to_llm: false`` only ``*_concept_id`` columns (and vocabulary tables)
+  can be grouped.
+* Spec edits are rejected when their SQL fails ``sqlguard.fragment_issues``, reads a direct
+  identifier (``privacy.pii_references``), reads tables outside the staged source, vocabulary
+  and ETL schemas, or breaks the person/visit linkage (``auto_id`` person or visit keys, a
+  ``person_id`` field that bypasses the person id map).
+* Database errors shown to the model (failed ETL steps, check errors) go through
+  ``redact_error``: DETAIL is dropped, and quoted text is kept only when it is exactly a known
+  identifier; every value slot is withheld. Small violated-row counts of failed checks are
+  shown as ``<k``.
+
+Residual risk: exact counts over model-chosen filters allow differencing ("tracker") attacks,
+and whether a build succeeds is itself one bit. These channels are low-bandwidth and need a
+deliberate, multi-step effort; noise or query auditing would be needed to close them.
 
 Tool names and input fields are part of recorded replays: do not rename them.
 """
@@ -19,17 +39,21 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any, Iterable, Iterator, Literal
 
 import psycopg
 import yaml
+from psycopg import sql as pgsql
+from psycopg.rows import dict_row
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..cdm.spec import load_cdm_spec
 from ..config import ProjectConfig
-from ..db import Schemas, execute, readonly_query, rollback_only, short_error
+from ..db import Schemas, execute, rollback_only, short_error
 from ..llm.base import AgentTool, LLMClient, LLMError, LLMUnavailable
 from ..models import (
     CheckResult,
@@ -43,13 +67,14 @@ from ..models import (
     TableLoadResult,
     TableMapping,
 )
-from ..privacy import profile_prompt_text
+from ..privacy import pii_columns, pii_references, profile_prompt_text
+from ..profiling.profiler import KEY_MAX_LISTED_DISTINCT, _is_key_column
+from ..sqlguard import fragment_issues, strip_literals
 from ..workspace import Workspace, utcnow
-from .checks import summarize
 
 MAX_FAILURES_IN_PROMPT = 30
-QUERY_FETCH_LIMIT = 200  # rows examined (for suppression counts)
-QUERY_SHOW_LIMIT = 50  # rows shown to the model
+COUNT_TIMEOUT_MS = 30_000
+MAX_FILTER_VALUES = 100
 
 REPAIR_SYSTEM = """\
 You are the data-quality repair agent of an OMOP CDM v5.4 ETL pipeline: the ETL developer who \
@@ -59,34 +84,43 @@ The ETL is defined by an ETL spec. Each table mapping compiles to one
   INSERT INTO cdm.<table> SELECT ... FROM src.<source table> <alias> [JOIN ...] [WHERE ...]
 with one field mapping per CDM field. Source columns are all text, so cast explicitly. Field kinds:
   column / expression / constant  a PostgreSQL expression over the source aliases, cast to the CDM type
-  person_id    the source patient key, resolved through the person id map (rows without a person are dropped)
-  visit_id     the source visit key, resolved through the visit id map (NULL when there is no match)
-  auto_id      generated surrogate key (only for the table's own primary key)
+  person_id    the source patient key, resolved through the person id map (rows without a person are
+               dropped). Every person_id field must use this kind.
+  visit_id     the source visit key, resolved through the visit id map. An optional field (e.g.
+               condition_occurrence.visit_occurrence_id) keeps the row with NULL when there is no match;
+               the required visit_occurrence primary key drops rows without a visit.
+  auto_id      generated surrogate key (only for the table's own primary key; never for person.person_id
+               or visit_occurrence.visit_occurrence_id, which come from the id maps)
   vocab_code   a code of an OMOP vocabulary: expression = the code as in concept_code, vocabulary = its
                vocabulary_id; concept_role 'standard' follows 'Maps to', 'source' returns the source concept
   concept_map  a local code/label mapped through the project's source_to_concept_map: vocabulary = the
                source_vocabulary_id, target_domain = the OMOP domain of the targets; concept_role 'source'
                returns the map's source_concept_id
   null         leave the field NULL
-Concept lookups yield 0 when a source value exists but has no mapping. Expressions may use the schema
-placeholders {src}, {cdm}, {vocab}, {etl}.
+Concept lookups yield 0 when a source value exists but has no mapping. Source and join tables are staged
+source table names (or {src}., {vocab}., {etl}.-qualified names). Spec SQL must be a single expression or
+condition: no statement separators, no catalog, file or session functions, and no direct identifiers
+(names, phone numbers, national ids, addresses, GPS): those are never loaded into the CDM.
 
 How to work:
 1. Diagnose the root cause of each failure before changing anything. Read the mapping and its compiled
    SQL (get_table_mapping), the CDM conventions (get_cdm_table) and the source profile
-   (get_source_profile), and test hypotheses with run_aggregate_query.
+   (get_source_profile), and test hypotheses with count_records.
 2. Fix the ETL spec, not the data: update_field_mapping changes one field, replace_table_mapping changes
-   the source, joins, filter or several fields at once. A change is applied only if the table still
-   compiles and EXPLAINs cleanly; if it comes back REJECTED, read the error and try again.
+   the source, joins, filter or several fields at once. A change is applied only if it passes the SQL and
+   privacy checks and the table still compiles and EXPLAINs cleanly; if it comes back REJECTED, read the
+   reason and try again.
 3. Prefer the smallest change that follows OMOP conventions (for example, a visit without an end date
    ends on its start date; an unknown value maps to concept 0 rather than to a guessed concept).
 4. Do not paper over real data problems. Never filter out or delete records just to make a check pass,
    and never invent concept ids, dates or values. When the cause lies in the source data or in the
    vocabulary coverage (unmapped local codes, implausible dates recorded at source), leave the spec as
    it is and explain the problem for a human.
-5. Privacy: you only ever see aggregates. run_aggregate_query must return a count column named n;
-   groups with n below the minimum cell count are withheld, and queries that touch direct identifiers
-   are refused. Never try to retrieve individual records.
+5. Privacy: you only ever see aggregates. count_records returns counts of records, optionally grouped by
+   up to three columns: groups with fewer records than the minimum cell count are withheld (only their
+   number is reported) and a small total is shown as "<k". Patient, visit and record identifiers, direct
+   identifiers and CDM *_id columns (except *_concept_id) cannot be grouped or filtered. Never try to
+   retrieve or reconstruct individual records or rare values.
 
 Finish with a short summary: what you changed and why, and what remains for a human to review."""
 
@@ -115,6 +149,14 @@ class RepairState:
         keys = self.table_triggers.get(table.lower())
         return ", ".join(keys)[:500] if keys else self.trigger
 
+    @property
+    def min_cell_count(self) -> int:
+        return self.cfg.privacy.min_cell_count
+
+    def known_identifiers(self) -> set[str]:
+        """Identifiers that may appear verbatim in a redacted error message."""
+        return known_identifiers(self.profile, self.schemas)
+
 
 class _ToolInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -133,14 +175,38 @@ class GetSourceProfileInput(_ToolInput):
     table: str = Field(..., description="Source table name as staged, e.g. 'clinic_visits'.")
 
 
-class RunAggregateQueryInput(_ToolInput):
-    sql: str = Field(
+FilterOp = Literal["=", "<>", "<", ">", "<=", ">=", "is_null", "not_null", "in", "not_in", "like"]
+
+
+class RecordFilter(_ToolInput):
+    column: str = Field(..., description="A column of the counted table.")
+    op: FilterOp = Field(
         ...,
-        description="One read-only PostgreSQL SELECT (or WITH ... SELECT) statement that aggregates and returns "
-        "a count column named n, e.g. \"SELECT v.visit_type, COUNT(*) AS n FROM {src}.clinic_visits v WHERE "
-        "v.discharge_date IS NULL GROUP BY 1\". Use the schema placeholders {src}, {cdm}, {vocab}, {etl}. "
-        "Rows with n below the minimum cell count are withheld; at most 50 rows are shown.",
+        description="Comparison: =, <>, <, >, <=, >= and like (SQL LIKE pattern with % and _) take `value`; "
+        "in / not_in take `values`; is_null / not_null take neither.",
     )
+    value: str | int | float | None = Field(None, description="The value compared with (cast to the column's type).")
+    values: list[str | int | float] = Field(
+        default_factory=list, max_length=MAX_FILTER_VALUES, description="The list of values for in / not_in."
+    )
+
+
+class CountRecordsInput(_ToolInput):
+    table: str = Field(
+        ...,
+        description="'<schema>.<table>' where schema is src (staged source tables), cdm (CDM tables), vocab "
+        "(vocabulary tables) or etl (only etl.source_to_concept_map), e.g. 'cdm.condition_occurrence', "
+        "'src.clinic_visits', 'vocab.concept'.",
+    )
+    group_by: list[str] = Field(
+        default_factory=list,
+        max_length=3,
+        description="Up to 3 columns of the table to count by. Empty: one total count.",
+    )
+    filters: list[RecordFilter] = Field(
+        default_factory=list, max_length=10, description="Conditions on columns of the table, combined with AND."
+    )
+    limit: int = Field(50, ge=1, le=50, description="Largest groups shown (at most 50).")
 
 
 class UpdateFieldMappingInput(_ToolInput):
@@ -212,6 +278,17 @@ def _same_logic(a: FieldMapping, b: FieldMapping) -> bool:
     return a.model_dump(exclude={"rationale"}) == b.model_dump(exclude={"rationale"})
 
 
+def _same_mapping_logic(a: TableMapping, b: TableMapping) -> bool:
+    """Same source, joins, filter and field logic (rationales and field order aside)."""
+    if a.target_table.lower() != b.target_table.lower() or (a.source, a.joins) != (b.source, b.joins):
+        return False
+    if (a.where or "").strip() != (b.where or "").strip():
+        return False
+    fa = {f.target_field: f for f in a.fields}
+    fb = {f.target_field: f for f in b.fields}
+    return fa.keys() == fb.keys() and all(_same_logic(fa[n], fb[n]) for n in fa)
+
+
 def _mapping_diff(old: TableMapping | None, new: TableMapping) -> str:
     if old is None:
         return f"added table mapping {new.target_table} <- {new.source.table} ({len(new.fields)} fields)"
@@ -236,6 +313,508 @@ def _mapping_diff(old: TableMapping | None, new: TableMapping) -> str:
     return "replaced table mapping: " + ("; ".join(parts) if parts else "no functional change")
 
 
+@contextmanager
+def _readonly(conn: psycopg.Connection, timeout_ms: int = COUNT_TIMEOUT_MS) -> Iterator[psycopg.Connection]:
+    """A READ ONLY transaction (or savepoint) with a statement timeout, always rolled back."""
+    with conn.transaction(force_rollback=True):
+        execute(conn, "SET TRANSACTION READ ONLY")
+        execute(conn, f"SET LOCAL statement_timeout = {int(timeout_ms)}")
+        yield conn
+
+
+def _rows(conn: psycopg.Connection, query: Any, params: Iterable[Any] = (), limit: int | None = None) -> list[dict]:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(query, list(params))
+        if not cur.description:
+            return []
+        return list(cur.fetchmany(limit) if limit is not None else cur.fetchall())
+
+
+def _tables_in(conn: psycopg.Connection, schema: str) -> list[str]:
+    rows = _rows(conn, "SELECT table_name FROM information_schema.tables WHERE table_schema = %s", [schema])
+    return sorted(r["table_name"] for r in rows)
+
+
+def _columns_of(conn: psycopg.Connection, schema: str, table: str) -> dict[str, str]:
+    """column name -> data type, in table order."""
+    rows = _rows(
+        conn,
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+        [schema, table],
+    )
+    return {r["column_name"]: r["data_type"] for r in rows}
+
+
+def _find_name(name: str, names: Iterable[str]) -> str | None:
+    """``name`` as it exists in ``names``: exact, else the one case-insensitive match."""
+    names = list(names)
+    if name in names:
+        return name
+    matches = [n for n in names if n.lower() == name.lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+_QUOTED_IDENT = re.compile(r'"((?:[^"]|"")+)"')
+
+
+def _tokens(text: str | None) -> set[str]:
+    """Lower-cased identifiers and words of a SQL fragment, literals and comments removed."""
+    bare = strip_literals(text or "")
+    quoted = {m.replace('""', '"').lower() for m in _QUOTED_IDENT.findall(bare)}
+    return quoted | {m.lower() for m in _IDENT.findall(_QUOTED_IDENT.sub(" ", bare))}
+
+
+# ---- which columns may be grouped or filtered ----------------------------------------
+
+
+def _pii_pattern(name: str, state: RepairState) -> bool:
+    return any(re.search(p, name.lower()) for p in state.cfg.privacy.pii_name_patterns)
+
+
+def source_column_denial(state: RepairState, table: str, column: str) -> str | None:
+    """Why a staged source column may not be grouped or filtered (None if it may)."""
+    col = column.lower()
+    if col in pii_columns(state.profile, state.cfg.privacy).get(table.lower(), set()) or _pii_pattern(col, state):
+        return "a direct identifier (PII)"
+    tp = state.profile.table(table) if state.profile is not None else None
+    if tp is None and state.profile is not None:
+        tp = next((t for t in state.profile.tables if t.name.lower() == table.lower()), None)
+    cp = next((c for c in tp.columns if c.name.lower() == col), None) if tp is not None else None
+    if cp is None:  # no profile for it: judge by the name alone, as if it had very many values
+        if _is_key_column(col, sys.maxsize):
+            return "a patient, visit or record key"
+        return None
+    if cp.is_pii:
+        return "a direct identifier (PII)"
+    if _is_key_column(cp.name, cp.n_distinct):
+        return "a patient, visit or record key"
+    if cp.unique and cp.n_distinct >= state.min_cell_count and (
+        col.endswith("id") or (cp.n_distinct > KEY_MAX_LISTED_DISTINCT and cp.inferred_type in ("string", "integer"))
+    ):
+        return "a unique record identifier"
+    return None
+
+
+def _source_table_name(ref: str) -> str | None:
+    """The staged table a mapping's source/join table reference points at, or None."""
+    ref = ref.strip()
+    m = re.fullmatch(r"(?:\{src\}\.)?\"?([^\".{}]+)\"?", ref)
+    return m.group(1) if m else None
+
+
+_WINDOW_OR_SUBQUERY = re.compile(r"\b(select|over)\b", re.I)
+
+
+def _derived_from_identifier(state: RepairState, fm: FieldMapping, tm: TableMapping) -> str | None:
+    """Why a CDM field's values may reveal identifiers or individual records, per its spec mapping."""
+    if fm.kind not in ("column", "expression", "constant") or not fm.expression:
+        return None
+    bare = strip_literals(fm.expression)
+    if _WINDOW_OR_SUBQUERY.search(bare):
+        return "computed across records in the ETL spec (subquery or window function)"
+    for alias in [tm.source.alias] + [j.alias for j in tm.joins]:
+        if re.search(rf"(?<![\w.$]){re.escape(alias)}\b(?!\s*\.)", bare, re.I):
+            return f"built from whole source rows ({alias}) in the ETL spec"
+    tables = [t for t in (_source_table_name(r) for r in [tm.source.table] + [j.table for j in tm.joins]) if t]
+    for token in sorted(_tokens(fm.expression)):
+        for t in tables or [""]:
+            reason = source_column_denial(state, t, token)
+            if reason:
+                return f"loaded from {token}, {reason}, in the ETL spec"
+    return None
+
+
+def cdm_column_denial(state: RepairState, table: str, column: str) -> str | None:
+    """Why a CDM column may not be grouped or filtered (None if it may)."""
+    col = column.lower()
+    if col in ("person_id", "person_source_value"):
+        return "a person identifier"
+    if col.endswith("_id") and not col.endswith("_concept_id"):
+        return "a record identifier (CDM *_id column)"
+    if _pii_pattern(col, state):
+        return "a direct identifier (PII)"
+    for tm in state.spec.table_mappings:
+        if tm.target_table.lower() != table.lower():
+            continue
+        fm = next((f for f in tm.fields if f.target_field.lower() == col), None)
+        reason = _derived_from_identifier(state, fm, tm) if fm is not None else None
+        if reason:
+            return reason
+    return None
+
+
+# ---- count_records -------------------------------------------------------------------
+
+LOGICAL_SCHEMAS = ("src", "cdm", "vocab", "etl")
+ETL_COUNTABLE = ("source_to_concept_map",)
+ETL_DENIED = ("person_map", "visit_map")
+
+
+@lru_cache(maxsize=1)
+def _cdm_tables() -> frozenset[str]:
+    return frozenset(t.name for t in load_cdm_spec().cdm_tables)
+
+
+@lru_cache(maxsize=1)
+def _public_vocab_tables() -> frozenset[str]:
+    """The standardized vocabularies (Athena): public reference data. The source_to_concept_map is
+    site-specific (it lists local source values) and is not part of it."""
+    return frozenset(t.name for t in load_cdm_spec().vocab_tables if t.name != "source_to_concept_map")
+
+
+def _resolve_table(state: RepairState, name: str) -> tuple[str, str, str] | str:
+    """(logical schema, physical schema, table) or a message saying why the table can't be counted."""
+    m = re.fullmatch(r"\s*\{?([A-Za-z_]+)\}?\s*\.\s*\"?([^\".]+?)\"?\s*", name)
+    if not m or m.group(1).lower() not in LOGICAL_SCHEMAS:
+        return (
+            f"ERROR: table must be '<schema>.<table>' with schema one of {', '.join(LOGICAL_SCHEMAS)} "
+            f"(e.g. 'cdm.condition_occurrence' or 'src.clinic_visits'), got {name!r}"
+        )
+    logical, wanted = m.group(1).lower(), m.group(2)
+    if logical == "etl" and wanted.lower() in ETL_DENIED:
+        return (
+            f"REFUSED: etl.{wanted.lower()} maps source identifiers to CDM ids and cannot be queried. "
+            "Count the CDM table instead (unmatched records are reported as etlRecordRetention)."
+        )
+    physical = getattr(state.schemas, logical)
+    existing = _tables_in(state.conn, physical)
+    if logical == "cdm":
+        existing = [t for t in existing if t.lower() in _cdm_tables()]
+    elif logical == "vocab":
+        existing = [t for t in existing if t.lower() in _public_vocab_tables()]
+    elif logical == "etl":
+        existing = [t for t in existing if t.lower() in ETL_COUNTABLE]
+    table = _find_name(wanted, existing)
+    if table is None:
+        listed = ", ".join(existing) or "(none)"
+        return f"ERROR: no table {logical}.{wanted} that can be counted. {logical} tables: {listed}"
+    return logical, physical, table
+
+
+def _denial(state: RepairState, logical: str, table: str, column: str) -> str | None:
+    if logical == "src":
+        return source_column_denial(state, table, column)
+    if logical == "cdm":
+        return cdm_column_denial(state, table, column)
+    return None  # vocab (public) and etl.source_to_concept_map
+
+
+def _filter_sql(f: RecordFilter, column: str) -> tuple[pgsql.Composable, list[str]] | str:
+    ident = pgsql.Identifier(column)
+    if f.op in ("is_null", "not_null"):
+        return pgsql.SQL("{} IS NULL" if f.op == "is_null" else "{} IS NOT NULL").format(ident), []
+    if f.op in ("in", "not_in"):
+        if not f.values:
+            return f"filter on {f.column}: op '{f.op}' needs a non-empty `values` list"
+        marks = pgsql.SQL(", ").join([pgsql.Placeholder()] * len(f.values))
+        keyword = pgsql.SQL("IN" if f.op == "in" else "NOT IN")
+        return pgsql.SQL("{} {} ({})").format(ident, keyword, marks), [str(v) for v in f.values]
+    if f.value is None:
+        return f"filter on {f.column}: op '{f.op}' needs a `value` (use is_null / not_null for NULL)"
+    if f.op == "like":
+        return pgsql.SQL("{}::text LIKE {}").format(ident, pgsql.Placeholder()), [str(f.value)]
+    return pgsql.SQL("{} {} {}").format(ident, pgsql.SQL(f.op), pgsql.Placeholder()), [str(f.value)]
+
+
+def _describe_filter(f: RecordFilter, column: str) -> str:
+    if f.op in ("is_null", "not_null"):
+        return f"{column} {'IS NULL' if f.op == 'is_null' else 'IS NOT NULL'}"
+    if f.op in ("in", "not_in"):
+        return f"{column} {'IN' if f.op == 'in' else 'NOT IN'} ({', '.join(repr(v) for v in f.values)})"
+    return f"{column} {f.op.upper()} {f.value!r}"
+
+
+def _cell(v: Any) -> str:
+    s = "NULL" if v is None else str(v)
+    s = " ".join(s.split())
+    return s if len(s) <= 60 else s[:57] + "..."
+
+
+def _table_text(rows: list[dict], cols: list[str]) -> list[str]:
+    cells = [[_cell(r.get(c)) for c in cols] for r in rows]
+    widths = [max([len(c)] + [len(row[i]) for row in cells]) for i, c in enumerate(cols)]
+    lines = [" | ".join(c.ljust(w) for c, w in zip(cols, widths)).rstrip(), "-+-".join("-" * w for w in widths)]
+    lines += [" | ".join(v.ljust(w) for v, w in zip(row, widths)).rstrip() for row in cells]
+    return lines
+
+
+def count_records(state: RepairState, inp: CountRecordsInput) -> str:
+    """Counts only: the query is built here from the structured input, never from model SQL."""
+    k = state.min_cell_count
+    try:
+        with _readonly(state.conn):
+            resolved = _resolve_table(state, inp.table)
+            if isinstance(resolved, str):
+                return resolved
+            logical, physical, table = resolved
+            public = logical == "vocab"
+            columns = _columns_of(state.conn, physical, table)
+
+            def column(name: str) -> str | None:
+                bare = name.strip().strip('"')
+                if "." in bare and bare.split(".", 1)[0].lower() in (table.lower(), logical):
+                    bare = bare.split(".", 1)[1]
+                return _find_name(bare, columns)
+
+            group_by: list[str] = []
+            for name in inp.group_by:
+                col = column(name)
+                if col is None:
+                    return f"ERROR: {logical}.{table} has no column {name!r}. Columns: {', '.join(columns)}"
+                if col not in group_by:
+                    group_by.append(col)
+            filters: list[tuple[RecordFilter, str]] = []
+            for f in inp.filters:
+                col = column(f.column)
+                if col is None:
+                    return f"ERROR: {logical}.{table} has no column {f.column!r}. Columns: {', '.join(columns)}"
+                filters.append((f, col))
+
+            for col in dict.fromkeys(group_by + [c for _, c in filters]):
+                reason = _denial(state, logical, table, col)
+                if reason:
+                    return (
+                        f"REFUSED: {logical}.{table}.{col} is {reason}; it cannot be grouped or filtered. "
+                        "Identifiers can only be counted: drop it from group_by and filters."
+                    )
+            if group_by and not public and not state.cfg.privacy.send_values_to_llm:
+                values = [c for c in group_by if not c.lower().endswith("_concept_id")]
+                if values:
+                    return (
+                        f"REFUSED: privacy.send_values_to_llm is false, so only *_concept_id columns (and vocabulary "
+                        f"tables) can be grouped; {', '.join(values)} would show source values. Use filters and "
+                        "totals instead."
+                    )
+
+            where: list[pgsql.Composable] = []
+            params: list[str] = []
+            for f, col in filters:
+                built = _filter_sql(f, col)
+                if isinstance(built, str):
+                    return f"ERROR: {built}"
+                where.append(built[0])
+                params += built[1]
+            src = pgsql.SQL("FROM {} WHERE {}").format(
+                pgsql.Identifier(physical, table), pgsql.SQL(" AND ").join(where) if where else pgsql.SQL("TRUE")
+            )
+            label = f"{logical}.{table}"
+            if filters:
+                label += " WHERE " + " AND ".join(_describe_filter(f, c) for f, c in filters)
+
+            if not group_by:
+                n = int(_rows(state.conn, pgsql.SQL("SELECT COUNT(*) AS n {}").format(src), params)[0]["n"])
+                if public or n >= k:
+                    return f"{label}: n = {n}"
+                return f"{label}: n < {k} (totals below the minimum cell count of {k} are not shown)"
+
+            label += " GROUP BY " + ", ".join(group_by)
+            idents = pgsql.SQL(", ").join(pgsql.Identifier(c) for c in group_by)
+            n_name = "n" if "n" not in group_by else "n_records"
+            threshold = 0 if public else k
+            # positional ORDER BY: the count column, then the group columns
+            order = ", ".join([f"{len(group_by) + 1} DESC"] + [f"{i + 1} NULLS LAST" for i, _ in enumerate(group_by)])
+            main = pgsql.SQL(
+                "SELECT {g}, COUNT(*) AS {n} {src} GROUP BY {g} HAVING COUNT(*) >= %s ORDER BY {o} LIMIT %s"
+            ).format(g=idents, n=pgsql.Identifier(n_name), src=src, o=pgsql.SQL(order))
+            rows = _rows(state.conn, main, [*params, threshold, inp.limit])
+            stats = pgsql.SQL(
+                "SELECT COUNT(*) FILTER (WHERE n >= %s) AS shown, COUNT(*) FILTER (WHERE n < %s) AS withheld "
+                "FROM (SELECT COUNT(*) AS n {src} GROUP BY {g}) s"
+            ).format(src=src, g=idents)
+            st = _rows(state.conn, stats, [threshold, threshold, *params])[0]
+    except psycopg.Error as e:
+        values = {str(v) for f in inp.filters for v in [f.value, *f.values] if v is not None}
+        return f"ERROR: {redact_error(short_error(e), known=state.known_identifiers() | values)}"
+
+    shown, withheld = int(st["shown"]), int(st["withheld"])
+    lines = [label]
+    if rows:
+        lines += _table_text(rows, group_by + [n_name])
+    footer = f"({len(rows)} group(s) shown"
+    if shown > len(rows):
+        footer += f" of {shown}; raise limit (max 50) or add filters to see the rest"
+    if public:
+        footer += "; vocabulary tables are public reference data, not suppressed"
+    else:
+        footer += f"; {withheld} group(s) with fewer than {k} records withheld (small-cell suppression)"
+    lines.append(footer + ")")
+    return "\n".join(lines)
+
+
+# ---- error redaction -----------------------------------------------------------------
+
+WITHHELD = "<value withheld>"
+_ERROR_DETAIL = re.compile(r"\s*DETAIL:.*?(?=\s*HINT:|$)", re.S)
+_ERROR_HINT = re.compile(r"(\s*HINT:)")
+_ERROR_OUT_OF_RANGE = re.compile(r"(out of range: )(?!\")(\S+)")
+_ERROR_QUOTED = re.compile(r'"([^"]*)"')
+# PostgreSQL message fragments that may separate two quoted identifiers, e.g.
+# 'column "x" of relation "y"', 'relation "t" violates check constraint "c"'.
+_ERROR_CONNECTOR = re.compile(
+    r"\s+(of relation|of table|on table|in table|for|for table|or the column|and|violates "
+    r"(check|foreign key|unique|not-null|exclusion) constraint)\s+",
+    re.I,
+)
+# Text right before a quoted slot that holds a value, never an identifier: 'syntax for type date: "..."',
+# 'value "..." is out of range', 'invalid value "..." for "MM"'.
+_ERROR_VALUE_SLOT = re.compile(r"(:|\bvalue)\s*$", re.I)
+
+
+@lru_cache(maxsize=1)
+def _static_identifiers() -> frozenset[str]:
+    from ..cdm.ddl import ETL_TABLES
+
+    cdm = load_cdm_spec()
+    names = {t.name for t in cdm.tables.values()} | {f.name for t in cdm.tables.values() for f in t.fields}
+    names |= {f"xpk_{t.name}" for t in cdm.tables.values()}  # official primary key constraint names
+    for table, ddl in ETL_TABLES.items():
+        names |= {table, f"{table}_pkey"} | set(re.findall(r"^\s+(\w+)\s", ddl, re.M))
+    names |= {"person_map_person_id_key", "visit_map_visit_occurrence_id_key"}
+    return frozenset(n.lower() for n in names)
+
+
+def known_identifiers(profile: SourceProfile | None, schemas: Schemas | None) -> set[str]:
+    """CDM and ETL table/field names, staged source table/column names and the schema names."""
+    known = set(_static_identifiers())
+    if profile is not None:
+        for t in profile.tables:
+            known.add(t.name)
+            known |= {c.name for c in t.columns}
+    if schemas is not None:
+        known |= {schemas.cdm, schemas.vocab, schemas.src, schemas.etl, schemas.results}
+    return known
+
+
+def _context_identifiers(context: str | None) -> set[str]:
+    """Identifiers written in the SQL (as written and as PostgreSQL folds them); literals excluded."""
+    bare = strip_literals(context or "")
+    out = {m.replace('""', '"') for m in _QUOTED_IDENT.findall(bare)}
+    for word in _IDENT.findall(_QUOTED_IDENT.sub(" ", bare)):
+        out |= {word, word.lower()}
+    return out
+
+
+def _redact_segment(seg: str, known: set[str]) -> str:
+    """Keep quoted text only when it is exactly a known identifier in an identifier slot.
+
+    Values can contain double quotes, so from the first doubtful quoted token everything up to the
+    last quote of the segment is withheld (text after it is PostgreSQL's own)."""
+    if '"' not in seg:
+        return seg
+    tokens = list(_ERROR_QUOTED.finditer(seg))
+    start: int | None = None
+    for i, m in enumerate(tokens):
+        before = seg[tokens[i - 1].end() if i else 0 : m.start()]
+        if i and not _ERROR_CONNECTOR.fullmatch(before):
+            start = tokens[i - 1].start()  # unexpected text between two quoted tokens: may be a value
+            break
+        value = m.group(1)
+        if _ERROR_VALUE_SLOT.search(before) or not value or not all(p in known for p in value.split(".")):
+            start = m.start()
+            break
+    if start is None:
+        if seg.count('"') == 2 * len(tokens):
+            return seg
+        start = seg.index('"')  # a stray quote: the pairing above can't be trusted
+    last = seg.rfind('"')
+    return seg[:start] + f'"{WITHHELD}"' + (seg[last + 1 :] if last > start else "")
+
+
+def redact_error(message: str | None, context: str | None = "", known: Iterable[str] | None = None) -> str:
+    """A database error message with record values removed, fit for a prompt.
+
+    PostgreSQL errors can quote data: ``DETAIL: Failing row contains (...)``, ``Key (id)=(42)``,
+    ``invalid input syntax for type date: "31/02/1990"``, ``relation "<value>" does not exist``
+    (a value cast to ``regclass``). DETAIL sections are dropped. Quoted text (in the message and
+    in HINT) is kept only when it is exactly a known identifier - a CDM table/field name, a staged
+    source table/column, a schema name (``known``) or an identifier written in ``context`` (the
+    SQL) - and does not sit in a value slot; everything else becomes ``"<value withheld>"``.
+    """
+    msg = _ERROR_DETAIL.sub(" DETAIL: (withheld: may contain record values)", message or "")
+    names = set(_static_identifiers()) | _context_identifiers(context) | set(known or ())
+    parts = _ERROR_HINT.split(msg)  # [message, " HINT:", hint, ...]
+    msg = "".join(p if i % 2 else _redact_segment(p, names) for i, p in enumerate(parts))
+    return _ERROR_OUT_OF_RANGE.sub(rf"\1{WITHHELD}", msg)
+
+
+# ---- spec edits ----------------------------------------------------------------------
+
+_TABLE_REF = re.compile(
+    r"(?:\{(?P<ph>src|vocab|etl)\}\.)?(?:(?P<bare>[A-Za-z_][A-Za-z0-9_$]*)|\"(?P<quoted>[^\"]+)\")"
+)
+
+
+def _table_ref_issue(state: RepairState, ref: str) -> str | None:
+    m = _TABLE_REF.fullmatch(ref.strip())
+    if not m:
+        return (
+            f"table {ref!r} must be a staged source table name, or a table qualified with {{src}}, {{vocab}} or "
+            "{etl} (other schemas and subqueries are not allowed)"
+        )
+    schema = getattr(state.schemas, m.group("ph") or "src")
+    # as the compiler emits it: a bare name is quoted as written, a qualified one is folded by PostgreSQL
+    name = m.group("quoted") or (m.group("bare").lower() if m.group("ph") else m.group("bare"))
+    if name not in _tables_in(state.conn, schema):
+        where = f"{{{m.group('ph')}}}" if m.group("ph") else "the staged source"
+        return f"table {ref!r} does not exist in {where}"
+    return None
+
+
+def _pii_tokens(state: RepairState, tm: TableMapping) -> list[str]:
+    """Direct-identifier columns of the mapping's source tables named anywhere in its SQL (also
+    unqualified); complements ``privacy.pii_references``, which follows alias.column references."""
+    pii = pii_columns(state.profile, state.cfg.privacy)
+    texts = [f.expression for f in tm.fields] + [tm.where] + [j.on for j in tm.joins]
+    tokens = set().union(*(_tokens(t) for t in texts))
+    hits: list[str] = []
+    for ref in [tm.source.table] + [j.table for j in tm.joins]:
+        table = _source_table_name(ref)
+        if table is None:
+            continue
+        cols = set(pii.get(table.lower(), set()))
+        cols |= {c.lower() for c in _columns_of(state.conn, state.schemas.src, table) if _pii_pattern(c, state)}
+        hits += [f"{table}.{c}" for c in sorted(tokens & cols)]
+    return hits
+
+
+_ID_MAP_KEYS = {
+    ("person", "person_id"): "person id map (kind person_id)",
+    ("visit_occurrence", "visit_occurrence_id"): "visit id map (kind visit_id)",
+}
+
+
+def mapping_issues(state: RepairState, tm: TableMapping) -> list[str]:
+    """Why ``tm`` may not be applied (empty when it may); checked before compiling."""
+    issues: list[str] = []
+    for fm in tm.fields:
+        issues += [f"{fm.target_field} expression {i}" for i in fragment_issues(fm.expression)]
+    issues += [f"where {i}" for i in fragment_issues(tm.where)]
+    for j in tm.joins:
+        issues += [f"join {j.alias} condition {i}" for i in fragment_issues(j.on)]
+    with _readonly(state.conn):
+        for ref in [tm.source.table] + [j.table for j in tm.joins]:
+            issue = _table_ref_issue(state, ref)
+            if issue:
+                issues.append(issue)
+        pii = list(dict.fromkeys(pii_references(tm, state.profile, state.cfg.privacy) + _pii_tokens(state, tm)))
+    if pii:
+        issues.append(
+            f"reads direct-identifier (PII) column(s) {', '.join(pii)}; direct identifiers must never be loaded "
+            "into the CDM"
+        )
+    target = tm.target_table.lower()
+    for fm in tm.fields:
+        name = fm.target_field.lower()
+        id_map = _ID_MAP_KEYS.get((target, name))
+        if fm.kind == "auto_id" and id_map:
+            issues.append(f"{target}.{name} cannot be auto_id: it must come from the {id_map}")
+        if name == "person_id" and fm.kind != "person_id":
+            issues.append(f"{target}.person_id must use kind person_id (the person id map), not {fm.kind}")
+    return issues
+
+
 def validate_mapping(tm: TableMapping, spec: ETLSpec, conn: psycopg.Connection, schemas: Schemas) -> str | None:
     """None if ``tm`` compiles and its INSERT EXPLAINs cleanly, else the error."""
     from ..etl.compiler import compile_table
@@ -248,7 +827,7 @@ def validate_mapping(tm: TableMapping, spec: ETLSpec, conn: psycopg.Connection, 
         with rollback_only(conn):
             execute(conn, "EXPLAIN\n" + sql.rstrip().rstrip(";"))
     except psycopg.Error as e:
-        return f"EXPLAIN failed: {short_error(e)}"
+        return f"EXPLAIN failed: {redact_error(short_error(e), sql, known_identifiers(None, schemas))}"
     return None
 
 
@@ -261,6 +840,9 @@ def _apply(
     change: str,
     rationale: str,
 ) -> str:
+    issues = mapping_issues(state, new_tm)
+    if issues:
+        return "REJECTED: " + "; ".join(issues)
     mappings = list(state.spec.table_mappings)
     if pos is None:
         mappings.append(new_tm)
@@ -286,157 +868,6 @@ def _apply(
         "The table compiles and EXPLAINs cleanly; runtime errors (e.g. NOT NULL violations) show up when "
         "the ETL is rebuilt after you finish."
     )
-
-
-# ---- aggregate queries ---------------------------------------------------------------
-
-_LITERAL_OR_COMMENT = re.compile(r"'(?:[^']|'')*'|--[^\n]*|/\*.*?\*/", re.S)
-_QUOTED_IDENT = re.compile(r'"((?:[^"]|"")+)"')
-_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
-_STAR = re.compile(r"(\bselect\s+(?:all\s+|distinct\s+)?|,\s*|\.)\*", re.I)
-_COUNT_STAR = re.compile(r"\bcount\s*\(\s*\*\s*\)", re.I)
-_DENIED_FUNCTIONS = re.compile(
-    r"\b(string_agg|array_agg|json_agg|jsonb_agg|json_object_agg|jsonb_object_agg|xmlagg|row_to_json|to_json|"
-    r"to_jsonb|json_build_object|jsonb_build_object|json_build_array|jsonb_build_array|pg_read_file|"
-    r"pg_read_binary_file|pg_ls_dir|pg_stat_file|lo_import|lo_export|lo_get|dblink\w*|pg_sleep\w*|"
-    r"set_config|copy)\s*\(",
-    re.I,
-)
-
-
-_ERROR_DETAIL = re.compile(r"\s*DETAIL:.*?(?=\s*HINT:|$)", re.S)
-_ERROR_QUOTED = re.compile(r'"([^"]*)"')
-_ERROR_OUT_OF_RANGE = re.compile(r"(out of range: )(\S+)")
-_ERROR_NAMED_OBJECT = re.compile(
-    r"\b(constraint|index|relation|table|column|schema|function|operator|type|sequence|role|database)\s+$", re.I
-)
-
-
-@lru_cache(maxsize=1)
-def _cdm_names() -> frozenset[str]:
-    cdm = load_cdm_spec()
-    return frozenset({t.name for t in cdm.tables.values()} | {f.name for t in cdm.tables.values() for f in t.fields})
-
-
-def redact_error(message: str | None, context: str | None = "") -> str:
-    """A database error message with record values removed, fit for a prompt.
-
-    PostgreSQL errors can quote data: ``DETAIL: Failing row contains (...)``, ``Key (id)=(42)``,
-    ``invalid input syntax for type date: "31/02/1990"``. DETAIL sections are dropped, and quoted
-    text is kept only when it names a database object (``constraint "x"``, ``column "y"``), a CDM
-    table/field, or an identifier used in ``context`` (the SQL).
-    """
-    msg = _ERROR_DETAIL.sub(" DETAIL: (withheld: may contain record values)", message or "")
-    known = _cdm_names() | {m.lower() for m in _IDENT.findall(context or "")}
-
-    def quoted(m: re.Match[str]) -> str:
-        value, before = m.group(1), msg[: m.start()]
-        if value.lower() in known or value.split(".")[-1].lower() in known or _ERROR_NAMED_OBJECT.search(before):
-            return m.group(0)
-        return '"<value withheld>"'
-
-    msg = _ERROR_QUOTED.sub(quoted, msg)
-    return _ERROR_OUT_OF_RANGE.sub(r"\1<value withheld>", msg)
-
-
-def _pii_columns(state: RepairState) -> set[str]:
-    cols = {c.split(".")[-1].strip().lower() for c in state.cfg.privacy.pii_columns if c.strip()}
-    if state.profile is not None:
-        cols |= {c.name.lower() for t in state.profile.tables for c in t.columns if c.is_pii}
-    return cols
-
-
-def _identifiers(bare_sql: str) -> set[str]:
-    quoted = {m.replace('""', '"').lower() for m in _QUOTED_IDENT.findall(bare_sql)}
-    return quoted | {m.lower() for m in _IDENT.findall(_QUOTED_IDENT.sub(" ", bare_sql))}
-
-
-def _check_query(sql: str, state: RepairState) -> str | None:
-    """Why the query is refused, or None."""
-    bare = _LITERAL_OR_COMMENT.sub(" ", sql).strip()
-    if ";" in bare:
-        return "only one statement is allowed."
-    if not re.match(r"(?is)^(select|with)\b", bare):
-        return "only a single read-only SELECT (or WITH ... SELECT) query is allowed."
-    if _STAR.search(_COUNT_STAR.sub("count(1)", bare)):
-        return "SELECT * is not allowed; name the columns you aggregate over."
-    denied = _DENIED_FUNCTIONS.search(bare)
-    if denied:
-        return f"refused: {denied.group(1)}() is not allowed in aggregate queries."
-    idents = _identifiers(bare)
-    pii = sorted(idents & _pii_columns(state))
-    if state.profile is None:  # no profile: fall back to the configured identifier name patterns
-        pii += sorted(i for i in idents if any(re.search(p, i) for p in state.cfg.privacy.pii_name_patterns))
-    if pii:
-        return (
-            f"refused: the query references direct-identifier (PII) columns ({', '.join(dict.fromkeys(pii))}). "
-            "Only aggregate queries over non-identifying columns are allowed."
-        )
-    if "n" not in idents:
-        return "the query must return a count column named n (e.g. COUNT(*) AS n)."
-    return None
-
-
-def _count(v: Any) -> float | None:
-    if isinstance(v, bool) or v is None:
-        return None
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _cell(v: Any) -> str:
-    s = "NULL" if v is None else str(v)
-    s = " ".join(s.split())
-    return s if len(s) <= 60 else s[:57] + "..."
-
-
-def _format_rows(rows: list[dict], withheld: int, min_n: int, examined_all: bool) -> str:
-    if not rows and not withheld:
-        return "0 rows."
-    lines: list[str] = []
-    shown = rows[:QUERY_SHOW_LIMIT]
-    if shown:
-        cols = list(shown[0].keys())
-        cells = [[_cell(r.get(c)) for c in cols] for r in shown]
-        widths = [max([len(c)] + [len(row[i]) for row in cells]) for i, c in enumerate(cols)]
-        lines.append(" | ".join(c.ljust(w) for c, w in zip(cols, widths)).rstrip())
-        lines.append("-+-".join("-" * w for w in widths))
-        lines += [" | ".join(v.ljust(w) for v, w in zip(row, widths)).rstrip() for row in cells]
-    footer = f"({len(shown)} row(s) shown"
-    if len(rows) > len(shown):
-        footer += f" of {len(rows)}; aggregate further to see the rest"
-    if withheld:
-        footer += f"; {withheld} row(s) withheld because n < {min_n} (small-cell suppression)"
-    if not examined_all:
-        footer += f"; only the first {QUERY_FETCH_LIMIT} result rows were examined"
-    lines.append(footer + ")")
-    return "\n".join(lines)
-
-
-def run_aggregate_query(state: RepairState, sql: str) -> str:
-    """Run an aggregate-only, read-only query with small-cell suppression. Errors come back as text."""
-    sql = sql.strip().rstrip(";").strip()
-    refusal = _check_query(sql, state)
-    if refusal:
-        return f"ERROR: {refusal}"
-    try:
-        rows = readonly_query(state.conn, state.schemas.render(sql), limit=QUERY_FETCH_LIMIT)
-    except psycopg.Error as e:
-        return f"ERROR: {redact_error(short_error(e), sql)}"
-    if rows and "n" not in rows[0]:
-        return "ERROR: the result has no column named n; return the group size as COUNT(*) AS n."
-    min_n = state.cfg.privacy.min_cell_count
-    kept: list[dict] = []
-    withheld = 0
-    for r in rows:
-        n = _count(r.get("n"))
-        if n is None or n < min_n:
-            withheld += 1
-        else:
-            kept.append(r)
-    return _format_rows(kept, withheld, min_n, examined_all=len(rows) < QUERY_FETCH_LIMIT)
 
 
 # --------------------------------------------------------------------------------------
@@ -478,8 +909,8 @@ def build_repair_tools(state: RepairState) -> list[AgentTool]:
             return f"ERROR: no source table named {inp.table!r}. Profiled tables: {names}"
         return profile_prompt_text(state.profile, state.cfg.privacy, tables=[inp.table])
 
-    def aggregate_query(inp: RunAggregateQueryInput) -> str:
-        return run_aggregate_query(state, inp.sql)
+    def count(inp: CountRecordsInput) -> str:
+        return count_records(state, inp)
 
     def update_field_mapping(inp: UpdateFieldMappingInput) -> str:
         pos, n = _locate(state.spec, inp.target_table, inp.mapping_index)
@@ -503,6 +934,11 @@ def build_repair_tools(state: RepairState) -> list[AgentTool]:
             rationale=inp.rationale,
         )
         old_fm = next((f for f in old_tm.fields if f.target_field == target_field), None)
+        if old_fm is not None and _same_logic(old_fm, new_fm):
+            return (
+                f"UNCHANGED: {old_tm.target_table}.{target_field} already maps as {_fm_text(old_fm)}; nothing to "
+                "apply (no repair recorded)."
+            )
         if old_fm is not None:
             fields = [new_fm if f.target_field == target_field else f for f in old_tm.fields]
         else:
@@ -531,9 +967,15 @@ def build_repair_tools(state: RepairState) -> list[AgentTool]:
         if pos is None and inp.mapping_index != n:
             return f"REJECTED: {inp.target_table} has {n} mapping(s); mapping_index must be 0..{n}"
         old_tm = state.spec.table_mappings[pos] if pos is not None else None
+        if old_tm is not None and _same_mapping_logic(old_tm, new_tm):
+            return (
+                f"UNCHANGED: the new {inp.target_table} mapping #{inp.mapping_index} is the same as the current "
+                "one; nothing to apply (no repair recorded)."
+            )
         change = _mapping_diff(old_tm, new_tm)
         return _apply(state, pos, new_tm, target_field=None, change=change, rationale=inp.rationale)
 
+    k = state.min_cell_count
     return [
         AgentTool(
             "get_table_mapping",
@@ -555,24 +997,30 @@ def build_repair_tools(state: RepairState) -> list[AgentTool]:
             get_source_profile,
         ),
         AgentTool(
-            "run_aggregate_query",
-            "Run one read-only aggregate SELECT against the source ({src}), CDM ({cdm}), vocabulary ({vocab}) "
-            "or ETL working ({etl}) schemas. It must return a count column named n; groups with n below the "
-            "minimum cell count are withheld and direct identifiers cannot be queried.",
-            RunAggregateQueryInput,
-            aggregate_query,
+            "count_records",
+            "Count the records of one table - a staged source table (src.<table>), a CDM table (cdm.<table>), a "
+            "vocabulary table (vocab.<table>) or etl.source_to_concept_map - optionally grouped by up to 3 of "
+            "its columns and filtered with simple conditions (combined with AND). Returns counts only, largest "
+            f"groups first: groups with fewer than {k} records are withheld (their number is reported) and a "
+            f"total below {k} is shown as '<{k}'. Vocabulary tables are public reference data and are not "
+            "suppressed. Patient, visit and record identifiers, direct identifiers (PII) and CDM *_id columns "
+            "(except *_concept_id) cannot be grouped or filtered, and the person/visit id maps cannot be counted.",
+            CountRecordsInput,
+            count,
         ),
         AgentTool(
             "update_field_mapping",
-            "Set how one CDM field is populated (replaces the field's mapping, or adds it). Applied only if the "
-            "table still compiles and EXPLAINs cleanly; otherwise returns REJECTED with the error.",
+            "Set how one CDM field is populated (replaces the field's mapping, or adds it). Applied only if it "
+            "passes the SQL and privacy checks and the table still compiles and EXPLAINs cleanly; otherwise "
+            "returns REJECTED with the reason.",
             UpdateFieldMappingInput,
             update_field_mapping,
         ),
         AgentTool(
             "replace_table_mapping",
             "Replace a whole table mapping (source, joins, where, fields) with a new one given as YAML. Applied "
-            "only if it compiles and EXPLAINs cleanly; otherwise returns REJECTED with the error.",
+            "only if it passes the SQL and privacy checks and compiles and EXPLAINs cleanly; otherwise returns "
+            "REJECTED with the reason.",
             ReplaceTableMappingInput,
             replace_table_mapping,
         ),
@@ -603,17 +1051,50 @@ def _clip(text: str | None, n: int) -> str:
     return text if len(text) <= n else text[:n] + "\n... (truncated)"
 
 
+def _small_count(n: int | None, k: int) -> str:
+    """A record count for a prompt: counts between 1 and k-1 are shown as '<k'."""
+    if n is None:
+        return "?"
+    return f"<{k}" if 0 < n < k else str(n)
+
+
+def _check_summary(r: CheckResult, k: int) -> tuple[str, str]:
+    """(one-line summary, description) with violated/denominator counts below k suppressed."""
+    v, d = r.num_violated_rows, r.num_denominator_rows
+    if not (0 < v < k or 0 < d < k):
+        head = (
+            f"{r.key} ({r.severity}): {v} of {d} ({r.pct_violated_rows:.2%}) violated, threshold {r.threshold_pct:g}%"
+        )
+        return head, r.description
+    pct = f"<{k / d:.2%}" if d >= k and v < k else "percentage withheld"
+    head = (
+        f"{r.key} ({r.severity}): {_small_count(v, k)} of {_small_count(d, k)} ({pct}) violated, threshold "
+        f"{r.threshold_pct:g}% (counts below {k} are not shown)"
+    )
+    description = r.description.replace(f"{v} of {d}", f"{_small_count(v, k)} of {_small_count(d, k)}")
+    return head, description
+
+
 def build_repair_prompt(
-    spec: ETLSpec, iteration: int, etl_errors: list[TableLoadResult], checks: list[CheckResult], cfg: ProjectConfig
+    spec: ETLSpec,
+    iteration: int,
+    etl_errors: list[TableLoadResult],
+    checks: list[CheckResult],
+    cfg: ProjectConfig,
+    *,
+    profile: SourceProfile | None = None,
+    schemas: Schemas | None = None,
 ) -> str:
+    k = cfg.privacy.min_cell_count
+    known = known_identifiers(profile, schemas)
     lines: list[str] = [f"Repair iteration {iteration} of at most {cfg.quality.max_repair_iterations}."]
     if etl_errors:
         lines.append(f"The last ETL build failed: {len(etl_errors)} step(s) raised an error.\n\nFAILED ETL STEPS")
         for i, s in enumerate(etl_errors, 1):
             lines.append(f"{i}. step {s.step} (target table {s.target_table})")
-            lines.append(f"   error: {redact_error(s.error, s.sql)}")
+            lines.append(f"   error: {redact_error(s.error, s.sql, known)}")
             if s.source_rows is not None:
-                lines.append(f"   source rows: {s.source_rows}")
+                lines.append(f"   source rows: {_small_count(s.source_rows, k)}")
             if s.sql:
                 lines.append("   failing SQL:\n```sql\n" + _clip(s.sql, 4000) + "\n```")
     else:
@@ -621,12 +1102,17 @@ def build_repair_prompt(
             f"The data-quality checks found {len(checks)} failure(s) with a severity the pipeline repairs "
             f"({', '.join(cfg.quality.repair_severities)}; blocking: {', '.join(cfg.quality.blocking_severities)}). "
             "Percentages are of the check's denominator; a check fails when the percentage exceeds its threshold."
+            f" Counts below the minimum cell count are shown as <{k}."
             "\n\nFAILED CHECKS"
         )
         for i, r in enumerate(checks[:MAX_FAILURES_IN_PROMPT], 1):
-            head = f"{r.key} ({r.severity}): ERROR {redact_error(r.error, r.sql)}" if r.error else summarize(r)
+            if r.error:  # the description of an errored check can repeat the error text
+                head = f"{r.key} ({r.severity}): ERROR {redact_error(r.error, r.sql, known)}"
+                description = redact_error(r.description, r.sql, known)
+            else:
+                head, description = _check_summary(r, k)
             lines.append(f"{i}. {head}")
-            lines.append(f"   {r.check_level} check: {r.description}")
+            lines.append(f"   {r.check_level} check: {description}")
             if r.sql:
                 lines.append("   check SQL:\n```sql\n" + _clip(r.sql, 1500) + "\n```")
         if len(checks) > MAX_FAILURES_IN_PROMPT:
@@ -714,7 +1200,7 @@ def repair_spec(
         trigger=", ".join(keys)[:500],
         table_triggers=table_triggers,
     )
-    prompt = build_repair_prompt(spec, iteration, etl_errors, checks, cfg)
+    prompt = build_repair_prompt(spec, iteration, etl_errors, checks, cfg, profile=profile, schemas=schemas)
     try:
         result = llm.run_agent(
             stage="repair",

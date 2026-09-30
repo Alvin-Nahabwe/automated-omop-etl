@@ -9,8 +9,12 @@ whose result is 0 when a source value exists but has no mapping.
 
 A full compile yields ordered steps: id maps, table inserts (in CDM load order, each followed
 by its custom SQL), remaining custom SQL, the derived observation period, and the
-``cdm_source`` row. The generated SQL is written to ``sql/*.sql`` for humans to review, so it
-is laid out one field per line with the field kind as a trailing comment.
+``cdm_source`` row. After the person (and visit_occurrence) load an id-map pruning step removes
+keys that did not become a row, so events of people or visits that a mapping filtered out are
+dropped (or get a NULL visit) instead of pointing at rows that do not exist. The id maps are
+never truncated: ids are kept across runs so stored cohorts stay valid, and new keys get ids
+after the largest existing one. The generated SQL is written to ``sql/*.sql`` for humans to
+review, so it is laid out one field per line with the field kind as a trailing comment.
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ StepKind = Literal["id_map", "insert", "custom", "derived", "metadata"]
 
 # Kinds whose ``expression`` must be given.
 _NEEDS_EXPRESSION = {"column", "expression", "constant", "concept_map", "vocab_code", "person_id", "visit_id"}
+# Keys that other tables link to through an id map: (table, field) -> the kind that fills them.
+ID_MAP_KEYS = {("person", "person_id"): "person_id", ("visit_occurrence", "visit_occurrence_id"): "visit_id"}
 _ALIAS_REF = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)")
 _STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
 
@@ -43,7 +49,17 @@ class CompiledStep:
     kind: StepKind
     sql: str
     source_table: str | None = None
+    # COUNT(*) of the source rows after the mapping's own joins and WHERE
     source_count_sql: str | None = None
+    # ... that also survive the INNER person/visit id-map joins, without the vocabulary lookup
+    # joins (which can fan out 1-to-many): source - retained = records dropped
+    retained_count_sql: str | None = None
+    # skip this step when a step loading this CDM table failed (id-map pruning must not
+    # discard the ids of rows whose load merely errored)
+    requires: str | None = None
+    # the spec objects (TableMapping, KeySpec, CustomSQL) whose SQL this step executes, so the
+    # runner can re-check them before running anything
+    origins: tuple[TableMapping | KeySpec | CustomSQL, ...] = ()
     error: str | None = None  # set instead of raising when compile_spec(strict=False)
 
 
@@ -130,6 +146,7 @@ class _Joins:
         self.taken = set(taken)
         self.counters: dict[str, int] = {}
         self.lines: list[str] = []
+        self.id_lines: list[str] = []  # INNER id-map joins: they drop rows (see retained_count_sql)
         self.vocab: dict[tuple[str, str], dict[str, str | None]] = {}
         self.stcm: dict[tuple[str, str], str] = {}
         self._vocab_line_index: dict[tuple[str, str], int] = {}
@@ -147,13 +164,18 @@ class _Joins:
 
     def person(self, expr: str) -> str:
         a = self.alias("pm")
-        self.lines.append(f"INNER JOIN {{etl}}.person_map {a} ON {a}.source_value = {_p(expr)}::text")
+        line = f"INNER JOIN {{etl}}.person_map {a} ON {a}.source_value = {_p(expr)}::text"
+        self.lines.append(line)
+        self.id_lines.append(line)
         return f"{a}.person_id"
 
     def visit(self, expr: str, inner: bool) -> str:
         a = self.alias("vm")
         jt = "INNER" if inner else "LEFT"
-        self.lines.append(f"{jt} JOIN {{etl}}.visit_map {a} ON {a}.source_value = {_p(expr)}::text")
+        line = f"{jt} JOIN {{etl}}.visit_map {a} ON {a}.source_value = {_p(expr)}::text"
+        self.lines.append(line)
+        if inner:
+            self.id_lines.append(line)  # a LEFT join on the map's unique key neither drops nor adds rows
         return f"{a}.visit_occurrence_id"
 
     def vocab_code(self, expr: str, vocabulary: str, standard: bool) -> str:
@@ -211,6 +233,12 @@ def _field_value(fm: FieldMapping, f: CdmField, table: CdmTable, tm: TableMappin
         if not f.is_pk:
             pk = table.primary_key or "none"
             raise CompileError(f"{where}: auto_id is only allowed on the table's primary key ({pk})")
+        if (table.name, f.name) in ID_MAP_KEYS:
+            raise CompileError(
+                f"{where}: auto_id is not allowed here; use kind {ID_MAP_KEYS[(table.name, f.name)]} so the id "
+                "comes from the id map that other tables link through (auto_id would follow row order and "
+                "attach events to the wrong rows)"
+            )
         value = f"(SELECT COALESCE(MAX({qi(f.name)}), 0) FROM {{cdm}}.{qi(table.name)}) + ROW_NUMBER() OVER ()"
         return cast_to(value, f.datatype)
     if kind == "person_id":
@@ -257,6 +285,11 @@ def _check_mapping(tm: TableMapping) -> CdmTable:
 
 def _compile_insert(tm: TableMapping, spec: ETLSpec) -> str:
     """Unrendered INSERT (placeholders kept)."""
+    return _compile(tm, spec)[0]
+
+
+def _compile(tm: TableMapping, spec: ETLSpec) -> tuple[str, str]:
+    """Unrendered (INSERT, retained-row COUNT) of one table mapping."""
     table = _check_mapping(tm)
     by_name = {fm.target_field: fm for fm in tm.fields}
     ordered = [(f, by_name[f.name]) for f in table.fields if f.name in by_name]
@@ -282,11 +315,11 @@ def _compile_insert(tm: TableMapping, spec: ETLSpec) -> str:
     out += joins.lines
     if tm.where and tm.where.strip():
         out.append(f"WHERE {_p(tm.where)}")
-    return "\n".join(out) + ";"
+    return "\n".join(out) + ";", _source_count(tm, joins.id_lines)
 
 
-def _source_count(tm: TableMapping) -> str:
-    lines = ["SELECT COUNT(*) AS n", *_from_clause(tm)]
+def _source_count(tm: TableMapping, id_joins: list[str] | None = None) -> str:
+    lines = ["SELECT COUNT(*) AS n", *_from_clause(tm), *(id_joins or [])]
     if tm.where and tm.where.strip():
         lines.append(f"WHERE {_p(tm.where)}")
     return "\n".join(lines)
@@ -302,29 +335,64 @@ def source_count_sql(tm: TableMapping, schemas: Schemas) -> str:
     return schemas.render(_source_count(tm))
 
 
+def retained_count_sql(tm: TableMapping, spec: ETLSpec, schemas: Schemas) -> str:
+    """``SELECT COUNT(*)`` of the source rows that also survive the INNER person/visit id-map joins.
+
+    The vocabulary lookups are left out: a code with several 'Maps to' targets (or several
+    source_to_concept_map rows) inserts several CDM rows, and that fan-out must not hide rows
+    that were dropped. Raises ``CompileError``.
+    """
+    return schemas.render(_compile(tm, spec)[1])
+
+
 # --------------------------------------------------------------------------------------
 # id maps, derived tables, metadata
 # --------------------------------------------------------------------------------------
 
 
 def _person_map_sql(key: KeySpec) -> str:
+    expr = _p(key.expression)
     return "\n".join(
         [
-            _comment(f"person id map: one person_id per distinct {key.table}.{_norm(key.expression)}"),
-            "TRUNCATE TABLE {etl}.person_map;",
+            _comment(
+                f"person id map: one person_id per distinct {key.table}.{_norm(key.expression)}.\n"
+                "The map is kept across runs, so a person keeps their person_id on every rebuild (stored\n"
+                "cohorts stay valid): only keys not yet in the map are added, numbered after the largest\n"
+                "existing person_id in key order. Keys that do not become a person are removed by the\n"
+                "pruning step after the person load."
+            ),
             "INSERT INTO {etl}.person_map (source_value, person_id)",
-            "SELECT k.source_value, (ROW_NUMBER() OVER (ORDER BY k.source_value))::integer",
+            "SELECT k.source_value,",
+            "    ((SELECT COALESCE(MAX(person_id), 0) FROM {etl}.person_map)"
+            " + ROW_NUMBER() OVER (ORDER BY k.source_value))::integer",
             "FROM (",
-            f"    SELECT DISTINCT {_p(key.expression)}::text AS source_value",
+            f"    SELECT DISTINCT {expr}::text AS source_value",
             f"    FROM {source_ref(key.table)}",
-            f"    WHERE {_p(key.expression)} IS NOT NULL",
-            ") k;",
+            f"    WHERE {expr} IS NOT NULL",
+            ") k",
+            "WHERE NOT EXISTS (SELECT 1 FROM {etl}.person_map pm WHERE pm.source_value = k.source_value)",
+            "ON CONFLICT DO NOTHING;",
         ]
     )
 
 
-def _visit_person_expr(spec: ETLSpec) -> tuple[str, str] | None:
-    """(alias, person expression) from a mapping that reads the visit table, if one is usable."""
+def _person_map_prune_sql() -> str:
+    return "\n".join(
+        [
+            _comment(
+                "person id map: drop the keys that did not become a person (the person mapping's WHERE or\n"
+                "joins filtered them out), so the INNER JOIN on person_map drops their events instead of\n"
+                "loading rows whose person_id is not in person. The ids of everyone kept are unchanged.\n"
+                "Skipped by the runner when the person load failed."
+            ),
+            "DELETE FROM {etl}.person_map pm",
+            "WHERE NOT EXISTS (SELECT 1 FROM {cdm}.person p WHERE p.person_id = pm.person_id);",
+        ]
+    )
+
+
+def _visit_person_mapping(spec: ETLSpec) -> TableMapping | None:
+    """A mapping that reads the visit table and whose person expression uses only its source alias."""
     vk = spec.visit_key
     if vk is None:
         return None
@@ -336,8 +404,17 @@ def _visit_person_expr(spec: ETLSpec) -> tuple[str, str] | None:
             continue
         refs = {a for a, _ in alias_refs(pf.expression)}
         if refs <= {tm.source.alias.lower()}:
-            return tm.source.alias, pf.expression  # type: ignore[return-value]
+            return tm
     return None
+
+
+def _visit_person_expr(spec: ETLSpec) -> tuple[str, str] | None:
+    """(alias, person expression) from a mapping that reads the visit table, if one is usable."""
+    tm = _visit_person_mapping(spec)
+    if tm is None:
+        return None
+    pf = next(f for f in tm.fields if f.kind == "person_id" and f.expression)
+    return tm.source.alias, pf.expression  # type: ignore[return-value]
 
 
 def _visit_map_sql(spec: ETLSpec) -> str:
@@ -348,16 +425,41 @@ def _visit_map_sql(spec: ETLSpec) -> str:
     person_sql = f"MIN({_p(person[1])}::text)" if person else "NULL::text"
     return "\n".join(
         [
-            _comment(f"visit id map: one visit_occurrence_id per distinct {vk.table}.{_norm(vk.expression)}"),
-            "TRUNCATE TABLE {etl}.visit_map;",
+            _comment(
+                f"visit id map: one visit_occurrence_id per distinct {vk.table}.{_norm(vk.expression)}.\n"
+                "Kept across runs like the person id map: only new keys are added, numbered after the\n"
+                "largest existing visit_occurrence_id in key order; keys that do not become a visit are\n"
+                "removed by the pruning step after the visit_occurrence load."
+            ),
             "INSERT INTO {etl}.visit_map (source_value, visit_occurrence_id, person_source_value)",
-            "SELECT k.source_value, (ROW_NUMBER() OVER (ORDER BY k.source_value))::integer, k.person_source_value",
+            "SELECT k.source_value,",
+            "    ((SELECT COALESCE(MAX(visit_occurrence_id), 0) FROM {etl}.visit_map)"
+            " + ROW_NUMBER() OVER (ORDER BY k.source_value))::integer,",
+            "    k.person_source_value",
             "FROM (",
             f"    SELECT {_p(vk.expression)}::text AS source_value, {person_sql} AS person_source_value",
             f"    FROM {source_ref(vk.table)} {alias}",
             f"    WHERE {_p(vk.expression)} IS NOT NULL",
             "    GROUP BY 1",
-            ") k;",
+            ") k",
+            "WHERE NOT EXISTS (SELECT 1 FROM {etl}.visit_map vm WHERE vm.source_value = k.source_value)",
+            "ON CONFLICT DO NOTHING;",
+        ]
+    )
+
+
+def _visit_map_prune_sql() -> str:
+    return "\n".join(
+        [
+            _comment(
+                "visit id map: drop the keys that did not become a visit (filtered out by the\n"
+                "visit_occurrence mapping, or visits of people who were not loaded), so events that refer\n"
+                "to them get a NULL visit_occurrence_id instead of an id missing from visit_occurrence.\n"
+                "Skipped by the runner when the visit_occurrence load failed."
+            ),
+            "DELETE FROM {etl}.visit_map vm",
+            "WHERE NOT EXISTS (SELECT 1 FROM {cdm}.visit_occurrence v"
+            " WHERE v.visit_occurrence_id = vm.visit_occurrence_id);",
         ]
     )
 
@@ -476,9 +578,12 @@ def compile_spec(
     """
     steps: list[CompiledStep] = []  # names are assigned at the end
 
-    steps.append(CompiledStep("person_map", None, "id_map", _person_map_sql(spec.person_key), source_table=spec.person_key.table))
+    steps.append(CompiledStep("person_map", None, "id_map", _person_map_sql(spec.person_key),
+                              source_table=spec.person_key.table, origins=(spec.person_key,)))
     if spec.visit_key is not None:
-        steps.append(CompiledStep("visit_map", None, "id_map", _visit_map_sql(spec), source_table=spec.visit_key.table))
+        person_from = _visit_person_mapping(spec)
+        steps.append(CompiledStep("visit_map", None, "id_map", _visit_map_sql(spec), source_table=spec.visit_key.table,
+                                  origins=(spec.visit_key,) + ((person_from,) if person_from else ())))
 
     ordered = sorted(enumerate(spec.table_mappings), key=lambda it: (_load_index(it[1].target_table.lower()), it[0]))
     customs_by_table: dict[str, list[CustomSQL]] = {}
@@ -495,12 +600,16 @@ def compile_spec(
         seen_count[t] = seen_count.get(t, 0) + 1
         label = t if seen_count[t] == 1 else f"{t}_{seen_count[t]}"
         try:
-            sql = _compile_insert(tm, spec)
-            step = CompiledStep(label, t, "insert", sql, source_table=tm.source.table, source_count_sql=_source_count(tm))
+            sql, retained = _compile(tm, spec)
+            step = CompiledStep(
+                label, t, "insert", sql, source_table=tm.source.table,
+                source_count_sql=_source_count(tm), retained_count_sql=retained, origins=(tm,),
+            )
         except CompileError as e:
             if strict:
                 raise
-            step = CompiledStep(label, t, "insert", "", source_table=tm.source.table, error=f"compile error: {e}")
+            step = CompiledStep(label, t, "insert", "", source_table=tm.source.table, origins=(tm,),
+                                error=f"compile error: {e}")
         steps.append(step)
         if last_index_for[t] == pos:
             for cs in customs_by_table.get(t, []):
@@ -509,6 +618,13 @@ def compile_spec(
     for cs in spec.custom_sql:
         if id(cs) not in placed_custom:
             steps.append(_custom_step(cs))
+
+    # prune each id map right after the last step that loads its table, before the events
+    _insert_after_last(steps, "person", CompiledStep("person_map_prune", None, "id_map", _person_map_prune_sql(),
+                                                     requires="person"))
+    if spec.visit_key is not None:
+        _insert_after_last(steps, "visit_occurrence", CompiledStep(
+            "visit_map_prune", None, "id_map", _visit_map_prune_sql(), requires="visit_occurrence"))
 
     if spec.observation_period == "from_events":
         loaded = [t for t in target_tables(spec) if t != "observation_period"]
@@ -524,10 +640,20 @@ def compile_spec(
         s.sql = schemas.render(s.sql)
         if s.source_count_sql:
             s.source_count_sql = schemas.render(s.source_count_sql)
+        if s.retained_count_sql:
+            s.retained_count_sql = schemas.render(s.retained_count_sql)
     return steps
+
+
+def _insert_after_last(steps: list[CompiledStep], table: str, new: CompiledStep) -> None:
+    """Insert ``new`` after the last insert/custom step that writes ``table`` (if there is one)."""
+    last = max((i for i, s in enumerate(steps) if s.target_table == table and s.kind in ("insert", "custom")), default=None)
+    if last is not None:
+        steps.insert(last + 1, new)
 
 
 def _custom_step(cs: CustomSQL) -> CompiledStep:
     sql = cs.sql.strip()
     header = _comment(f"custom SQL '{cs.name}' -> {cs.target_table}" + (f"\n{cs.rationale}" if cs.rationale.strip() else ""))
-    return CompiledStep(f"custom_{_safe_name(cs.name)}", cs.target_table.lower(), "custom", header + "\n" + sql)
+    return CompiledStep(f"custom_{_safe_name(cs.name)}", cs.target_table.lower(), "custom", header + "\n" + sql,
+                        origins=(cs,))
