@@ -20,8 +20,9 @@ def normalize_url(url: str) -> str:
     return re.sub(r"^postgres(ql)?\+\w+://", "postgresql://", url)
 
 
-def connect(url: str, autocommit: bool = False) -> psycopg.Connection:
-    return psycopg.connect(normalize_url(url), autocommit=autocommit, row_factory=dict_row)
+def connect(url: str, autocommit: bool = False, **params: Any) -> psycopg.Connection:
+    """Open a connection (rows as dicts). ``params`` are extra libpq settings, e.g. connect_timeout."""
+    return psycopg.connect(normalize_url(url), autocommit=autocommit, row_factory=dict_row, **params)
 
 
 def qi(name: str) -> str:

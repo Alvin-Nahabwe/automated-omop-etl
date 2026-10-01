@@ -1,0 +1,34 @@
+{% extends "base.html.j2" %}
+{% from "_macros.html.j2" import badge %}
+{% block title %}Projects · omop-agent{% endblock %}
+{% block content %}
+<h1>Projects</h1>
+<p class="sub">Each project is a folder with an <code>omop_agent.yaml</code> in <code>{{ projects_dir }}</code>.</p>
+{% if not projects %}
+<div class="card">
+  <p>No projects yet. On the server, create one with <code>omop-agent init {{ projects_dir }}/NAME</code>
+  (or the demo: <code>omop-agent demo {{ projects_dir }}/demo --no-run</code>), then reload this page.</p>
+</div>
+{% else %}
+<div class="card tw">
+<table>
+  <thead><tr><th>Project</th><th>ETL design</th><th>Code mappings</th><th>Last run</th><th>Quality</th></tr></thead>
+  <tbody>
+  {% for s in projects %}
+    <tr>
+      <td><a href="/p/{{ s.project.id }}"><strong>{{ s.project.name }}</strong></a><br><span class="muted small">{{ s.project.id }}</span></td>
+      {% if s.project.cfg %}
+      <td>{{ badge(s.gates.design.label) }}</td>
+      <td>{{ badge(s.gates.vocab_map.label) }}</td>
+      <td>{% if s.active_job %}{{ badge('running') }}{% elif s.last_job %}<span class="small">{{ s.last_job.created_at|dt }}</span>{% else %}<span class="muted">never</span>{% endif %}</td>
+      <td>{% if s.dq %}{{ badge('passed' if s.dq.passed else 'failed') }}{% else %}<span class="muted">not checked</span>{% endif %}</td>
+      {% else %}
+      <td colspan="4"><span class="badge b-fail">configuration error</span> <span class="small">{{ s.project.error }}</span></td>
+      {% endif %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

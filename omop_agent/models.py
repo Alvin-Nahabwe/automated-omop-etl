@@ -300,6 +300,9 @@ class MappingDecision(BaseModel):
     method: Literal["exact", "lexical", "llm", "manual", "suppressed"] = "lexical"
     rationale: str = ""
     candidates: list[ConceptCandidate] = Field(default_factory=list)
+    reviewed_by: str | None = None
+    reviewed_at: str | None = None
+    review_note: str = ""
 
 
 class TermChoice(BaseModel):

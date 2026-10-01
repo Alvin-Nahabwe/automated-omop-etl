@@ -1,0 +1,108 @@
+{% extends "base.html.j2" %}
+{% from "_macros.html.j2" import badge, gate_line %}
+{% block title %}{{ project.name }} · omop-agent{% endblock %}
+{% block content %}
+<h1>{{ project.name }}</h1>
+{% if not project.cfg %}
+<div class="callout bad"><strong>The project's configuration could not be read.</strong><br>{{ project.error }}</div>
+{% else %}
+<p class="sub">
+  Source: {{ project.cfg.source.type }} · CDM schema <code>{{ project.cfg.target.cdm_schema }}</code> ·
+  LLM: {{ project.cfg.llm.provider }}{% if project.cfg.llm.provider == 'anthropic' %} ({{ project.cfg.llm.model }}){% endif %}
+</p>
+
+{% if conflicts %}
+<div class="callout bad"><strong>This project shares database schemas with another project</strong>, so their runs would overwrite each other's data:
+  {{ conflicts|join('; ') }}. Give it its own schema names in <code>omop_agent.yaml</code> (for example <code>{{ project.id|lower|replace('-', '_') }}_cdm</code>); runs from this app are refused until then.</div>
+{% endif %}
+
+<div class="grid">
+  <section class="card">
+    <h2>Review steps</h2>
+    <p><strong>ETL design</strong><br>{{ gate_line(gates.design) }}<br><a href="/p/{{ project.id }}/spec">Review the ETL design</a></p>
+    <p><strong>Code mappings</strong><br>{{ gate_line(gates.vocab_map) }}<br>
+      {% if counts %}<span class="small">{{ counts.review }} need review · {{ counts.unmapped }} without a concept · {{ counts.all }} in total</span><br>{% endif %}
+      <a href="/p/{{ project.id }}/mappings">Review the code mappings</a></p>
+  </section>
+
+  <section class="card">
+    <h2>Pipeline</h2>
+    {% if active_job %}
+      <p>{{ badge('running') }} {{ active_job.label }}, started by {{ active_job.by }}.
+      <a href="/p/{{ project.id }}/runs/{{ active_job.id }}">Watch the run</a></p>
+    {% elif other_run is not none %}
+      <p>{{ badge('running') }} A run started outside this app is in progress{% if other_run %} ({{ other_run }}){% endif %}. Reload this page to see when it ends.</p>
+    {% elif user.can('operator') %}
+      <p class="small muted">A run continues from where the last one stopped and pauses at a review step until a reviewer approves it.</p>
+      <form method="post" action="/p/{{ project.id }}/runs">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <input type="hidden" name="kind" value="continue">
+        <button class="btn primary" type="submit">Continue the pipeline</button>
+      </form>
+      <details class="small">
+        <summary>Other kinds of run</summary>
+        <form method="post" action="/p/{{ project.id }}/runs" class="stack">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          {% for kind, label in KIND_LABELS.items() if kind != 'continue' %}
+          <label class="inline"><input type="radio" name="kind" value="{{ kind }}" {% if loop.first %}checked{% endif %}> {{ label }}</label>
+          {% endfor %}
+          <p class="muted">Mapping again or redrafting replaces Claude's earlier proposals (reviewed mappings are kept only when continuing). Starting over re-reads the source data.</p>
+          <label class="inline"><input type="checkbox" name="confirm" value="yes"> I understand</label>
+          <button class="btn" type="submit">Start this run</button>
+        </form>
+      </details>
+    {% else %}
+      <p class="muted">An operator starts pipeline runs.</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Quality</h2>
+    {% if dq %}
+      <p>{{ badge('passed' if dq.passed else 'failed') }} <span class="small muted">checked {{ dq.run_at|dt }}</span></p>
+      {% if dq.blocking_failures %}<p class="small">{{ dq.blocking_failures|length }} blocking check(s) failed.</p>{% endif %}
+    {% else %}
+      <p class="muted">Not checked yet.</p>
+    {% endif %}
+    {% if has_report %}<p><a href="/p/{{ project.id }}/report">Open the inspection report</a>{% if project.ws.root.joinpath('report.shareable.html').exists() %} · <a href="/p/{{ project.id }}/report?version=shareable">shareable version</a>{% endif %}</p>{% endif %}
+  </section>
+</div>
+
+<section class="card">
+  <h2>Stages</h2>
+  <div class="tw"><table>
+    <thead><tr><th>Stage</th><th>Status</th><th>When</th><th>Note</th></tr></thead>
+    <tbody>
+    {% for stage, info in stage_rows %}
+      <tr>
+        <td>{{ STAGE_LABELS.get(stage, stage) }}</td>
+        <td>{% if info %}{{ badge(info.status) }}{% else %}<span class="muted">not run</span>{% endif %}</td>
+        <td class="small">{{ info.at|dt if info else '' }}</td>
+        <td class="small">{{ info.error if info and info.error else '' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+
+<section class="card">
+  <h2>Runs from this app</h2>
+  {% if not jobs %}<p class="muted">None yet.</p>{% else %}
+  <div class="tw"><table>
+    <thead><tr><th>Started</th><th>Kind</th><th>By</th><th>Status</th><th>Result</th></tr></thead>
+    <tbody>
+    {% for job, status in jobs %}
+      <tr>
+        <td class="nowrap"><a href="/p/{{ project.id }}/runs/{{ job.id }}">{{ job.created_at|dt }}</a></td>
+        <td>{{ job.label }}</td>
+        <td>{{ job.by }}</td>
+        <td>{{ badge(status) }}</td>
+        <td class="small">{{ job.message }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

@@ -45,3 +45,31 @@ jobs:
             /tmp/omop-demo/work/etl_spec.md
             /tmp/omop-demo/work/dq_results.json
             /tmp/omop-demo/work/sql/
+
+  docker:
+    # Builds the image and runs the offline demo inside the deploy/ bundle, as an install would.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure the bundle
+        run: |
+          cp .env.example .env
+          sed -i "s/^POSTGRES_PASSWORD=$/POSTGRES_PASSWORD=$(openssl rand -hex 16)/; s/^OMOP_DB_PASSWORD=$/OMOP_DB_PASSWORD=$(openssl rand -hex 16)/" .env
+          mkdir -p projects data athena source
+          sudo chown 10001:10001 projects data athena
+      - name: Build and start
+        run: docker compose up -d --build --wait
+      - name: Offline demo inside the bundle
+        run: docker compose run --rm -T app demo /srv/projects/demo
+      - name: Web app answers
+        run: |
+          printf 'ci-password-1234\n' | docker compose run --rm -T app users add ci --role operator --password-stdin
+          curl -fsS http://127.0.0.1:8000/healthz
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/login)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/p/demo)" = 303
+      - name: Logs
+        if: failure()
+        run: docker compose logs

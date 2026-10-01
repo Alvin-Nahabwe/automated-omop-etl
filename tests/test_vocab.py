@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -793,7 +794,7 @@ def test_export_review_formats(tmp_path):
         ],
     )
     paths = export_review(ws, [d])
-    assert paths[1].name == "SRC_Weird_ID.csv"
+    assert re.fullmatch(r"SRC_Weird_ID-[0-9a-f]{8}\.csv", paths[1].name)
     with paths[1].open(newline="") as fh:
         row = next(csv.DictReader(fh))
     assert row["source_code"] == "a,b" and row["confidence"] == "0.12" and row["alternatives"] == "6:six"
@@ -859,3 +860,14 @@ def test_low_confidence_choice_with_search_phrases_is_retried(staged, tmp_path):
     assert by["HB"].target_concept_id == 2000004001      # the better concept found by the second search
     assert by["WT"].target_concept_id == 2000004004      # retry found nothing better: first choice kept
     assert by["SBP"].target_concept_id == 2000004006     # confident choice: not retried
+
+
+def test_review_files_of_similar_vocabulary_ids_do_not_collide(tmp_path):
+    ws = Workspace(tmp_path / "w")
+    a = _decision("SRC_DRUG", "x", 0, "UNCHECKED")
+    b = _decision("SRC DRUG", "y", 0, "UNCHECKED")
+    names = sorted(p.name for p in export_review(ws, [a, b])[1:])
+    assert names[1] == "SRC_DRUG.csv" and names[0].startswith("SRC_DRUG-") and len(set(names)) == 2
+    _edit_csv(ws.mappings_dir / "SRC_DRUG.csv", {"x": {"status": "REJECTED"}})
+    got = {d.source_vocabulary_id: d.status for d in import_review(ws)}
+    assert got == {"SRC_DRUG": "REJECTED", "SRC DRUG": "UNCHECKED"}

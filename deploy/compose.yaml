@@ -1,0 +1,69 @@
+# omop-agent on one server: PostgreSQL 16 and the review web app.
+#
+#   cd deploy
+#   cp .env.example .env        # then set the passwords and keys in .env
+#   mkdir -p projects data athena source
+#   docker compose up -d --build
+#   docker compose run --rm app users add YOUR-NAME --role operator
+#
+# Then open http://127.0.0.1:8000 on the server (or through your HTTPS reverse proxy).
+# Full instructions: docs/deploy.md. Patient data never leaves this server; only aggregates
+# go to the Claude API, and only when a project's llm.provider is "anthropic".
+name: omop-agent
+
+services:
+  db:
+    image: ${POSTGRES_IMAGE:-postgres:16}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      OMOP_DB_PASSWORD: ${OMOP_DB_PASSWORD:?set OMOP_DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    shm_size: 1g  # vocabulary loads build large indexes
+    healthcheck:
+      # Over TCP: during first-time setup the server listens only on its socket, so this stays
+      # unhealthy until the omop role and database exist.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d omop"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    # Not published on the host. To reach it from the server itself, add:
+    # ports: ["127.0.0.1:5432:5432"]
+
+  app:
+    build:
+      context: ..
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+    image: omop-agent:local
+    restart: unless-stopped
+    init: true  # reaps the processes of finished pipeline runs
+    depends_on:
+      db:
+        condition: service_healthy
+    # Run as your own user so the files under projects/ stay editable on the server.
+    user: "${OMOP_AGENT_UID:-10001}:${OMOP_AGENT_GID:-10001}"
+    environment:
+      OMOP_AGENT_DB_URL: postgresql://omop:${OMOP_DB_PASSWORD}@db:5432/omop
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ATHENA_DOWNLOAD_URL: ${ATHENA_DOWNLOAD_URL:-}
+      OMOP_AGENT_WEB_SECRET: ${OMOP_AGENT_WEB_SECRET:-}
+      OMOP_AGENT_SECURE_COOKIES: ${OMOP_AGENT_SECURE_COOKIES:-false}
+      # Inside the container every client appears to come from Docker's gateway, so the address
+      # your reverse proxy reports (X-Forwarded-For) is trusted. Safe while the port is bound to
+      # 127.0.0.1 (only programs on this server can connect); see docs/deploy.md otherwise.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
+      HOME: /tmp
+    volumes:
+      - ./projects:/srv/projects  # one sub-directory per project (omop_agent.yaml + work/)
+      - ./data:/srv/data          # accounts, session key, sign-in log
+      - ./athena:/srv/athena      # the unpacked Athena vocabulary download
+      - ./source:/srv/source:ro   # source CSV exports (read-only)
+    ports:
+      - "${OMOP_AGENT_BIND:-127.0.0.1}:${OMOP_AGENT_PORT:-8000}:8000"
+
+volumes:
+  pgdata:

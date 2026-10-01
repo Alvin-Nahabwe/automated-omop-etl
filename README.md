@@ -42,6 +42,27 @@ load fails, the repair agent fixes the spec, then a quality check fails and the 
 the code normalisation, and the rebuilt CDM passes. To run the same demo against Claude live,
 use `--provider anthropic` (it needs an API key, see below).
 
+## The review web app and the Docker bundle
+
+For a team, install the bundle in `deploy/` on the server that holds the data: PostgreSQL 16
+and a small web app, started with one `docker compose up`. Reviewers then work in a browser
+instead of editing YAML and CSV files:
+
+* **ETL design**: read Claude's draft table by table, see what changed since it was last
+  approved (including changes made by the repair agent), and approve it.
+* **Code mappings**: each local code with how often it occurs, Claude's proposed concept and
+  reasoning, and the other candidates. Search the vocabulary, pick a concept, approve, flag for
+  discussion or reject, with a note. Then approve the mappings as a whole.
+* **Runs**: an operator starts the pipeline in the background and watches its log. A run
+  pauses at each review step until the current design or mappings are approved.
+* **Report and audit trail**: the inspection report, and every approval and edit with the
+  reviewer's name.
+
+Accounts are local and managed on the server (`omop-agent users add NAME --role
+viewer|reviewer|operator`). The app writes to the same files as the command line, so both can
+be used on the same project. Setup, HTTPS and backups: [docs/deploy.md](docs/deploy.md).
+Without Docker: `pip install -e ".[web]"` and `omop-agent serve --projects DIR`.
+
 ## Using it on your data
 
 ```bash
@@ -68,7 +89,9 @@ omop-agent apply-mappings   # load your CSV edits into source_to_concept_map
 omop-agent build            # compile + load + DQ checks + repair loop
 omop-agent check            # DQ checks only
 omop-agent report [--shareable]   # report.md / report.html
-omop-agent status
+omop-agent status           # stages and review gates
+omop-agent approve design --by NAME     # record a review (also: vocab_map)
+omop-agent run --recorded-approvals     # stop at a gate unless its current artifact was approved
 ```
 
 Everything lands in `work/`: the profile, spec, mappings, generated SQL, DQ results,
@@ -174,7 +197,8 @@ pytest -q
 ```
 
 Tests that need PostgreSQL are skipped when `OMOP_AGENT_TEST_DB_URL` is unset. CI runs the
-suite plus the offline demo against a `postgres:16` service.
+suite plus the offline demo against a `postgres:16` service, and builds the Docker bundle and
+runs the demo inside it.
 
 ## Limitations and roadmap
 
@@ -199,6 +223,10 @@ suite plus the offline demo against a `postgres:16` service.
   gender, plausible units) need the official R DQD (`quality.use_r_dqd: true`).
 * The demo vocabulary and the recorded LLM answers are synthetic and hand-written. Never load
   the fixture vocabulary into a real CDM.
+* The web app has local accounts only (no single sign-on or two-factor login yet). Keep it on
+  the internal network or VPN, behind HTTPS. The ETL design is reviewed in the browser but
+  edited on the server (`etl_spec.yaml`). The Docker image does not include R, so the
+  official R Achilles/DQD (`quality.use_r_dqd`) needs R installed separately.
 
 ## Licence and attribution
 

@@ -1,0 +1,22 @@
+{% extends "base.html.j2" %}
+{% block title %}Sign in · omop-agent{% endblock %}
+{% block content %}
+<div class="card login">
+  <h1>Sign in</h1>
+  <p class="sub">omop-agent review app</p>
+  {% if error %}<div class="flash error" role="alert">{{ error }}</div>{% endif %}
+  {% if no_users %}
+  <div class="callout">No accounts exist yet. On the server, create one with
+    <code>omop-agent users add NAME --role operator</code>.</div>
+  {% endif %}
+  <form method="post" action="/login" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <input type="hidden" name="next" value="{{ next }}">
+    <div><label for="username">User name</label>
+      <input id="username" name="username" type="text" autocomplete="username" value="{{ username or '' }}" required autofocus></div>
+    <div><label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required></div>
+    <div><button class="btn primary" type="submit">Sign in</button></div>
+  </form>
+</div>
+{% endblock %}

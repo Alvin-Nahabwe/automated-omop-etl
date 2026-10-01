@@ -1,0 +1,14 @@
+{% extends "base.html.j2" %}
+{% block title %}Audit trail · {{ project.name }}{% endblock %}
+{% block content %}
+<h1>Audit trail</h1>
+<p class="sub">The latest events from <code>audit.jsonl</code>, newest first: approvals, mapping edits, runs, Claude calls, repairs and errors. Sign-ins are logged on the server in <code>access.jsonl</code>.</p>
+{% if not events %}<div class="card"><p class="muted">No events yet.</p></div>{% else %}
+<div class="card tw"><table>
+  <thead><tr><th>When</th><th>Event</th><th>By</th><th>Details</th></tr></thead>
+  <tbody>{% for e in events %}
+    <tr><td class="nowrap small">{{ e.ts|dt }}</td><td class="nowrap">{{ e.event|replace('_', ' ') }}</td><td>{{ e.by or '' }}</td><td class="mono small">{{ e.details }}</td></tr>
+  {% endfor %}</tbody>
+</table></div>
+{% endif %}
+{% endblock %}

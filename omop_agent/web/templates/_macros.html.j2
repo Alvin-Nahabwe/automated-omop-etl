@@ -1,0 +1,22 @@
+{% macro badge(text, cls=none) %}<span class="badge b-{{ cls or (text|statuscls) }}">{{ text|replace('_', ' ') }}</span>{% endmacro %}
+
+{% macro gate_line(gate) -%}
+{{ badge(gate.label) }}
+{% if gate.approval %}<span class="muted small">last approved by {{ gate.approval.by }}, {{ gate.approval.at|dt }}</span>{% endif %}
+{%- endmacro %}
+
+{% macro approve_form(action, gate, csrf, what, user) %}
+{% if user.can('reviewer') and gate.ready and not gate.current %}
+<form method="post" action="{{ action }}" class="stack">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="expected_digest" value="{{ gate.digest }}">
+  <label for="approve-note">Comment (optional, kept with the approval)</label>
+  <textarea id="approve-note" name="note" maxlength="1000"></textarea>
+  <button class="btn primary" type="submit">Approve the {{ what }}</button>
+</form>
+{% elif gate.current %}
+<p class="muted small">Approved as it is now. Any change will need a new approval.</p>
+{% elif not user.can('reviewer') %}
+<p class="muted small">A reviewer approves this step.</p>
+{% endif %}
+{% endmacro %}

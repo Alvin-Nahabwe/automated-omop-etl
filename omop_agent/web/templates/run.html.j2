@@ -1,0 +1,32 @@
+{% extends "base.html.j2" %}
+{% from "_macros.html.j2" import badge %}
+{% block head %}{% if live %}<meta http-equiv="refresh" content="4">{% endif %}{% endblock %}
+{% block title %}Run {{ job.id }} · {{ project.name }}{% endblock %}
+{% block content %}
+<h1>{{ job.label }}</h1>
+<p class="sub">Started by {{ job.by }} · {{ job.created_at|dt }}{% if job.ended_at %} · finished {{ job.ended_at|dt }}{% endif %}</p>
+<section class="card">
+  <p>{{ badge(status) }} {{ job.message }}</p>
+  {% if status == 'waiting_review' %}
+    <p>{% if job.stage == 'design' %}<a href="/p/{{ project.id }}/spec">Review the ETL design</a>{% else %}<a href="/p/{{ project.id }}/mappings">Review the code mappings</a>{% endif %},
+    then continue the pipeline from the <a href="/p/{{ project.id }}">project page</a>.</p>
+  {% elif status in ('passed', 'failed_quality') %}
+    <p><a href="/p/{{ project.id }}/report">Open the inspection report</a></p>
+  {% elif status == 'interrupted' %}
+    <p class="small">The run stopped without finishing (for example, the server restarted). Start it again from the project page.</p>
+  {% endif %}
+  {% if live %}
+    <p class="muted small">This page refreshes every few seconds while the run is going.</p>
+    {% if user.can('operator') %}
+    <form method="post" action="/p/{{ project.id }}/runs/{{ job.id }}/stop" data-confirm="Stop this run?">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <button class="btn danger" type="submit">Stop the run</button>
+    </form>
+    {% endif %}
+  {% endif %}
+</section>
+<section class="card">
+  <h2>Log</h2>
+  <pre class="log">{{ log or 'No output yet.' }}</pre>
+</section>
+{% endblock %}
