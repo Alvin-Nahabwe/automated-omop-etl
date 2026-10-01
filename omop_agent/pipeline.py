@@ -38,6 +38,10 @@ def auto_approve(stage: str, message: str, paths: list[str]) -> bool:
 class PipelineStopped(Exception):
     """Raised when a reviewer declines to continue at a gate."""
 
+    def __init__(self, message: str, stage: str | None = None):
+        super().__init__(message)
+        self.stage = stage
+
 
 class SpecInvalid(Exception):
     """Raised when the ETL spec on disk has validation errors (e.g. after a hand edit)."""
@@ -74,7 +78,7 @@ class Pipeline:
         self.ws.audit("human_approval", stage=stage, approved=ok, artifacts=paths)
         if not ok:
             self.ws.mark(stage, "awaiting_review")
-            raise PipelineStopped(f"Stopped for review at '{stage}'. Edit {', '.join(paths)} and re-run.")
+            raise PipelineStopped(f"Stopped for review at '{stage}'. Edit {', '.join(paths)} and re-run.", stage)
 
     def _run_stage(self, stage: str, fn: Callable[[], object]) -> object:
         self.log(f"▶ {stage}")

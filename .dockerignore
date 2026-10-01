@@ -1,0 +1,7 @@
+# Only the package and its metadata go into the image.
+*
+!pyproject.toml
+!README.md
+!omop_agent
+**/__pycache__
+**/*.pyc

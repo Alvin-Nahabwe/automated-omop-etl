@@ -1,0 +1,95 @@
+{% extends "base.html.j2" %}
+{% from "_macros.html.j2" import badge, gate_line, approve_form %}
+{% block title %}ETL design · {{ project.name }}{% endblock %}
+{% block content %}
+<h1>ETL design</h1>
+<p class="sub">Claude's draft of how each source table fills the OMOP CDM (the Rabbit-in-a-Hat step). It is checked in code before it is used. To change it, edit <code>etl_spec.yaml</code> on the server, then approve it here.</p>
+
+<section class="card">
+  <h2>Review</h2>
+  <p>{{ gate_line(gate) }}</p>
+  {% if gate.approval and gate.approval.note %}<p class="small">“{{ gate.approval.note }}”</p>{% endif %}
+  {% if diff %}
+    <div class="callout">The design changed since it was approved (by a hand edit, a redraft or the repair agent). Changes:</div>
+    <pre class="diff">{% for line in diff %}{% if line.startswith('@@') %}<span class="hunk">{{ line }}</span>{% elif line.startswith('+') and not line.startswith('+++') %}<span class="add">{{ line }}</span>{% elif line.startswith('-') and not line.startswith('---') %}<span class="del">{{ line }}</span>{% else %}{{ line }}
+{% endif %}{% endfor %}</pre>
+  {% endif %}
+  {% if not gate.ready %}<p class="muted">There is no design yet: it is drafted by the first pipeline run.</p>
+  {% else %}{{ approve_form('/p/' ~ project.id ~ '/spec/approve', gate, csrf, 'ETL design', user) }}{% endif %}
+</section>
+
+{% if issues %}
+<section class="card">
+  <h2>Checks on the design</h2>
+  <ul>
+  {% for i in issues %}
+    <li>{{ badge(i.severity, 'fail' if i.severity == 'error' else 'warn') }}
+      {% if i.target_table %}<code>{{ i.target_table }}{% if i.target_field %}.{{ i.target_field }}{% endif %}</code>{% endif %} {{ i.message }}</li>
+  {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if repairs %}
+<section class="card">
+  <h2>Changes made by the repair agent</h2>
+  <div class="tw"><table>
+    <thead><tr><th class="n">Round</th><th>Where</th><th>Change</th><th>Why</th></tr></thead>
+    <tbody>{% for r in repairs %}
+      <tr><td class="n">{{ r.iteration }}</td><td><code>{{ r.target_table }}{% if r.target_field %}.{{ r.target_field }}{% endif %}</code></td>
+        <td>{{ r.change }}</td><td class="small">{{ r.rationale }}<br><span class="muted">trigger: {{ r.trigger }}</span></td></tr>
+    {% endfor %}</tbody>
+  </table></div>
+</section>
+{% endif %}
+
+{% if spec_error %}
+<div class="callout bad"><strong>etl_spec.yaml has errors</strong> and cannot be used until they are fixed on the server.<pre class="yaml">{{ spec_error }}</pre></div>
+{% endif %}
+
+{% if spec %}
+<section class="card">
+  <h2>Overview</h2>
+  <dl class="facts">
+    <dt>People</dt><dd><code>{{ spec.person_key.table }}</code> keyed by <code>{{ spec.person_key.expression }}</code></dd>
+    <dt>Visits</dt><dd>{% if spec.visit_key %}<code>{{ spec.visit_key.table }}</code> keyed by <code>{{ spec.visit_key.expression }}</code>{% else %}<span class="muted">none</span>{% endif %}</dd>
+    <dt>Observation periods</dt><dd>{{ 'from the first and last event of each person' if spec.observation_period == 'from_events' else 'from a table mapping' }}</dd>
+    <dt>CDM tables filled</dt><dd>{{ spec.table_mappings|map(attribute='target_table')|join(', ') }}</dd>
+  </dl>
+  {% if spec.assumptions %}<h3>Assumptions</h3><ul>{% for a in spec.assumptions %}<li>{{ a }}</li>{% endfor %}</ul>{% endif %}
+  {% if spec.open_questions %}<h3>Open questions for the data team</h3><ul>{% for q in spec.open_questions %}<li>{{ q }}</li>{% endfor %}</ul>{% endif %}
+</section>
+
+{% for tm in spec.table_mappings %}
+<section class="card">
+  <h2><code>{{ tm.target_table }}</code> <span class="muted small">from</span> <code>{{ tm.source.table }}</code> <span class="muted small">as {{ tm.source.alias }}</span></h2>
+  {% if tm.rationale %}<p class="small">{{ tm.rationale }}</p>{% endif %}
+  {% for j in tm.joins %}<p class="small">{{ j.join_type }} join <code>{{ j.table }}</code> as {{ j.alias }} on <code>{{ j.on }}</code></p>{% endfor %}
+  {% if tm.where %}<p class="small">only rows where <code>{{ tm.where }}</code></p>{% endif %}
+  <div class="tw"><table>
+    <thead><tr><th>CDM field</th><th>How</th><th>From</th><th>Why</th></tr></thead>
+    <tbody>{% for f in tm.fields %}
+      <tr>
+        <td><code>{{ f.target_field }}</code></td>
+        <td class="nowrap">{{ f.kind|replace('_', ' ') }}{% if f.kind in ('concept_map', 'vocab_code') %}<br><span class="muted small">{{ f.vocabulary }}{% if f.target_domain %} → {{ f.target_domain }}{% endif %}{% if f.concept_role == 'source' %} (source concept){% endif %}</span>{% endif %}</td>
+        <td>{% if f.expression %}<code>{{ f.expression }}</code>{% endif %}</td>
+        <td class="small">{{ f.rationale }}</td>
+      </tr>
+    {% endfor %}</tbody>
+  </table></div>
+</section>
+{% endfor %}
+
+{% for c in spec.custom_sql %}
+<section class="card">
+  <h2>Custom SQL: {{ c.name }} <span class="muted small">→ {{ c.target_table }}</span></h2>
+  {% if c.rationale %}<p class="small">{{ c.rationale }}</p>{% endif %}
+  <pre class="yaml">{{ c.sql }}</pre>
+</section>
+{% endfor %}
+{% endif %}
+
+{% if spec_text %}
+<details class="card"><summary>The YAML file as it is on the server</summary><pre class="yaml">{{ spec_text }}</pre></details>
+{% endif %}
+{% endblock %}

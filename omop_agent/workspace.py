@@ -28,6 +28,8 @@ from typing import Any, TypeVar
 import yaml
 from pydantic import BaseModel
 
+from .fsutil import atomic_write_text
+
 T = TypeVar("T", bound=BaseModel)
 
 STAGES = ["profile", "annotate", "design", "vocab_map", "build", "quality", "report"]
@@ -120,8 +122,7 @@ class Workspace:
             data: Any = [m.model_dump(mode="json") for m in model]
         else:
             data = model.model_dump(mode="json")
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-        return path
+        return atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
     def load_json(self, path: Path, cls: type[T]) -> T:
         return cls.model_validate_json(path.read_text())
@@ -136,8 +137,7 @@ class Workspace:
             allow_unicode=True,
             width=110,
         )
-        path.write_text((header + "\n" if header else "") + body)
-        return path
+        return atomic_write_text(path, (header + "\n" if header else "") + body)
 
     def load_yaml(self, path: Path, cls: type[T]) -> T:
         return cls.model_validate(yaml.safe_load(path.read_text()))
@@ -163,7 +163,7 @@ class Workspace:
     def mark(self, stage: str, status: str, **extra: Any) -> None:
         st = self.state()
         st["stages"][stage] = {"status": status, "at": utcnow().isoformat(), **extra}
-        self.state_json.write_text(json.dumps(st, indent=2) + "\n")
+        atomic_write_text(self.state_json, json.dumps(st, indent=2) + "\n")
 
     def stage_status(self, stage: str) -> str | None:
         return self.state()["stages"].get(stage, {}).get("status")

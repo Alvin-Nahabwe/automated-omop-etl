@@ -1,0 +1,43 @@
+{#- Layout for every page. Autoescaped; no inline scripts or styles (see the CSP in security.py). -#}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+{% block head %}{% endblock %}
+<title>{% block title %}omop-agent{% endblock %}</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="topbar"><div class="in">
+  <a class="brand" href="/">omop-agent</a>
+  {% if project is defined and project %}<span class="crumb">/ <a href="/p/{{ project.id }}">{{ project.name }}</a></span>{% endif %}
+  {% if user %}
+  <span class="who">
+    <span>{{ user.display }} <span class="muted">· {{ user.role }}</span></span>
+    <form method="post" action="/logout" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <button class="btn quiet" type="submit">Sign out</button>
+    </form>
+  </span>
+  {% endif %}
+</div></header>
+<main>
+{% if project is defined and project and project.cfg %}
+<nav class="tabs" aria-label="Project">
+  <a href="/p/{{ project.id }}" {% if tab == 'overview' %}aria-current="page"{% endif %}>Overview</a>
+  <a href="/p/{{ project.id }}/spec" {% if tab == 'spec' %}aria-current="page"{% endif %}>ETL design</a>
+  <a href="/p/{{ project.id }}/mappings" {% if tab == 'mappings' %}aria-current="page"{% endif %}>Code mappings</a>
+  <a href="/p/{{ project.id }}/report" {% if tab == 'report' %}aria-current="page"{% endif %}>Report</a>
+  <a href="/p/{{ project.id }}/audit" {% if tab == 'audit' %}aria-current="page"{% endif %}>Audit trail</a>
+</nav>
+{% endif %}
+{% for kind, message in flashes %}<div class="flash {{ kind }}" role="status">{{ message }}</div>{% endfor %}
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

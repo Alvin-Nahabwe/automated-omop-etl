@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from importlib import resources
 from pathlib import Path
 
@@ -36,6 +38,8 @@ def create_demo_project(
     else:
         llm = "  provider: none\n"
     p = schema_prefix
+    # Keep a password that came from the environment out of the file: write the reference.
+    url = "${OMOP_AGENT_DB_URL}" if db_url and os.environ.get("OMOP_AGENT_DB_URL") == db_url else db_url
     cfg = root / "omop_agent.yaml"
     cfg.write_text(
         f"""# Demo project: synthetic data only. See omop_agent/demo/fixtures/vocab/README.md.
@@ -47,7 +51,7 @@ source:
   path: ./data
 
 target:
-  url: {db_url}
+  url: {json.dumps(url)}
   cdm_schema: {p}_cdm
   vocab_schema: {p}_vocab
   staging_schema: {p}_src

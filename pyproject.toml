@@ -22,7 +22,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "itsdangerous>=2.1",
+    "python-multipart>=0.0.9",
+]
+dev = ["pytest>=8", "httpx>=0.27", "omop-agent[web]"]
 
 [project.scripts]
 omop-agent = "omop_agent.cli:app"
@@ -34,6 +40,8 @@ include = ["omop_agent*"]
 omop_agent = [
     "resources/ohdsi/*",
     "report/templates/*",
+    "web/templates/*",
+    "web/static/*",
     "quality/r/*",
     "demo/fixtures/vocab/*",
     "demo/fixtures/replay/*",
