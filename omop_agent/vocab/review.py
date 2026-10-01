@@ -16,6 +16,7 @@ command-line and browser reviews are interchangeable. It also fills ``reviewed_b
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import re
 from pathlib import Path
@@ -59,7 +60,11 @@ def decisions_path(ws: Workspace) -> Path:
 
 
 def _csv_name(source_vocabulary_id: str) -> str:
-    return (re.sub(r"[^A-Za-z0-9_.-]+", "_", source_vocabulary_id).strip("_") or "vocabulary") + ".csv"
+    """``<id>.csv``; ids with other characters get a hash suffix, so two ids never share a file."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", source_vocabulary_id).strip("_.") or "vocabulary"
+    if safe != source_vocabulary_id:
+        safe += "-" + hashlib.sha1(source_vocabulary_id.encode()).hexdigest()[:8]
+    return safe + ".csv"
 
 
 def _alternatives(d: MappingDecision) -> str:
@@ -137,8 +142,15 @@ def update_review_row(ws: Workspace, source_vocabulary_id: str, source_code: str
             if r.get("source_vocabulary_id") == source_vocabulary_id and r.get("source_code") == source_code:
                 r.update(changes)
                 break
-        else:
-            raise KeyError(f"{source_vocabulary_id} {source_code!r} is not in the review files")
+        else:  # the row was deleted from the CSV: restore it from decisions.json
+            decisions = ws.load_json_list(decisions_path(ws), MappingDecision)
+            d = next(
+                (x for x in decisions if x.source_vocabulary_id == source_vocabulary_id and x.source_code == source_code),
+                None,
+            )
+            if d is None:
+                raise KeyError(f"{source_vocabulary_id} {source_code!r} is not in the review files")
+            rows.append({**_row(d), **changes})
         _write_csv(path, rows)
 
 
@@ -160,14 +172,26 @@ def _parse_id(text: str) -> int | None:
 def _apply_edit(
     d: MappingDecision, row: dict[str, str], conn: psycopg.Connection | None, schemas: Schemas | None
 ) -> MappingDecision:
-    d = d.model_copy(deep=True)
-    reviewer = (row.get("reviewed_by") or "").strip()
-    if reviewer and reviewer != (d.reviewed_by or ""):
-        d.reviewed_by = reviewer
-        d.reviewed_at = (row.get("reviewed_at") or "").strip() or None
+    out = _apply_cells(d, row, conn, schemas)
     review_note = row.get("review_note")
     if review_note is not None and review_note.strip() != d.review_note:
-        d.review_note = review_note.strip()
+        out.review_note = review_note.strip()
+    # Who reviewed: a new reviewed_at stamp (the web app always writes one) names the reviewer.
+    # An edit of the status or concept without a new stamp (a spreadsheet edit) is not credited
+    # to whoever reviewed the term before.
+    stamp = (row.get("reviewed_at") or "").strip()
+    if stamp and stamp != (d.reviewed_at or ""):
+        out.reviewed_at = stamp
+        out.reviewed_by = (row.get("reviewed_by") or "").strip() or None
+    elif (out.status, out.target_concept_id) != (d.status, d.target_concept_id):
+        out.reviewed_by = out.reviewed_at = None
+    return out
+
+
+def _apply_cells(
+    d: MappingDecision, row: dict[str, str], conn: psycopg.Connection | None, schemas: Schemas | None
+) -> MappingDecision:
+    d = d.model_copy(deep=True)
     status = row.get("status", "").strip().upper()
     status_changed = status in _STATUSES and status != d.status
     if status_changed:

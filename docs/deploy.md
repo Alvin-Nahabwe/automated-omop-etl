@@ -44,6 +44,8 @@ Edit `.env`:
 * `ANTHROPIC_API_KEY`: your Claude API key, if projects will use Claude.
 * `ATHENA_DOWNLOAD_URL`: the link Athena e-mails you, if you download the vocabulary here.
   Treat it like a password.
+* `OMOP_AGENT_WEB_SECRET`: optional. A key of at least 32 characters for signing sessions,
+  for example from `openssl rand -hex 32`. If it is empty, one is generated in `data/secret_key`.
 * `OMOP_AGENT_UID` and `OMOP_AGENT_GID`: the output of `id -u` and `id -g`. The app then writes
   files as you, and you can edit them.
 
@@ -88,12 +90,15 @@ server {
 }
 ```
 
-Then set these in `.env` and run `docker compose up -d`:
+Then set `OMOP_AGENT_SECURE_COOKIES=true` in `.env`, so the session cookie is only sent over
+HTTPS, and run `docker compose up -d`.
 
-* `OMOP_AGENT_SECURE_COOKIES=true`, so the session cookie is only sent over HTTPS.
-* `FORWARDED_ALLOW_IPS=*`. This makes the app trust the client address the proxy reports, which
-  it needs to lock out repeated failed sign-ins. It is safe while the port is bound to
-  127.0.0.1, because only programs on the server can reach it.
+The app slows down password guessing per user and per client address. Inside the container,
+every connection appears to come from Docker's gateway, so the app uses the address your proxy
+reports in `X-Forwarded-For`. `FORWARDED_ALLOW_IPS=*` (the default) trusts that header. This is
+safe while the port is bound to 127.0.0.1, because only programs on the server can reach it.
+If you bind the app to a network address instead, set `FORWARDED_ALLOW_IPS` to the gateway
+address your proxy's requests come from.
 
 The app has no single sign-on or two-factor login yet. Make it reachable only from your
 internal network or VPN.
@@ -112,8 +117,10 @@ internal network or VPN.
        --source /srv/source/<name> --athena-dir /srv/athena
    ```
    This writes `projects/<name>/omop_agent.yaml`. Its database URL is
-   `${OMOP_AGENT_DB_URL}`, so no password is stored in it. Review the privacy settings and
-   `cdm_source` in that file.
+   `${OMOP_AGENT_DB_URL}`, so no password is stored in it. Its schemas are named after the
+   project (`<name>_cdm`, `<name>_src`, ...), so projects in the same database don't overwrite
+   each other; the app refuses to run a project whose schemas another project uses. Review the
+   privacy settings and `cdm_source` in that file.
 4. In the browser, open the project and press **Continue the pipeline**. The first run
    profiles the source, loads the vocabulary (a few minutes for a full bundle) and drafts the
    ETL design. It then stops until a reviewer approves the design.
@@ -146,7 +153,7 @@ docker compose run --rm app users set-role NAME operator
 docker compose run --rm app users disable NAME
 ```
 
-Changing an account signs it out everywhere. Approvals and edits are recorded with the user name
+Changing an account signs it out everywhere, and so does signing out. Approvals and edits are recorded with the user name
 in each project's `work/audit.jsonl` (the **Audit trail** tab). Sign-ins are logged in
 `data/access.jsonl`.
 
@@ -155,6 +162,7 @@ in each project's `work/audit.jsonl` (the **Audit trail** tab). Sign-ins are log
 Back up three things: the database, the `projects/` and `data/` folders, and `.env`.
 
 ```bash
+umask 077   # the backups contain patient data and secrets
 docker compose exec -T db pg_dump -U postgres -Fc omop > omop-$(date +%F).dump
 tar czf omop-files-$(date +%F).tgz projects data .env
 ```

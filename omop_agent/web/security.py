@@ -55,13 +55,28 @@ def csrf_ok(session: dict, submitted: str | None) -> bool:
 
 
 class LoginThrottle:
-    """Locks a user name or client address out for a while after repeated failed logins."""
+    """Locks sign-in out for a while after repeated failures.
 
-    def __init__(self, max_failures: int = 5, window_s: float = 900, lockout_s: float = 900):
-        self.max_failures, self.window_s, self.lockout_s = max_failures, window_s, lockout_s
+    Keys are ``kind:value``; each kind has its own limit within the window:
+
+    * ``pair`` (user name + client address): 5. Guessing one account from one place.
+    * ``user``: 20, from anywhere. Slows guessing one account from many places, without letting
+      a few typos from someone else's machine lock its owner out.
+    * ``ip``: 30, for any names. Slows one machine trying many accounts.
+    """
+
+    LIMITS = {"pair": 5, "user": 20, "ip": 30}
+
+    def __init__(self, window_s: float = 900, lockout_s: float = 900, limits: dict[str, int] | None = None):
+        self.window_s, self.lockout_s = window_s, lockout_s
+        self.limits = {**self.LIMITS, **(limits or {})}
         self._fails: dict[str, deque[float]] = defaultdict(deque)
         self._locked_until: dict[str, float] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def keys(user: str, ip: str) -> tuple[str, str, str]:
+        return (f"pair:{user}|{ip}", f"user:{user}", f"ip:{ip}")
 
     def blocked(self, *keys: str) -> bool:
         now = time.monotonic()
@@ -76,15 +91,19 @@ class LoginThrottle:
                 q.append(now)
                 while q and q[0] < now - self.window_s:
                     q.popleft()
-                if len(q) >= self.max_failures:
+                if len(q) >= self.limits.get(k.split(":", 1)[0], 5):
                     self._locked_until[k] = now + self.lockout_s
                     q.clear()
+            if len(self._fails) > 10_000:  # forget stale entries rather than grow without bound
+                for k in [k for k, q in self._fails.items() if not q or q[-1] < now - self.window_s]:
+                    del self._fails[k]
 
     def success(self, *keys: str) -> None:
         with self._lock:
             for k in keys:
-                self._fails.pop(k, None)
-                self._locked_until.pop(k, None)
+                if k.startswith("pair:"):  # a success clears only this user's own record
+                    self._fails.pop(k, None)
+                    self._locked_until.pop(k, None)
 
 
 def safe_next(target: str | None, default: str = "/") -> str:

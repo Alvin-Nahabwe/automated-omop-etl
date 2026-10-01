@@ -116,6 +116,19 @@ class Workspace:
     def state_json(self) -> Path:
         return self.root / "state.json"
 
+    @property
+    def jobs_dir(self) -> Path:
+        return self.root / "jobs"
+
+    @property
+    def run_lock(self) -> Path:
+        """Held by whoever is running the pipeline on this project (see runlock.py)."""
+        return self.jobs_dir / "run.lock"
+
+    @property
+    def run_holder(self) -> Path:
+        return self.jobs_dir / "current"
+
     # ---- model I/O ---------------------------------------------------------------------
     def save_json(self, path: Path, model: BaseModel | list[BaseModel]) -> Path:
         if isinstance(model, list):

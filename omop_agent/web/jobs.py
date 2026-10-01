@@ -2,9 +2,10 @@
 
 Each run is a separate process (``python -m omop_agent.web.worker <job.json>``) so a long run
 survives a slow page and a crashed run cannot take the web app down. Its record and log live
-in ``<workdir>/jobs/``. The worker holds an exclusive lock on ``jobs/run.lock`` while it runs
-and writes its job id to ``jobs/current``: the lock, not the record, says whether a run is in
-progress, so a run that died without updating its record shows as interrupted.
+in ``<workdir>/jobs/``. The worker holds the project's run lock while it runs (see
+``runlock.py``; command-line runs take the same lock) and names itself in ``jobs/current``: the
+lock, not the record, says whether a run is in progress, so a run that died without updating
+its record shows as interrupted.
 """
 
 from __future__ import annotations
@@ -22,7 +23,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from ..fsutil import atomic_write_text, file_lock
+from ..fsutil import atomic_write_text
+from ..runlock import lock_holder
 from ..workspace import Workspace, utcnow
 
 JOB_ID = re.compile(r"^\d{8}T\d{6}-[0-9a-f]{6}$")
@@ -43,7 +45,8 @@ JobStatus = Literal[
     "queued", "running", "waiting_review", "passed", "failed_quality", "failed", "cancelled", "interrupted"
 ]
 FINISHED = {"waiting_review", "passed", "failed_quality", "failed", "cancelled"}
-STARTUP_GRACE = timedelta(seconds=30)  # a queued run may take this long to take its lock
+STARTUP_GRACE = timedelta(seconds=30)
+WORKER_HIDDEN_ENV = {"OMOP_AGENT_WEB_SECRET"}  # the web app's secrets are not the pipeline's business  # a queued run may take this long to take its lock
 _start_lock = threading.Lock()
 
 
@@ -71,11 +74,8 @@ class Job(BaseModel):
 
 class JobStore:
     def __init__(self, ws: Workspace):
-        self.dir = ws.root / "jobs"
-
-    @property
-    def lock_path(self) -> Path:
-        return self.dir / "run.lock"
+        self.ws = ws
+        self.dir = ws.jobs_dir
 
     def path(self, job_id: str) -> Path:
         if not JOB_ID.match(job_id):
@@ -104,24 +104,16 @@ class JobStore:
         return [j for j in (self.get(n) for n in names[:limit]) if j is not None]
 
     def running(self) -> bool:
-        """True while a worker holds the run lock."""
-        if not self.lock_path.exists():
-            return False
-        with file_lock(self.lock_path, blocking=False) as got:
-            return not got
-
-    @property
-    def current_path(self) -> Path:
-        return self.dir / "current"
+        """True while anyone (a run from this app or the command line) holds the run lock."""
+        return lock_holder(self.ws) is not None
 
     def holder(self) -> str | None:
-        """Id of the job holding the run lock ("" if it has not written it yet), else None."""
-        if not self.running():
-            return None
-        try:
-            return self.current_path.read_text().strip()
-        except FileNotFoundError:
-            return ""
+        """Who holds the run lock: a job id, a description of a command-line run, or ""."""
+        return lock_holder(self.ws)
+
+    def busy(self) -> bool:
+        """A run is in progress or just starting, so mapping edits must wait."""
+        return self.running() or self.active() is not None
 
     def status(self, job: Job) -> str:
         """The job's status, with runs that died without a word shown as interrupted."""
@@ -155,7 +147,7 @@ class JobStore:
         if kind not in KINDS:
             raise ValueError(f"unknown kind of run: {kind}")
         with _start_lock:
-            if self.running() or self.active() is not None:
+            if self.busy():
                 raise JobBusy("a run of this project is already in progress")
             now = utcnow()
             job = Job(
@@ -164,9 +156,10 @@ class JobStore:
             )
             self.save(job)
             cmd = command or [sys.executable, "-m", "omop_agent.web.worker", str(self.path(job.id))]
+            env = {k: v for k, v in os.environ.items() if k not in WORKER_HIDDEN_ENV}
             with self.log_path(job.id).open("ab") as log:
                 proc = subprocess.Popen(
-                    cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env,
                     cwd=str(Path(config_path).parent), start_new_session=True, close_fds=True,
                 )
             job.pid = proc.pid

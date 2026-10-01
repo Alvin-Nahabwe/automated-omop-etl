@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +22,22 @@ app = typer.Typer(
 console = Console()
 
 ConfigOpt = typer.Option(Path("omop_agent.yaml"), "--config", "-c", help="Project config file.")
+
+
+@contextmanager
+def _exclusive(p):
+    """Hold the project's run lock (shared with the web app) while a stage changes the workspace."""
+    from .runlock import RunInProgress, run_lock
+
+    stack = ExitStack()
+    try:
+        stack.enter_context(run_lock(p.ws, f"command line, pid {os.getpid()}"))
+    except RunInProgress as e:
+        console.print(f"[red]Not started: {e}.[/]")
+        p.close()
+        raise typer.Exit(3)
+    with stack:
+        yield
 
 
 def _pipeline(config: Path, yes: bool = True, recorded: bool = False):
@@ -54,9 +72,19 @@ def init(
         "${OMOP_AGENT_DB_URL} when that variable is set (as in the Docker bundle), else a local server.",
     ),
     athena_dir: str = typer.Option("./vocab", help="Unzipped Athena vocabulary download."),
+    schema_prefix: Optional[str] = typer.Option(
+        None, help="Prefix of this project's database schemas (<prefix>_cdm, ...). Default: the directory name.",
+    ),
 ) -> None:
     """Write a starter omop_agent.yaml."""
     import os
+    import re
+
+    prefix = schema_prefix or re.sub(r"[^a-z0-9]+", "_", directory.resolve().name.lower()).strip("_")
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,39}", prefix or ""):
+        prefix = f"p_{prefix}"[:40].rstrip("_") if prefix else "omop"
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,39}", prefix):
+        raise typer.BadParameter("--schema-prefix: lower-case letters, digits and _, starting with a letter")
 
     if db_url is None:
         db_url = (
@@ -88,11 +116,12 @@ source:
 {src}
 target:
   url: {q(db_url)}
-  cdm_schema: cdm
-  vocab_schema: cdm
-  staging_schema: src
-  etl_schema: etl
-  results_schema: results
+  # Schemas are named after the project so several projects can share one database.
+  cdm_schema: {prefix}_cdm
+  vocab_schema: {prefix}_cdm   # the OHDSI convention: vocabulary tables live in the CDM schema
+  staging_schema: {prefix}_src
+  etl_schema: {prefix}_etl
+  results_schema: {prefix}_results
   # etl_role: omop_etl        # optional least-privilege role for running the generated SQL
 
 vocabulary:
@@ -152,46 +181,50 @@ def run(
     if yes and recorded_approvals:
         raise typer.BadParameter("use either --yes or --recorded-approvals, not both")
     p = _pipeline(config, yes, recorded=recorded_approvals)
-    try:
-        report = p.run_all(fresh=fresh, redesign=redesign, remap=remap)
-    except PipelineStopped as e:
-        console.print(f"[yellow]{e}[/]")
-        raise typer.Exit(2)
-    except SpecInvalid as e:
-        console.print(f"[red]{e}[/]")
-        raise typer.Exit(1)
-    console.print(f"\n[bold {'green' if report.passed else 'red'}]{'PASSED' if report.passed else 'FAILED'}[/] -> {p.ws.report_html}")
-    raise typer.Exit(0 if report.passed else 1)
+    with _exclusive(p):
+        try:
+            report = p.run_all(fresh=fresh, redesign=redesign, remap=remap)
+        except PipelineStopped as e:
+            console.print(f"[yellow]{e}[/]")
+            raise typer.Exit(2)
+        except SpecInvalid as e:
+            console.print(f"[red]{e}[/]")
+            raise typer.Exit(1)
+        console.print(f"\n[bold {'green' if report.passed else 'red'}]{'PASSED' if report.passed else 'FAILED'}[/] -> {p.ws.report_html}")
+        raise typer.Exit(0 if report.passed else 1)
 
 
 @app.command()
 def profile(config: Path = ConfigOpt) -> None:
     """Stage the source data and write the scan report (profile.md)."""
     p = _pipeline(config)
-    try:
-        p.stage_and_profile()
-    finally:
-        p.close()
+    with _exclusive(p):
+        try:
+            p.stage_and_profile()
+        finally:
+            p.close()
 
 
 @app.command()
 def annotate(config: Path = ConfigOpt) -> None:
     """Ask the LLM to interpret the profile (annotations.json)."""
     p = _pipeline(config)
-    try:
-        p.annotate()
-    finally:
-        p.close()
+    with _exclusive(p):
+        try:
+            p.annotate()
+        finally:
+            p.close()
 
 
 @app.command("vocab-load")
 def vocab_load(config: Path = ConfigOpt, force: bool = typer.Option(False, help="Reload even if the version matches.")) -> None:
     """Load the Athena vocabulary download."""
     p = _pipeline(config)
-    try:
-        p.load_vocabulary(force=force)
-    finally:
-        p.close()
+    with _exclusive(p):
+        try:
+            p.load_vocabulary(force=force)
+        finally:
+            p.close()
 
 
 @app.command("vocab-download")
@@ -219,10 +252,11 @@ def vocab_download(
 def design(config: Path = ConfigOpt) -> None:
     """Draft the ETL specification (etl_spec.yaml / etl_spec.md)."""
     p = _pipeline(config)
-    try:
-        p.design()
-    finally:
-        p.close()
+    with _exclusive(p):
+        try:
+            p.design()
+        finally:
+            p.close()
 
 
 @app.command("map")
@@ -232,21 +266,23 @@ def map_codes(
 ) -> None:
     """Evaluate the vocabulary and map source codes (mappings/*.csv)."""
     p = _pipeline(config)
-    try:
-        p.map_vocabulary(remap=remap)
-    finally:
-        p.close()
+    with _exclusive(p):
+        try:
+            p.map_vocabulary(remap=remap)
+        finally:
+            p.close()
 
 
 @app.command("apply-mappings")
 def apply_mappings(config: Path = ConfigOpt) -> None:
     """Load reviewed mappings/*.csv edits into source_to_concept_map."""
     p = _pipeline(config)
-    try:
-        n = p.apply_reviewed_mappings()
-        console.print(f"{n} mappings written")
-    finally:
-        p.close()
+    with _exclusive(p):
+        try:
+            n = p.apply_reviewed_mappings()
+            console.print(f"{n} mappings written")
+        finally:
+            p.close()
 
 
 @app.command()
@@ -258,17 +294,18 @@ def build(
     from .pipeline import SpecInvalid
 
     p = _pipeline(config)
-    try:
-        if repair:
-            report = p.build_check_repair()
-            raise typer.Exit(0 if report.passed else 1)
-        result = p.build()
-        raise typer.Exit(0 if result.ok else 1)
-    except SpecInvalid as e:
-        console.print(f"[red]{e}[/]")
-        raise typer.Exit(1)
-    finally:
-        p.close()
+    with _exclusive(p):
+        try:
+            if repair:
+                report = p.build_check_repair()
+                raise typer.Exit(0 if report.passed else 1)
+            result = p.build()
+            raise typer.Exit(0 if result.ok else 1)
+        except SpecInvalid as e:
+            console.print(f"[red]{e}[/]")
+            raise typer.Exit(1)
+        finally:
+            p.close()
 
 
 @app.command()
@@ -362,7 +399,8 @@ def demo(
     console.print(f"Demo project written to {directory} (config {cfg_path})")
     if run_pipeline:
         p = _pipeline(cfg_path, yes=True)
-        report = p.run_all(fresh=True)
+        with _exclusive(p):
+            report = p.run_all(fresh=True)
         console.print(f"\n[bold {'green' if report.passed else 'red'}]{'PASSED' if report.passed else 'FAILED'}[/] -> {p.ws.report_html}")
         raise typer.Exit(0 if report.passed else 1)
 

@@ -8,6 +8,7 @@ from functools import cached_property
 from pathlib import Path
 
 from ..config import ProjectConfig, load_config
+from ..db import normalize_url
 from ..workspace import Workspace
 
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -41,6 +42,39 @@ def _load(pid: str, d: Path) -> Project:
         return Project(id=pid, dir=d, cfg=load_config(d / CONFIG_NAME))
     except Exception as e:  # a broken config is shown on the page, not a server error
         return Project(id=pid, dir=d, error=f"{type(e).__name__}: {str(e)[:400]}")
+
+
+def _written_schemas(cfg: ProjectConfig) -> set[str]:
+    t = cfg.target
+    return {t.cdm_schema, t.staging_schema, t.etl_schema, t.results_schema}
+
+
+def _all_schemas(cfg: ProjectConfig) -> set[str]:
+    return _written_schemas(cfg) | {cfg.target.vocab_schema}
+
+
+def _same_database(a: ProjectConfig, b: ProjectConfig) -> bool:
+    def key(url: str) -> str:
+        return normalize_url(url).split("@")[-1].split("?")[0].lower()  # host:port/dbname
+
+    return key(a.target.url) == key(b.target.url)
+
+
+def schema_conflicts_for(project_dir: Path, cfg: ProjectConfig) -> list[str]:
+    """Other projects (next to ``project_dir``) whose database schemas overlap this one's.
+
+    Two projects that write to the same schemas would overwrite each other's staged data and
+    CDM. A vocabulary schema that neither project writes to may be shared.
+    """
+    project_dir = Path(project_dir).resolve()
+    out = []
+    for other in list_projects(project_dir.parent):
+        if other.cfg is None or other.dir.resolve() == project_dir or not _same_database(cfg, other.cfg):
+            continue
+        shared = (_written_schemas(cfg) & _all_schemas(other.cfg)) | (_all_schemas(cfg) & _written_schemas(other.cfg))
+        if shared:
+            out.append(f"{other.id}: {', '.join(sorted(shared))}")
+    return out
 
 
 def list_projects(root: Path) -> list[Project]:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import os
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -28,15 +29,25 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader
 from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
-from ..approvals import GATE_PHRASES, GATES, approved_snapshot, gate_state, mapping_changes, record_approval
+from ..approvals import (
+    GATE_PHRASES,
+    GATES,
+    ApprovalConflict,
+    approved_snapshot,
+    gate_state,
+    mapping_changes,
+    record_approval,
+)
 from ..db import Schemas, connect
 from ..models import ConceptCandidate, DQReport, ETLSpec, MappingDecision
+from ..runlock import RunInProgress, run_lock
 from ..vocab.review import import_review, update_review_row
 from ..workspace import utcnow
 from .jobs import KIND_LABELS, KINDS, JobBusy, JobStore
-from .projects import Project, get_project, list_projects
+from .projects import Project, get_project, list_projects, schema_conflicts_for
 from .security import (
     APP_CSP,
     BASE_HEADERS,
@@ -47,7 +58,7 @@ from .security import (
     load_secret_key,
     safe_next,
 )
-from .users import ROLES, User, UserStore
+from .users import ROLES, USERNAME, User, UserStore
 
 HERE = Path(__file__).parent
 STAGE_ORDER = ["profile", "annotate", "vocab_load", "design", "vocab_map", "build", "quality", "report"]
@@ -71,6 +82,7 @@ MAPPING_FILTERS = {
 PAGE_SIZE = 100
 SEARCH_MIN_SCORE = 0.1  # weaker lexical matches are noise in the reviewer's list
 NOTE_MAX = 1000
+PASSWORD_MAX = 1024
 # Audit fields too large or too raw to show in the browser.
 AUDIT_HIDDEN = {"system", "prompt", "response", "transcript", "tool_calls", "sql"}
 
@@ -152,7 +164,8 @@ def create_app(
     # ---- helpers -----------------------------------------------------------------------
     def access_log(event: str, **fields: Any) -> None:
         record = {"ts": utcnow().isoformat(), "event": event, **fields}
-        with (data_dir / "access.jsonl").open("a") as fh:
+        fd = os.open(data_dir / "access.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as fh:
             fh.write(json.dumps(record) + "\n")
 
     def current_user(request: Request) -> User | None:
@@ -233,8 +246,8 @@ def create_app(
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException):
         titles = {403: "Not allowed", 404: "Not found", 409: "Project not usable"}
-        return render(
-            request, "error.html.j2", status_code=exc.status_code,
+        return await run_in_threadpool(
+            render, request, "error.html.j2", status_code=exc.status_code,
             title=titles.get(exc.status_code, "Something went wrong"), message=str(exc.detail),
         )
 
@@ -248,7 +261,7 @@ def create_app(
         return FileResponse(HERE / "static" / "favicon.svg", media_type="image/svg+xml")
 
     @app.get("/login")
-    async def login_page(request: Request, next: str = "/"):
+    def login_page(request: Request, next: str = "/"):
         if current_user(request):
             return redirect(safe_next(next))
         return render(request, "login.html.j2", next=safe_next(next), no_users=not users.list())
@@ -256,20 +269,25 @@ def create_app(
     @app.post("/login")
     async def login(request: Request):
         form = await form_of(request)
-        name = form.get("username", "").strip().lower()
+        return await run_in_threadpool(_login, request, form)
+
+    def _login(request: Request, form: dict[str, str]):
+        typed = form.get("username", "").strip().lower()
+        name = typed if USERNAME.match(typed) else ""  # anything else is never logged or echoed
+        password = form.get("password", "")
         ip = request.client.host if request.client else "?"
-        keys = (f"user:{name}", f"ip:{ip}")
+        keys = throttle.keys(name or "?", ip)
         nxt = safe_next(form.get("next"))
         if throttle.blocked(*keys):
-            access_log("login_blocked", user=name, ip=ip)
+            access_log("login_blocked", user=name or "(not a user name)", ip=ip)
             return render(
                 request, "login.html.j2", status_code=429, next=nxt, username=name,
                 error="Too many failed sign-ins. Wait 15 minutes and try again.",
             )
-        user = users.authenticate(name, form.get("password", ""))
-        if user is None:
+        user = users.authenticate(name or "-", password[:PASSWORD_MAX])
+        if user is None or len(password) > PASSWORD_MAX:
             throttle.failure(*keys)
-            access_log("login_failed", user=name, ip=ip)
+            access_log("login_failed", user=name or "(not a user name)", ip=ip)
             return render(
                 request, "login.html.j2", status_code=401, next=nxt, username=name,
                 error="Wrong user name or password.",
@@ -284,9 +302,13 @@ def create_app(
     @app.post("/logout")
     async def logout(request: Request):
         await form_of(request)
+        return await run_in_threadpool(_logout, request)
+
+    def _logout(request: Request):
         user = current_user(request)
         request.session.clear()
         if user:
+            users.sign_out_everywhere(user.name)  # a copied session cookie stops working too
             access_log("logout", user=user.name, ip=request.client.host if request.client else "?")
         return redirect("/login")
 
@@ -313,7 +335,7 @@ def create_app(
         return out
 
     @app.get("/")
-    async def home(request: Request):
+    def home(request: Request):
         user = need(request)
         return render(
             request, "projects.html.j2", user=user, projects=[summary(p) for p in list_projects(projects_dir)],
@@ -321,7 +343,7 @@ def create_app(
         )
 
     @app.get("/p/{pid}")
-    async def project_page(request: Request, pid: str):
+    def project_page(request: Request, pid: str):
         user = need(request)
         proj = project_or_404(pid)
         ctx = summary(proj)
@@ -331,6 +353,9 @@ def create_app(
             ctx["counts"] = _mapping_counts(proj)
             order = STAGE_ORDER + [s for s in ctx["stages"] if s not in STAGE_ORDER]
             ctx["stage_rows"] = [(s, ctx["stages"].get(s)) for s in order]
+            ctx["conflicts"] = schema_conflicts_for(proj.dir, proj.cfg)
+            holder = jobs.holder()
+            ctx["other_run"] = holder if holder is not None and ctx["active_job"] is None else None
         return render(request, "project.html.j2", user=user, tab="overview", **ctx)
 
     def _mapping_counts(proj: Project) -> dict[str, int] | None:
@@ -340,7 +365,7 @@ def create_app(
 
     # ---- ETL design --------------------------------------------------------------------
     @app.get("/p/{pid}/spec")
-    async def spec_page(request: Request, pid: str):
+    def spec_page(request: Request, pid: str):
         user = need(request)
         proj = configured(project_or_404(pid))
         ws = proj.ws
@@ -360,24 +385,25 @@ def create_app(
                     )
                 )
         issues_path = ws.root / "design_issues.json"
-        ctx["issues"] = json.loads(issues_path.read_text()) if issues_path.exists() else []
-        ctx["repairs"] = json.loads(ws.repairs_json.read_text()) if ws.repairs_json.exists() else []
+        ctx["issues"] = _json_list(issues_path)
+        ctx["repairs"] = _json_list(ws.repairs_json)
         return render(request, "spec.html.j2", user=user, tab="spec", **ctx)
 
     @app.post("/p/{pid}/spec/approve")
     async def approve_spec(request: Request, pid: str):
-        user = need(request, "reviewer")
         form = await form_of(request)
-        proj = configured(project_or_404(pid))
-        return _approve_gate(request, proj, "design", user, form, f"/p/{pid}/spec")
+        return await run_in_threadpool(_approve_gate, request, pid, "design", form, f"/p/{pid}/spec")
 
-    def _approve_gate(request: Request, proj: Project, stage: str, user: User, form: dict, back: str):
-        # Approve only what the reviewer saw: refuse if it changed after the page was loaded.
-        if form.get("expected_digest") != gate_state(proj.ws, stage).digest:
+    def _approve_gate(request: Request, pid: str, stage: str, form: dict, back: str):
+        user = need(request, "reviewer")
+        proj = configured(project_or_404(pid))
+        try:  # approve only what the reviewer saw
+            record_approval(
+                proj.ws, stage, user.name, form.get("note", "")[:NOTE_MAX], expected_digest=form.get("expected_digest", "")
+            )
+        except ApprovalConflict:
             flash(request, "error", f"The {GATE_PHRASES[stage]} changed after you opened the page. Review it again.")
             return redirect(back)
-        try:
-            record_approval(proj.ws, stage, user.name, form.get("note", "")[:NOTE_MAX])
         except FileNotFoundError as e:
             flash(request, "error", str(e))
             return redirect(back)
@@ -391,7 +417,7 @@ def create_app(
 
     # ---- code mappings -----------------------------------------------------------------
     @app.get("/p/{pid}/mappings")
-    async def mappings_page(
+    def mappings_page(
         request: Request, pid: str, filter: str = "review", vocab: str = "", page: int = 1, term: str = "", q: str = ""
     ):
         user = need(request)
@@ -428,31 +454,45 @@ def create_app(
                     except Exception as e:  # e.g. the vocabulary is not loaded yet
                         search_error = f"Search failed: {type(e).__name__}"
         gate = gate_state(ws, "vocab_map")
-        busy = JobStore(ws).active() is not None
         return render(
             request, "mappings.html.j2", user=user, project=proj, decisions=shown, total=len(rows), counts=counts,
             vocabs=vocabs, vocab=vocab, filter=filter, filters=MAPPING_FILTERS, page=page, pages=pages,
             open_term=open_term, q=q, search_results=search_results, search_error=search_error, gate=gate,
-            changes=mapping_changes(ws) if gate.approval and not gate.current else [], busy=busy,
+            changes=mapping_changes(ws) if gate.approval and not gate.current else [], busy=JobStore(ws).busy(),
             choices=lambda d: _choices(d, search_results if d is open_term else None),
             db_ok=conn is not None, anchor=term_anchor, tab="mappings", include_unchecked=proj.cfg.mapping.use_unchecked_in_etl,  # type: ignore[union-attr]
         )
 
     @app.post("/p/{pid}/mappings/decide")
     async def decide(request: Request, pid: str):
-        user = need(request, "reviewer")
         form = await form_of(request)
+        return await run_in_threadpool(_decide, request, pid, form)
+
+    def _decide(request: Request, pid: str, form: dict[str, str]):
+        user = need(request, "reviewer")
         proj = configured(project_or_404(pid))
         ws = proj.ws
         svid, code = form.get("vocab_id", ""), form.get("code", "")
         back_q = {k: form.get(f"back_{k}", "") for k in ("filter", "vocab", "page")}
         back = f"/p/{pid}/mappings?" + urlencode({k: v for k, v in back_q.items() if v}) + "#" + term_anchor(svid, code)
-        if JobStore(ws).active() is not None:
-            flash(request, "error", "A pipeline run is in progress. Mapping edits are paused until it finishes.")
-            return redirect(back)
         action = form.get("action", "")
         if action not in {"approve", "flag", "reject"}:
             raise HTTPException(400, "Unknown action.")
+        paused = "A pipeline run is in progress. Mapping edits are paused until it finishes."
+        if JobStore(ws).active() is not None:
+            flash(request, "error", paused)
+            return redirect(back)
+        try:
+            # Hold the run lock while checking and saving, so no run starts in between and
+            # overwrites the edit (runs from the command line take the same lock).
+            with run_lock(ws, f"mapping edit by {user.name}", wait_s=2):
+                return _save_decision(request, proj, user, form, svid, code, action, back)
+        except RunInProgress:
+            flash(request, "error", paused)
+            return redirect(back)
+
+    def _save_decision(request, proj: Project, user: User, form: dict, svid: str, code: str, action: str, back: str):
+        ws = proj.ws
         schemas = Schemas.from_config(proj.cfg.target)  # type: ignore[union-attr]
         with vocab_conn(proj) as conn:
             decisions = import_review(ws, conn, schemas) if conn is not None else import_review(ws)
@@ -496,7 +536,11 @@ def create_app(
                 changes["status"] = "APPROVED"
             else:
                 changes["status"] = {"flag": "FLAGGED", "reject": "REJECTED"}[action]
-        update_review_row(ws, svid, code, changes)
+        try:
+            update_review_row(ws, svid, code, changes)
+        except KeyError:
+            flash(request, "error", f"'{code}' is missing from the review files; run the mapping step again.")
+            return redirect(back)
         ws.audit(
             "mapping_reviewed", by=user.name, source_vocabulary_id=svid, source_code=code, action=action,
             before={"target_concept_id": d.target_concept_id, "status": d.status},
@@ -508,16 +552,17 @@ def create_app(
 
     @app.post("/p/{pid}/mappings/approve")
     async def approve_mappings(request: Request, pid: str):
-        user = need(request, "reviewer")
         form = await form_of(request)
-        proj = configured(project_or_404(pid))
-        return _approve_gate(request, proj, "vocab_map", user, form, f"/p/{pid}/mappings")
+        return await run_in_threadpool(_approve_gate, request, pid, "vocab_map", form, f"/p/{pid}/mappings")
 
     # ---- runs --------------------------------------------------------------------------
     @app.post("/p/{pid}/runs")
     async def start_run(request: Request, pid: str):
-        user = need(request, "operator")
         form = await form_of(request)
+        return await run_in_threadpool(_start_run, request, pid, form)
+
+    def _start_run(request: Request, pid: str, form: dict[str, str]):
+        user = need(request, "operator")
         proj = configured(project_or_404(pid))
         kind = form.get("kind", "continue")
         if kind not in KINDS:
@@ -533,7 +578,7 @@ def create_app(
         return redirect(f"/p/{pid}/runs/{job.id}")
 
     @app.get("/p/{pid}/runs/{job_id}")
-    async def run_page(request: Request, pid: str, job_id: str):
+    def run_page(request: Request, pid: str, job_id: str):
         user = need(request)
         proj = configured(project_or_404(pid))
         jobs = JobStore(proj.ws)
@@ -548,8 +593,11 @@ def create_app(
 
     @app.post("/p/{pid}/runs/{job_id}/stop")
     async def stop_run(request: Request, pid: str, job_id: str):
-        user = need(request, "operator")
         await form_of(request)
+        return await run_in_threadpool(_stop_run, request, pid, job_id)
+
+    def _stop_run(request: Request, pid: str, job_id: str):
+        user = need(request, "operator")
         proj = configured(project_or_404(pid))
         if JobStore(proj.ws).cancel(job_id):
             proj.ws.audit("web_run_stop_requested", job=job_id, by=user.name)
@@ -560,7 +608,7 @@ def create_app(
 
     # ---- report and audit --------------------------------------------------------------
     @app.get("/p/{pid}/report")
-    async def report(request: Request, pid: str, version: str = "full"):
+    def report(request: Request, pid: str, version: str = "full"):
         need(request)
         proj = configured(project_or_404(pid))
         path = proj.ws.root / ("report.shareable.html" if version == "shareable" else "report.html")
@@ -569,7 +617,7 @@ def create_app(
         return FileResponse(path, media_type="text/html", headers={"Content-Security-Policy": REPORT_CSP})
 
     @app.get("/p/{pid}/audit")
-    async def audit(request: Request, pid: str):
+    def audit(request: Request, pid: str):
         user = need(request)
         proj = configured(project_or_404(pid))
         events = []
@@ -580,6 +628,15 @@ def create_app(
         return render(request, "audit.html.j2", user=user, project=proj, events=events, tab="audit")
 
     return app
+
+
+def _json_list(path: Path) -> list:
+    """A JSON list from ``path``; empty when missing or unreadable (a page must still render)."""
+    try:
+        data = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
 
 
 def _choices(d: MappingDecision, results: list[ConceptCandidate] | None) -> list[ConceptCandidate]:

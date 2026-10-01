@@ -24,7 +24,9 @@ services:
       - ./postgres-init:/docker-entrypoint-initdb.d:ro
     shm_size: 1g  # vocabulary loads build large indexes
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d omop"]
+      # Over TCP: during first-time setup the server listens only on its socket, so this stays
+      # unhealthy until the omop role and database exist.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d omop"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -38,6 +40,7 @@ services:
         PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
     image: omop-agent:local
     restart: unless-stopped
+    init: true  # reaps the processes of finished pipeline runs
     depends_on:
       db:
         condition: service_healthy
@@ -49,7 +52,10 @@ services:
       ATHENA_DOWNLOAD_URL: ${ATHENA_DOWNLOAD_URL:-}
       OMOP_AGENT_WEB_SECRET: ${OMOP_AGENT_WEB_SECRET:-}
       OMOP_AGENT_SECURE_COOKIES: ${OMOP_AGENT_SECURE_COOKIES:-false}
-      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      # Inside the container every client appears to come from Docker's gateway, so the address
+      # your reverse proxy reports (X-Forwarded-For) is trusted. Safe while the port is bound to
+      # 127.0.0.1 (only programs on this server can connect); see docs/deploy.md otherwise.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
       HOME: /tmp
     volumes:
       - ./projects:/srv/projects  # one sub-directory per project (omop_agent.yaml + work/)

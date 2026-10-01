@@ -74,14 +74,21 @@ def _check_stage(stage: str) -> None:
         raise ValueError(f"unknown review gate '{stage}'; use one of: {', '.join(GATES)}")
 
 
-def _spec_payload(ws: Workspace) -> Any | None:
-    if not ws.spec_yaml.exists():
-        return None
-    raw = yaml.safe_load(ws.spec_yaml.read_text())
+def _spec_payload_of(text: str) -> Any:
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return {"unparsable_yaml": text}  # still has a digest: a broken file is "changed"
     try:  # compare meaning, not formatting: defaults and key order do not matter
         return ETLSpec.model_validate(raw).model_dump(mode="json")
     except ValidationError:
         return raw
+
+
+def _spec_payload(ws: Workspace) -> Any | None:
+    if not ws.spec_yaml.exists():
+        return None
+    return _spec_payload_of(ws.spec_yaml.read_text())
 
 
 def _mapping_rows(ws: Workspace) -> list[list[Any]] | None:
@@ -129,23 +136,40 @@ def gate_state(ws: Workspace, stage: str) -> GateState:
     )
 
 
-def record_approval(ws: Workspace, stage: str, by: str, note: str = "") -> Approval:
-    """Approve the gate's current artifact as ``by``. Raises if there is nothing to approve."""
+class ApprovalConflict(RuntimeError):
+    """What would be approved is not what the reviewer saw."""
+
+
+def record_approval(
+    ws: Workspace, stage: str, by: str, note: str = "", expected_digest: str | None = None
+) -> Approval:
+    """Approve the gate's current artifact as ``by``.
+
+    With ``expected_digest`` (what the reviewer's page showed), raises ApprovalConflict if the
+    artifact has changed since. The digest and the kept copy come from one read of the
+    artifact, under the approvals lock. Raises FileNotFoundError if there is nothing to approve.
+    """
     by = by.strip()
     if not by:
         raise ValueError("an approval needs the reviewer's name")
-    payload = _payload(ws, stage)
-    if payload is None:
-        what = "etl_spec.yaml" if stage == "design" else "mappings/decisions.json"
-        raise FileNotFoundError(f"nothing to approve yet: {what} does not exist")
-    approval = Approval(stage=stage, by=by, at=utcnow(), digest=_digest(payload), note=note.strip())
-    snap = _snapshot_path(ws, stage)
-    snap.parent.mkdir(exist_ok=True)
-    if stage == "design":
-        atomic_write_text(snap, ws.spec_yaml.read_text())
-    else:
-        atomic_write_text(snap, json.dumps(payload, indent=1) + "\n")
+    _check_stage(stage)
     with file_lock(ws.root / ".approvals.lock"):
+        if stage == "design":
+            text = ws.spec_yaml.read_text() if ws.spec_yaml.exists() else None
+            payload = None if text is None else _spec_payload_of(text)
+        else:
+            payload = _mapping_rows(ws)
+            text = None if payload is None else json.dumps(payload, indent=1) + "\n"
+        if payload is None or text is None:
+            what = "etl_spec.yaml" if stage == "design" else "mappings/decisions.json"
+            raise FileNotFoundError(f"nothing to approve yet: {what} does not exist")
+        digest = _digest(payload)
+        if expected_digest is not None and expected_digest != digest:
+            raise ApprovalConflict(f"the {GATE_PHRASES[stage]} changed after the page was loaded")
+        approval = Approval(stage=stage, by=by, at=utcnow(), digest=digest, note=note.strip())
+        snap = _snapshot_path(ws, stage)
+        snap.parent.mkdir(exist_ok=True)
+        atomic_write_text(snap, text)
         data = {k: v.model_dump(mode="json") for k, v in load_approvals(ws).items()}
         data[stage] = approval.model_dump(mode="json")
         atomic_write_text(_path(ws), json.dumps(data, indent=2) + "\n")

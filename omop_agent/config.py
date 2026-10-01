@@ -31,7 +31,8 @@ def expand_env(value: str) -> str:
 
 
 class _Base(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    # Values may come from ${VAR} expansion (passwords in URLs): keep them out of error messages.
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, hide_input_in_errors=True)
 
 
 class SourceConfig(_Base):

@@ -11,6 +11,11 @@
   LLM: {{ project.cfg.llm.provider }}{% if project.cfg.llm.provider == 'anthropic' %} ({{ project.cfg.llm.model }}){% endif %}
 </p>
 
+{% if conflicts %}
+<div class="callout bad"><strong>This project shares database schemas with another project</strong>, so their runs would overwrite each other's data:
+  {{ conflicts|join('; ') }}. Give it its own schema names in <code>omop_agent.yaml</code> (for example <code>{{ project.id|lower|replace('-', '_') }}_cdm</code>); runs from this app are refused until then.</div>
+{% endif %}
+
 <div class="grid">
   <section class="card">
     <h2>Review steps</h2>
@@ -25,6 +30,8 @@
     {% if active_job %}
       <p>{{ badge('running') }} {{ active_job.label }}, started by {{ active_job.by }}.
       <a href="/p/{{ project.id }}/runs/{{ active_job.id }}">Watch the run</a></p>
+    {% elif other_run is not none %}
+      <p>{{ badge('running') }} A run started outside this app is in progress{% if other_run %} ({{ other_run }}){% endif %}. Reload this page to see when it ends.</p>
     {% elif user.can('operator') %}
       <p class="small muted">A run continues from where the last one stopped and pauses at a review step until a reviewer approves it.</p>
       <form method="post" action="/p/{{ project.id }}/runs">

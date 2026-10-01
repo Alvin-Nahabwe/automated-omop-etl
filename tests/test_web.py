@@ -423,3 +423,191 @@ def test_review_cycle_with_recorded_approvals(tmp_path):
         assert client.get("/p/demo/report").status_code == 200
     finally:
         _drop(prefix)
+
+
+# ---- fixes from review ---------------------------------------------------------------
+
+
+def test_a_broken_spec_file_does_not_break_the_pages(site):
+    client, ws, *_ = site
+    record_approval(ws, "design", "rita")
+    ws.spec_yaml.write_text("table_mappings: [unclosed\n  - : :")
+    login(client, "vera")
+    assert client.get("/").status_code == 200
+    assert client.get("/p/demo").status_code == 200
+    page = client.get("/p/demo/spec")
+    assert page.status_code == 200 and "has errors" in page.text and "changed since approval" in page.text
+
+
+def test_projects_sharing_schemas_are_flagged_and_not_run(site, tmp_path):
+    from omop_agent.web.projects import schema_conflicts_for
+
+    client, ws, *_ = site
+    projects = ws.root.parent.parent
+    other = _write_project(projects, "other")  # same URL and the same schema names as "demo"
+    third = _write_project(projects, "third", prefix="third")
+    cfg = load_config(projects / "demo" / "omop_agent.yaml")
+    assert schema_conflicts_for(projects / "demo", cfg) == ["other: t_cdm, t_etl, t_results, t_src"]
+    assert schema_conflicts_for(third, load_config(third / "omop_agent.yaml")) == []
+    login(client, "olive")
+    assert "shares database schemas with another project" in client.get("/p/demo").text
+    token = _csrf(client, "/p/demo")
+    r = client.post("/p/demo/runs", data={"csrf_token": token, "kind": "continue"}, follow_redirects=False)
+    job_id = r.headers["location"].rsplit("/", 1)[-1]
+    store = JobStore(ws)
+    assert _wait(store, job_id) == "failed"
+    assert "another project uses" in store.get(job_id).message
+    assert other.exists()
+
+
+def test_mapping_edits_wait_for_a_run_started_elsewhere(site):
+    from omop_agent.runlock import run_lock
+
+    client, ws, *_ = site
+    login(client, "rita")
+    with run_lock(ws, "command line, pid 1"):
+        assert "A run started outside this app is in progress" in client.get("/p/demo").text
+        assert "edits are paused" in client.get("/p/demo/mappings").text
+        r = _decide(client, ws, "TLD (TDF/3TC/DTG)", "reject")
+        assert "Mapping edits are paused" in client.get(r.headers["location"]).text
+    assert next(d for d in import_review(ws) if d.source_code.startswith("TLD")).status == "UNCHECKED"
+    _decide(client, ws, "TLD (TDF/3TC/DTG)", "reject")
+    assert next(d for d in import_review(ws) if d.source_code.startswith("TLD")).status == "REJECTED"
+
+
+def test_command_line_stages_refuse_to_run_during_another_run(site):
+    from typer.testing import CliRunner
+
+    from omop_agent.cli import app as cli
+    from omop_agent.runlock import run_lock
+
+    _, ws, *_ = site
+    cfg = str(ws.root.parent / "omop_agent.yaml")
+    with run_lock(ws, "web run 20261001T000000-abcdef"):
+        result = CliRunner().invoke(cli, ["map", "-c", cfg])
+    assert result.exit_code == 3 and "another run of this project is in progress" in result.output
+
+
+def test_sign_in_input_is_bounded_and_the_log_is_private(site):
+    client, _, users, data = site
+    r = login(client, "x" * 100_000, "whatever-password")
+    assert r.status_code == 401
+    log = (data / "access.jsonl").read_text()
+    assert "xxxxxxxxxx" not in log and "(not a user name)" in log
+    assert oct((data / "access.jsonl").stat().st_mode & 0o777) == "0o600"
+    assert login(client, "olive", "p" * 5000).status_code == 401
+
+
+def test_signing_out_ends_the_users_other_sessions(site):
+    client, _, users, data = site
+    other = TestClient(client.app)
+    login(client, "rita")
+    login(other, "rita")
+    assert other.get("/", follow_redirects=False).status_code == 200
+    client.post("/logout", data={"csrf_token": _csrf(client, "/")})
+    assert other.get("/", follow_redirects=False).status_code == 303
+
+
+def test_one_persons_typos_do_not_lock_others_out():
+    from omop_agent.web.security import LoginThrottle
+
+    t = LoginThrottle()
+    for _ in range(5):
+        t.failure(*t.keys("rita", "10.0.0.5"))
+    assert t.blocked(*t.keys("rita", "10.0.0.5"))
+    assert not t.blocked(*t.keys("rita", "10.0.0.9"))  # rita from her own machine
+    assert not t.blocked(*t.keys("olive", "10.0.0.5"))  # others on the shared machine
+    for i in range(30):
+        t.failure(*t.keys(f"user{i}", "10.0.0.66"))
+    assert t.blocked(*t.keys("olive", "10.0.0.66"))  # one machine trying many accounts
+
+
+def test_worker_waits_briefly_for_the_run_lock(site):
+    import threading
+
+    from omop_agent.runlock import run_lock
+    from omop_agent.web.jobs import Job
+    from omop_agent.web.worker import run_job
+    from omop_agent.workspace import utcnow
+
+    _, ws, *_ = site
+    store = JobStore(ws)
+    job = Job(id=f"{utcnow():%Y%m%dT%H%M%S}-abc123", kind="continue", by="olive",
+              config_path=str(ws.root.parent / "omop_agent.yaml"), created_at=utcnow())
+    store.save(job)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with run_lock(ws, "someone checking"):
+            held.set()
+            release.wait(5)
+
+    t = threading.Thread(target=hold)
+    t.start()
+    held.wait(5)
+    threading.Timer(1.0, release.set).start()
+    done = run_job(store.path(job.id))
+    t.join()
+    assert "Another run" not in done.message  # it waited, then ran (and failed on the missing database)
+
+
+def test_config_errors_do_not_echo_secrets(tmp_path, monkeypatch):
+    from omop_agent.web.projects import list_projects
+
+    monkeypatch.setenv("SECRET_URL", "postgresql://omop:Sup3rS3cret@db/omop")
+    d = tmp_path / "p" / "bad"
+    d.mkdir(parents=True)
+    (d / "omop_agent.yaml").write_text("name: bad\ntarget: {url: ${SECRET_URL}, cdm_schema: [not, a, name]}\n")
+    [proj] = list_projects(tmp_path / "p")
+    assert proj.error and "Sup3rS3cret" not in proj.error
+
+
+def test_reviewer_credit_follows_the_edit(site):
+    client, ws, *_ = site
+    login(client, "rita")
+    _decide(client, ws, "Paracetamol 500mg", "approve")
+    first = next(d for d in import_review(ws) if d.source_code == "Paracetamol 500mg")
+    export_review(ws, import_review(ws))  # a pipeline run folds the edit into decisions.json
+    time.sleep(1.1)
+    _decide(client, ws, "Paracetamol 500mg", "flag")
+    second = next(d for d in import_review(ws) if d.source_code == "Paracetamol 500mg")
+    assert second.reviewed_by == "rita" and second.reviewed_at > first.reviewed_at
+    export_review(ws, import_review(ws))
+    # A spreadsheet edit that changes the status without a new stamp is not credited to rita.
+    path = ws.mappings_dir / "SRC_DRUG.csv"
+    with path.open(newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    for r in rows:
+        if r["source_code"] == "Paracetamol 500mg":
+            r["status"] = "REJECTED"
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    third = next(d for d in import_review(ws) if d.source_code == "Paracetamol 500mg")
+    assert third.status == "REJECTED" and third.reviewed_by is None
+
+
+def test_a_row_deleted_from_the_csv_can_still_be_reviewed(site):
+    client, ws, *_ = site
+    path = ws.mappings_dir / "SRC_DRUG.csv"
+    lines = path.read_text().splitlines(keepends=True)
+    path.write_text("".join(line for line in lines if not line.startswith("UNCHECKED,SRC_DRUG,TLD")))
+    login(client, "rita")
+    r = _decide(client, ws, "TLD (TDF/3TC/DTG)", "reject")
+    assert r.status_code == 303
+    assert next(d for d in import_review(ws) if d.source_code.startswith("TLD")).status == "REJECTED"
+
+
+def test_record_approval_refuses_a_stale_digest(site):
+    from omop_agent.approvals import ApprovalConflict, artifact_digest
+
+    _, ws, *_ = site
+    digest = artifact_digest(ws, "vocab_map")
+    from omop_agent.vocab.review import update_review_row
+
+    update_review_row(ws, "SRC_DRUG", "TLD (TDF/3TC/DTG)", {"status": "FLAGGED"})
+    with pytest.raises(ApprovalConflict):
+        record_approval(ws, "vocab_map", "rita", expected_digest=digest)
+    a = record_approval(ws, "vocab_map", "rita", expected_digest=artifact_digest(ws, "vocab_map"))
+    assert gate_state(ws, "vocab_map").current and a.by == "rita"
