@@ -223,6 +223,10 @@ runs the demo inside it.
   gender, plausible units) need the official R DQD (`quality.use_r_dqd: true`).
 * The demo vocabulary and the recorded LLM answers are synthetic and hand-written. Never load
   the fixture vocabulary into a real CDM.
+* The web app has local accounts only (no single sign-on or two-factor login yet). Keep it on
+  the internal network or VPN, behind HTTPS. The ETL design is reviewed in the browser but
+  edited on the server (`etl_spec.yaml`). The Docker image does not include R, so the
+  official R Achilles/DQD (`quality.use_r_dqd`) needs R installed separately.
 
 ## Licence and attribution
 

@@ -121,3 +121,37 @@ and every change is recorded in `repairs.json` and the audit log.
 With `quality.use_r_dqd: true` and R available, the official Achilles and
 DataQualityDashboard packages also run through a generated R script. Their JSON results feed
 the same gate.
+
+## Review gates, the web app and deployment
+
+The pipeline stops twice for people: after the ETL design and after code mapping. How a gate
+decides depends on how the pipeline is run:
+
+* `omop-agent run` asks at the terminal; `--yes` skips both gates (for demos and CI).
+* `omop-agent run --recorded-approvals`, and every run started from the web app, continue only
+  when a reviewer approved what the gate shows *as it is now*. `approvals.py` stores each
+  approval in `work/approvals.json` with a sha256 digest. For the design, the digest covers the
+  validated spec, so formatting and comments don't count. For the mappings, it covers each
+  term's target concept and status. A hand edit, a redraft, a repair, a changed mapping or a
+  new source code changes the digest, and the run stops with status `waiting_review`. A copy of
+  what was approved is kept under `work/approvals/`, so the web app can show what changed.
+
+The web app (`omop_agent/web/`, FastAPI with server-rendered Jinja pages) is an interface to
+the same files the command line uses, not a separate system:
+
+* Mapping edits change cells of `mappings/<vocabulary>.csv` (`vocab/review.py:update_review_row`,
+  under a file lock), exactly as a spreadsheet edit would. `import_review` applies them on the
+  next run. Each edit records `reviewed_by`, `reviewed_at` and `review_note`, which are carried
+  into `decisions.json`.
+* Runs are separate processes (`web/worker.py`) that hold `work/jobs/run.lock`, one per
+  project. Their records and logs are in `work/jobs/`. Mapping edits are refused while a run is
+  in progress, and forms carry the state the reviewer saw (expected concept and status, gate
+  digest), so nobody approves or overwrites a change they did not see.
+* Accounts (`web/users.py`) are local, have three roles (viewer, reviewer, operator) and are
+  managed with `omop-agent users` on the server. Sessions are signed cookies (strict SameSite,
+  `Secure` behind HTTPS) that end when the account changes. Every form has a CSRF token. Pages
+  load no external assets and no inline scripts, under a strict Content-Security-Policy.
+
+`deploy/` packages it for one server: an image with the CLI and the app (non-root), and
+PostgreSQL 16 with `pg_trgm` and an application role that owns its database but is not a
+superuser. The database is not published outside the compose network. See `docs/deploy.md`.
