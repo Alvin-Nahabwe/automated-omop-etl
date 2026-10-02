@@ -15,6 +15,7 @@ re-run on its own (``omop-agent <stage>``) after a human edits an artifact.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -23,6 +24,7 @@ import psycopg
 from .cdm.ddl import create_cdm_tables, create_etl_tables
 from .config import ProjectConfig
 from .db import Schemas, connect
+from .fsutil import atomic_write_text
 from .llm import LLMClient, make_llm
 from .models import DQReport, ETLRunResult, ETLSpec, MappingDecision, SourceAnnotations, SourceProfile
 from .workspace import Workspace
@@ -106,16 +108,46 @@ class Pipeline:
         """Before any step that sends source data to Claude: the privacy review must be approved."""
         from .privacy_review import REVIEW_MD, refresh, sends_to_llm
 
-        if self._privacy_checked or not sends_to_llm(self.cfg) or not self.ws.profile_json.exists():
+        if self._privacy_checked:
             return
-        if refresh(self.cfg, self.ws) is None:
+        if not sends_to_llm(self.cfg):
+            if self.ws.stage_status("privacy") == "awaiting_review":
+                self.ws.mark("privacy", "done", note="nothing is sent to Claude")
             return
+        if not self.ws.profile_json.exists() or refresh(self.cfg, self.ws) is None:
+            raise RuntimeError(
+                "Profile the source first (`omop-agent profile`): the privacy review is built from the "
+                "profile and must be approved before anything is sent to Claude."
+            )
         self._gate(
             "privacy",
             "Check what will be sent to Claude: the withheld columns and the profile exactly as Claude will see it.",
             [str(self.ws.root / REVIEW_MD)],
         )
+        if self.ws.stage_status("privacy") != "done":
+            self.ws.mark("privacy", "done")
         self._privacy_checked = True
+
+    # A run that stops at a review gate is continued by a plain run, so what the operator asked
+    # for (start over, redraft, map again) is kept here until the step has been done.
+    def _pending(self) -> dict[str, bool]:
+        try:
+            raw = json.loads(self.ws.pending_json.read_text()) if self.ws.pending_json.exists() else {}
+        except ValueError:
+            raw = {}
+        return {k: bool(v) for k, v in raw.items() if k in PENDING_STEPS and v}
+
+    def _save_pending(self, flags: dict[str, bool]) -> None:
+        flags = {k: True for k, v in flags.items() if v}
+        if flags:
+            atomic_write_text(self.ws.pending_json, json.dumps(flags, indent=2) + "\n")
+        elif self.ws.pending_json.exists():
+            self.ws.pending_json.unlink()
+
+    def _done_pending(self, step: str) -> None:
+        flags = self._pending()
+        if flags.pop(step, False):
+            self._save_pending(flags)
 
     def _run_stage(self, stage: str, fn: Callable[[], object]) -> object:
         self.log(f"▶ {stage}")
@@ -161,7 +193,10 @@ class Pipeline:
             self.log(f"  profiled {len(profile.tables)} tables; {n_pii} identifier columns withheld from the LLM")
             return profile
 
-        return self._run_stage("profile", run)  # type: ignore[return-value]
+        profile = self._run_stage("profile", run)
+        self._privacy_checked = False  # a new profile needs its own review
+        self._done_pending("profile")
+        return profile  # type: ignore[return-value]
 
     def annotate(self) -> SourceAnnotations:
         from .profiling.annotate import annotate
@@ -175,7 +210,9 @@ class Pipeline:
                 self.log(f"  note: {note}")
             return ann
 
-        return self._run_stage("annotate", run)  # type: ignore[return-value]
+        ann = self._run_stage("annotate", run)
+        self._done_pending("annotate")
+        return ann  # type: ignore[return-value]
 
     def load_vocabulary(self, force: bool = False) -> None:
         from .vocab.loader import load_athena, vocab_loaded
@@ -226,6 +263,7 @@ class Pipeline:
                 return spec
 
             spec = self._run_stage("design", run)  # type: ignore[assignment]
+            self._done_pending("redesign")
         self._gate(
             "design",
             "Review the ETL design (etl_spec.md). Edit etl_spec.yaml to change it.",
@@ -287,6 +325,7 @@ class Pipeline:
             return decisions
 
         decisions = self._run_stage("vocab_map", run)
+        self._done_pending("remap")
         self._gate(
             "vocab_map",
             "Review the code mappings in mappings/*.csv (set status/target_concept_id), then continue.",
@@ -520,15 +559,22 @@ class Pipeline:
             fresh=fresh, redesign=redesign, remap=remap,
         )
         try:
-            if fresh or not self.ws.profile_json.exists():
+            asked = {"profile": fresh, "annotate": fresh, "redesign": fresh or redesign, "remap": fresh or remap}
+            earlier = self._pending()
+            if earlier:
+                self.log(f"  continuing an earlier request: {', '.join(sorted(earlier))}")
+            todo = {k: v or earlier.get(k, False) for k, v in asked.items()}
+            self._save_pending(todo)
+            if todo["profile"] or not self.ws.profile_json.exists():
                 self.stage_and_profile()
             else:
                 self.log("▶ profile: reusing the staged source and profile.json")
-            if fresh or not self.ws.annotations_json.exists():
+            self._privacy_gate()
+            if todo["annotate"] or not self.ws.annotations_json.exists():
                 self.annotate()
             self.load_vocabulary()
-            self.design(redraft=fresh or redesign or not self.ws.spec_yaml.exists())
-            self.map_vocabulary(remap=fresh or remap)
+            self.design(redraft=todo["redesign"] or not self.ws.spec_yaml.exists())
+            self.map_vocabulary(remap=todo["remap"])
             report = self.build_check_repair()
             self.report()
             self.ws.audit("pipeline_end", passed=report.passed)
@@ -536,6 +582,8 @@ class Pipeline:
         finally:
             self.close()
 
+
+PENDING_STEPS = ("profile", "annotate", "redesign", "remap")
 
 SPEC_HEADER = "# ETL specification (restored by the repair loop). Edit and re-run `omop-agent build`."
 

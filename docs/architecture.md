@@ -168,6 +168,10 @@ How a gate decides depends on how the pipeline is run:
   new source code changes the digest, and the run stops with status `waiting_review`. A copy of
   what was approved is kept under `work/approvals/`, so the web app can show what changed.
 
+A stopped run is continued by a plain run. What the stopped run was asked to redo (start over,
+redraft the design, map again) is kept in `work/pending_run.json` until that step has run, so
+stopping at the privacy review, which comes before that work, doesn't lose the request.
+
 Every gate writes a `review_gate` audit event (approved, skipped, stopped or not checked). The
 report's Reviews table is built from those events and the approvals, and a PASSED verdict
 carries a "Not fully reviewed" caveat when a gate was skipped, the repair agent changed the

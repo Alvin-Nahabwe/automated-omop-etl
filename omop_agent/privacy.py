@@ -32,10 +32,20 @@ _PHONE = re.compile(r"^(\+?254|0)?[17]\d{8}$|^\+\d{9,15}$")
 _PHONE_SEPARATORS = re.compile(r"[\s\-().]")
 # One or more coordinates: "-1.2921 36.8219", "-1.2921,36.8219", ODK geopoints "-1.29 36.82 1650.0 5.0".
 _GPS = re.compile(r"^-?\d{1,3}\.\d{3,}[\s,;]+-?\d{1,3}\.\d{3,}([\s,;]+-?\d+(\.\d+)?){0,2}$")
-# Column names of keys and codes: their long numbers are ids, not phone numbers.
+# Column names of keys and codes: their long numbers are ids, not phone numbers...
 _ID_LIKE_NAME = re.compile(r"(^|_)(id|uuid|guid|key|no|num|number|code|ref)$|[a-z]id$")
-FREE_TEXT_MIN_WORDS = 6
+# ...unless the name says it is a phone number ("cell_no", "contact_number"; "contact_id" stays a key).
+_PHONE_WORD = re.compile(r"(phone|mobile|cell|contact|(^|_)tel|msisdn).*(no|num|number|nr|ref)$")
+# Free text: long values written as sentences. Coded labels (LOINC long names, drug strengths,
+# ICD titles) are long too, but have few function words and no sentence punctuation.
+FREE_TEXT_MIN_WORDS = 8
 FREE_TEXT_MIN_LENGTH = 40
+_FUNCTION_WORDS = frozenset(
+    "a an the and but or so was were is are be been he she his her him they them their we our it its "
+    "had has have with for to at on from that this who when after before because then not no "
+    "na ya wa kwa ni la za alikuwa akiwa yeye baada kabla".split()
+)
+_SENTENCE_BREAK = re.compile(r"[a-z][.!?;:,]\s+[a-zA-Z]")
 
 # Words that make "<word>_name" the name of a thing, not of a person.
 _THING = (
@@ -46,12 +56,52 @@ _THING = (
     r"ethnicity|religion|occupation|relationship|method|catchment|cluster|zone|country|nationality|sheet|"
     r"table|column|package|app|device|sample|specimen|batch|kit|supplier|ward|unit"
 )
-# Built-in identifier rules: (what the column holds, pattern on the lower-case column name).
-NAME_RULES: list[tuple[str, re.Pattern[str]]] = [
-    ("a person's name", re.compile(
-        rf"^(?!(.*_)?({_THING})(_|$))(.*_)?(names?|[flmo]name|other_?names?|(first|last|sur|middle|given|"
-        rf"family|maiden|nick|full)_?names?)(_|$)"
-    )),
+_THING_WORD = re.compile(rf"^({_THING})s?$")
+# The parts of a column name that name a person: "name", "first_name", "fname", "patientname"...
+_NAME_TOKEN = re.compile(
+    r"^(names?|[flmo]name|(first|last|sur|middle|given|family|maiden|nick|full|other|christian|baptismal|"
+    r"patient|client|person|individual|member|respondent|mother|mothers|father|fathers|guardian|parent|kin|"
+    r"spouse|husband|wife|partner|child|baby|infant|caregiver|caretaker|deceased|informant|household_?head|"
+    r"head|owner|contact|witness)names?)$"
+)
+# "patient_name", "mother_s_name": a person word right before "name" settles it.
+_PERSON_WORD = re.compile(
+    r"^(first|last|sur|middle|given|family|maiden|nick|full|other|patient|client|person|individual|member|"
+    r"respondent|mother|mothers|father|fathers|guardian|parent|kin|spouse|husband|wife|partner|child|baby|"
+    r"infant|caregiver|caretaker|deceased|informant|head|owner|witness|s)$"
+)
+
+
+def _person_name(col: str) -> bool:
+    """A column name that holds a person's name: a name part not qualified by a thing word
+    ("facility_name", "drug_name", "name_of_village" are not people)."""
+    tokens = [t for t in col.split("_") if t]
+    for i, tok in enumerate(tokens):
+        if not _NAME_TOKEN.match(tok):
+            continue
+        before = tokens[i - 1] if i > 0 else ""
+        after = tokens[i + 2] if i + 2 < len(tokens) and tokens[i + 1] == "of" else ""
+        if before and _THING_WORD.match(before) and not _PERSON_WORD.match(before):
+            continue
+        if after and _THING_WORD.match(after):
+            continue
+        return True
+    return False
+
+
+class _NameCheck:
+    """A name rule that is a function rather than a pattern (same ``search`` interface)."""
+
+    def __init__(self, fn):  # type: ignore[no-untyped-def]
+        self.fn = fn
+
+    def search(self, col: str) -> bool:
+        return bool(self.fn(col))
+
+
+# Built-in identifier rules: (what the column holds, a check on the lower-case column name).
+NAME_RULES: list[tuple[str, "re.Pattern[str] | _NameCheck"]] = [
+    ("a person's name", _NameCheck(_person_name)),
     ("a staff member's name", re.compile(
         r"(^|_)(seen_by|attended_by|interviewer|enumerator|field_?worker|clinician|recorded_by|entered_by|"
         r"reviewed_by|signed_by|data_?clerk|user_?name)$"
@@ -59,7 +109,8 @@ NAME_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("a name question of the WHO verbal autopsy form", re.compile(r"(^|_)id10(007|017|018|061|062)($|_)")),
     ("a phone number", re.compile(
         r"(^|_)(phone|telephone|tel|msisdn|cellphone|contact_?(no|num|number|phone))($|_)"
-        r"|(^|_)mobile(_?(no|num|number|phone))?$"
+        r"|(^|_)(mobile|cell)(_?(no|num|number|phone|nr))?$|phone"
+        r"|(^|_)(emergency_?contact|contact_?(person|details|info))($|_)"
     )),
     ("an e-mail address", re.compile(r"e_?mail")),
     ("a national, health or register number", re.compile(
@@ -124,16 +175,23 @@ def detect_pii(table: str, column: str, sample_values: Iterable[str], cfg: Priva
         n = len(values)
         if sum(bool(_EMAIL.match(v)) for v in values) / n > 0.5:
             return "the values look like e-mail addresses"
-        if not _ID_LIKE_NAME.search(column.lower()):
+        if not _ID_LIKE_NAME.search(column.lower()) or _PHONE_WORD.search(column.lower()):
             phones = [v for v in values if not _DATE_LIKE.match(v) and _PHONE.match(_PHONE_SEPARATORS.sub("", v))]
             if len(phones) / n > 0.5:
                 return "the values look like phone numbers"
         if sum(bool(_GPS.match(v)) for v in values) / n > 0.5:
             return "the values look like GPS coordinates"
-        texts = [v for v in values if len(v) >= FREE_TEXT_MIN_LENGTH and len(v.split()) >= FREE_TEXT_MIN_WORDS]
-        if len(texts) / n > 0.5:
+        if sum(_looks_like_text(v) for v in values) / n > 0.5:
             return "the values look like free text (notes and narratives can contain names)"
     return None
+
+
+def _looks_like_text(v: str) -> bool:
+    words = v.split()
+    if len(v) < FREE_TEXT_MIN_LENGTH or len(words) < FREE_TEXT_MIN_WORDS or "[" in v:
+        return False
+    n_function = sum(w.strip(".,;:!?()\"'").lower() in _FUNCTION_WORDS for w in words)
+    return n_function >= 3 or bool(_SENTENCE_BREAK.search(v))
 
 
 def apply_overrides(
@@ -151,7 +209,8 @@ def apply_overrides(
     labelled: dict[str, str] = {}
     if annotations is not None:
         for ca in annotations.columns:
-            if ca.semantic_type in ("pii", "free_text"):
+            # Only Claude's own labels: the rule-based fallback calls any long string free text.
+            if ca.origin == "llm" and ca.semantic_type in ("pii", "free_text"):
                 what = "an identifier" if ca.semantic_type == "pii" else "free text"
                 labelled[f"{ca.table}.{ca.column}".lower()] = f"labelled {what} when Claude interpreted the profile"
     tables: list[TableProfile] = []
@@ -191,7 +250,8 @@ def llm_view(profile: SourceProfile, cfg: PrivacyConfig) -> SourceProfile:
             if c.is_pii or not cfg.send_values_to_llm:
                 cols.append(redact_column(c))
                 continue
-            kept, n_dropped = suppress_small_cells(c.top_values, profile.min_cell_count)
+            # The stricter of the threshold the profile was taken with and the current setting.
+            kept, n_dropped = suppress_small_cells(c.top_values, max(profile.min_cell_count, cfg.min_cell_count))
             update: dict = {
                 "top_values": kept[: cfg.max_values_per_column],
                 "n_suppressed_values": c.n_suppressed_values + n_dropped,

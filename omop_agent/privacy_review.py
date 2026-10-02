@@ -4,8 +4,11 @@ Identifier detection is heuristic, so before the first live call a reviewer chec
 Claude will see it and the columns that are withheld, and approves it (the ``privacy`` review
 gate, in the web app or with ``omop-agent approve privacy``). The review is written to
 ``<workdir>/privacy_review.json`` (what the approval's digest covers) and ``privacy_review.md``.
-It is rebuilt from the current profile, annotations and privacy settings whenever it is shown or
-checked, so a re-staged source or a changed setting needs a fresh approval.
+It is rebuilt from the current profile and privacy settings whenever it is shown or checked, so a
+re-staged source or a changed setting needs a fresh approval. Columns that Claude later labels as
+identifiers or free text are withheld from then on; they are listed, but they only remove data
+from what was approved, so they don't need a new approval (``also_withheld`` is left out of the
+digest).
 
 Projects that do not call Claude (``llm.provider`` ``none`` or ``replay``) need no privacy review.
 """
@@ -45,27 +48,37 @@ def review_path(ws: Workspace) -> Path:
     return ws.root / REVIEW_JSON
 
 
-def current_profile(cfg: ProjectConfig, ws: Workspace) -> SourceProfile | None:
-    """The profile with the current privacy settings and Claude's identifier labels applied."""
+def current_profile(cfg: ProjectConfig, ws: Workspace, with_labels: bool = True) -> SourceProfile | None:
+    """The profile with the current privacy settings (and, with ``with_labels``, Claude's
+    identifier labels) applied."""
     if not ws.profile_json.exists():
         return None
     profile = ws.load_json(ws.profile_json, SourceProfile)
-    annotations = ws.load_json(ws.annotations_json, SourceAnnotations) if ws.annotations_json.exists() else None
+    annotations = None
+    if with_labels and ws.annotations_json.exists():
+        annotations = ws.load_json(ws.annotations_json, SourceAnnotations)
     return apply_overrides(profile, cfg.privacy, annotations)
 
 
-def build_review(cfg: ProjectConfig, ws: Workspace) -> dict[str, Any] | None:
-    """The review content, or None before the source has been profiled."""
-    profile = current_profile(cfg, ws)
-    if profile is None:
-        return None
-    k = cfg.privacy.min_cell_count
-    withheld = [
+def _withheld(profile: SourceProfile) -> list[dict[str, Any]]:
+    return [
         {"table": t.name, "column": c.name, "reason": c.pii_reason or "identifier", "n_distinct": c.n_distinct}
         for t in profile.tables
         for c in t.columns
         if c.is_pii
     ]
+
+
+def build_review(cfg: ProjectConfig, ws: Workspace) -> dict[str, Any] | None:
+    """The review content, or None before the source has been profiled."""
+    profile = current_profile(cfg, ws, with_labels=False)
+    if profile is None:
+        return None
+    k = cfg.privacy.min_cell_count
+    withheld = _withheld(profile)
+    labelled = current_profile(cfg, ws)
+    before = {(w["table"], w["column"]) for w in withheld}
+    also = [w for w in _withheld(labelled) if (w["table"], w["column"]) not in before] if labelled else []
     return {
         "provider": cfg.llm.provider,
         "model": cfg.llm.model,
@@ -79,8 +92,14 @@ def build_review(cfg: ProjectConfig, ws: Workspace) -> dict[str, Any] | None:
         "sent": [s.format(k=k) for s in LATER_SENDS],
         "tables": [{"name": t.name, "rows": t.n_rows, "columns": len(t.columns)} for t in profile.tables],
         "withheld": withheld,
+        "also_withheld": also,
         "profile_text": profile_prompt_text(profile, cfg.privacy),
     }
+
+
+def digest_payload(review: dict[str, Any]) -> dict[str, Any]:
+    """The part of the review an approval covers (later labels only withhold more)."""
+    return {k: v for k, v in review.items() if k != "also_withheld"}
 
 
 def render_md(review: dict[str, Any]) -> str:
@@ -101,8 +120,18 @@ def render_md(review: dict[str, Any]) -> str:
         "|---|---|---|",
         *[f"| {w['table']} | {w['column']} | {w['reason']} |" for w in review["withheld"]],
         "",
+        *(
+            [
+                f"Also withheld from later prompts ({len(review['also_withheld'])}), because Claude labelled them "
+                "as identifiers or free text: " + ", ".join(f"{w['table']}.{w['column']}" for w in review["also_withheld"]),
+                "",
+            ]
+            if review.get("also_withheld")
+            else []
+        ),
         "Check the columns that are NOT in this list too. To withhold another column, add it to "
-        "`privacy.pii_columns`; to release a column flagged by mistake, add it to `privacy.not_pii_columns`.",
+        "`privacy.pii_columns`. To release a column flagged by mistake, add it to `privacy.not_pii_columns`; "
+        "its values were never collected, so they are sent only after the source is profiled again.",
         "",
         "## The profile exactly as Claude will see it",
         "",

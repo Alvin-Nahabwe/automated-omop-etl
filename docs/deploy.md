@@ -140,8 +140,9 @@ internal network or VPN.
    profiles the source and then stops for the **privacy review**, before anything is sent to
    Claude. A reviewer opens the **Privacy** tab, checks the withheld columns and the profile
    exactly as Claude will see it (look for names, phone numbers, local ID numbers, GPS or free
-   text among the listed values), fixes the settings if needed (`privacy.pii_columns`,
-   `privacy.not_pii_columns`) and approves it.
+   text among the listed values), fixes the settings if needed and approves it. A column added
+   to `privacy.pii_columns` is withheld at once. One released with `privacy.not_pii_columns`
+   only shows values after the source is profiled again (**Start over**).
 5. **Continue the pipeline** again: Claude interprets the profile, the vocabulary is loaded (a
    few minutes for a full bundle) and the ETL design is drafted. The run then stops until a
    reviewer approves the design.

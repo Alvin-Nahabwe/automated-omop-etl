@@ -127,6 +127,45 @@ def test_review_gate_stops(demo_project):
                for e in p.ws.read_audit())
 
 
+@pytest.mark.postgres
+def test_start_over_survives_a_privacy_stop(demo_project, monkeypatch):
+    """A run that stops at the privacy review is continued by a plain run: what the operator asked
+    for (start over) still happens, and the approved review leaves no unfinished stage behind."""
+    import omop_agent.privacy_review as privacy_review
+    from omop_agent.approvals import record_approval, recorded_approver
+
+    cfg = load_config(demo_project)
+    Pipeline(cfg, log=lambda m: None).run_all()
+    spec_path = cfg.workdir / "etl_spec.yaml"
+    spec_path.write_text(spec_path.read_text() + "\n# reviewer note\n")
+    annotated_at = (cfg.workdir / "annotations.json").stat().st_mtime_ns
+
+    monkeypatch.setattr(privacy_review, "sends_to_llm", lambda c: True)  # as if the project used Claude
+    p = Pipeline(cfg, log=lambda m: None)
+    ws, approver = p.ws, recorded_approver(p.ws)
+
+    def run(**kw):
+        with pytest.raises(PipelineStopped) as e:
+            Pipeline(cfg, approver=approver, log=lambda m: None).run_all(**kw)
+        return e.value.stage
+
+    assert run(fresh=True) == "privacy"
+    assert json.loads(ws.pending_json.read_text()) == {"annotate": True, "redesign": True, "remap": True}
+    record_approval(ws, "privacy", "rita")
+    assert run() == "design"
+    assert (cfg.workdir / "annotations.json").stat().st_mtime_ns != annotated_at  # interpreted again
+    assert "# reviewer note" not in spec_path.read_text()  # redrafted...
+    assert "# reviewer note" in (cfg.workdir / "etl_spec.1.yaml").read_text()  # ...after a backup
+    assert json.loads(ws.pending_json.read_text()) == {"remap": True}
+    record_approval(ws, "design", "rita")
+    assert run() == "vocab_map"
+    assert not ws.pending_json.exists()
+    record_approval(ws, "vocab_map", "rita")
+    report = Pipeline(cfg, approver=approver, log=lambda m: None).run_all()
+    assert report.passed and ws.stage_status("privacy") == "done"
+    assert "Verdict: PASSED" in ws.report_md.read_text()
+
+
 def test_cli_init(tmp_path, monkeypatch):
     monkeypatch.delenv("PGUSER", raising=False)
     monkeypatch.delenv("PGPASSWORD", raising=False)

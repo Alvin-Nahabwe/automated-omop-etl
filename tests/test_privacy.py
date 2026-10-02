@@ -14,13 +14,16 @@ from omop_agent.workspace import Workspace, utcnow
 
 NAMES = ["deceased_name", "respondent_name", "informant_name", "hh_head_name", "interviewer_name", "fname", "lname",
          "othername", "mother_s_name", "patient_s_name", "name_of_mother", "chv_name", "provider_name", "clinician",
-         "seen_by", "surname", "first_name", "name"]
+         "seen_by", "surname", "first_name", "name", "patientname", "clientname", "mothersname", "guardianname",
+         "clinic_patient_name", "facility_client_name", "household_head_name", "name_of_patient"]
 OTHER_IDENTIFIERS = ["id10007", "id10017", "id10018", "ccc_no", "upi", "birth_cert_no", "huduma_no", "opd_no", "ip_no",
                      "plot_no", "house_no", "geopoint", "coordinates", "latlong", "hh_long", "x_coord", "easting",
-                     "phone", "mobile", "email", "national_id", "va_narrative", "comments", "other_specify", "id10476"]
+                     "phone", "mobile", "email", "national_id", "va_narrative", "comments", "other_specify", "id10476",
+                     "cell", "cell_no", "cell_number", "patientphone", "emergency_contact", "contact_person"]
 CLINICAL = ["cd4_cell_count", "cell_count", "tb_contact", "contact_screened", "mobile_clinic", "name_of_facility",
             "drug_name", "test_name", "village_name", "facility_name", "sub_location_name", "cause_of_death",
-            "long_term_illness", "house_type", "sex", "dob", "individual_id", "notes_count", "respondent_relationship"]
+            "long_term_illness", "house_type", "sex", "dob", "individual_id", "notes_count", "respondent_relationship",
+            "brand_name", "unit_name", "file_name", "contacts_traced", "contact_tracing_status"]
 
 
 @pytest.mark.parametrize("column", NAMES + OTHER_IDENTIFIERS)
@@ -48,6 +51,15 @@ def test_identifiers_are_detected_by_value():
     assert "free text" in detect_pii("t", "story", stories, cfg)
     drugs = ["Paracetamol 500mg", "Amoxicillin 250mg caps", "ORS sachets", "Zinc 20mg", "Metformin 500mg"]
     assert detect_pii("t", "drug", drugs, cfg) is None
+    # Long coded labels are not free text: LOINC names, drug strengths, ICD titles.
+    labels = ["Glucose [Mass/volume] in Serum or Plasma --fasting", "Cholesterol in LDL [Mass/volume] in Serum or Plasma by calculation",
+              "Amoxicillin 250 MG / Clavulanate 62.5 MG Oral Suspension 100 ML bottle",
+              "Artemether 20 MG / Lumefantrine 120 MG Oral Tablet 24 tablets pack",
+              "Other and unspecified disorders of the circulatory system in diseases classified elsewhere"]
+    assert detect_pii("t", "test_description", labels, cfg) is None
+    # A key-like name does not hide phone numbers when the name says phone.
+    assert "phone" in detect_pii("t", "alt_cell_ref", phones, cfg)
+    assert detect_pii("t", "contact_id", ["123456789", "712345678", "100000001", "100000002", "100000003"], cfg) is None
 
 
 def test_allow_list_and_explicit_list():
@@ -76,11 +88,15 @@ def _profile() -> SourceProfile:
     )
 
 
-def test_overrides_and_claudes_labels_are_applied():
-    annotations = SourceAnnotations(tables=[], columns=[
-        ColumnAnnotation(table="va", column="informant", semantic_type="pii", description="informant's name"),
-        ColumnAnnotation(table="va", column="story", semantic_type="free_text", description="narrative"),
+def _labels(origin="llm") -> SourceAnnotations:
+    return SourceAnnotations(tables=[], columns=[
+        ColumnAnnotation(table="va", column="informant", semantic_type="pii", description="name", origin=origin),
+        ColumnAnnotation(table="va", column="story", semantic_type="free_text", description="narrative", origin=origin),
     ])
+
+
+def test_overrides_and_claudes_labels_are_applied():
+    annotations = _labels()
     cfg = PrivacyConfig(not_pii_columns=["va.cd4_count"])
     profile = apply_overrides(_profile(), cfg, annotations)
     cols = {c.name: c for c in profile.tables[0].columns}
@@ -90,6 +106,29 @@ def test_overrides_and_claudes_labels_are_applied():
     assert not cols["cd4_count"].is_pii and not cols["cause"].is_pii
     text = "\n".join(str(c.top_values) for c in llm_view(profile, cfg).tables[0].columns)
     assert "Kamau" not in text and "Malaria" in text
+
+    # The rule-based fallback calls any long string free text: its labels withhold nothing.
+    cols = {c.name: c for c in apply_overrides(_profile(), cfg, _labels("rules")).tables[0].columns}
+    assert not cols["informant"].is_pii and not cols["story"].is_pii
+
+
+def test_label_origin_is_not_part_of_claudes_answer_schema():
+    from omop_agent.profiling.annotate import heuristic_annotations, reconcile
+
+    assert "origin" not in str(SourceAnnotations.model_json_schema())
+    profile = _profile()
+    answer = SourceAnnotations(tables=[], columns=[
+        ColumnAnnotation(table="va", column="story", semantic_type="free_text", description="narrative"),
+    ])
+    origins = {c.column: c.origin for c in reconcile(answer, profile).columns}
+    assert origins["story"] == "llm" and origins["cause"] == "rules"  # filled in by the fallback
+    assert {c.origin for c in heuristic_annotations(profile).columns} == {"rules"}
+
+
+def test_current_setting_suppresses_values_a_laxer_profile_kept():
+    profile = _profile()  # profiled with min_cell_count 5; every value seen 20 times
+    view = llm_view(profile, PrivacyConfig(min_cell_count=25))
+    assert all(c.top_values == [] for c in view.tables[0].columns)
 
 
 def _project(tmp_path, provider="anthropic", **privacy) -> ProjectConfig:
@@ -125,6 +164,29 @@ def test_privacy_review_and_gate(tmp_path):
     assert not gate_state(ws, "privacy").current
     with pytest.raises(PipelineStopped):
         Pipeline(cfg2, approver=recorded_approver(ws), log=lambda m: None)._privacy_gate()
+
+
+def test_claudes_later_labels_keep_the_approval(tmp_path):
+    cfg = _project(tmp_path)
+    ws = Workspace(cfg.workdir)
+    ws.save_json(ws.profile_json, _profile())
+    refresh(cfg, ws)
+    record_approval(ws, "privacy", "rita")
+    ws.save_json(ws.annotations_json, _labels())  # Claude labels two more columns: they are withheld from now on
+    refresh(cfg, ws)
+    review = build_review(cfg, ws)
+    assert [w["column"] for w in review["also_withheld"]] == ["informant", "story"]
+    assert "Kamau Mwangi" in review["profile_text"]  # what was approved and sent first
+    assert gate_state(ws, "privacy").current  # withholding more needs no new approval
+    assert "Also withheld from later prompts (2)" in (ws.root / REVIEW_MD).read_text()
+    Pipeline(cfg, approver=recorded_approver(ws), log=lambda m: None)._privacy_gate()
+    assert ws.stage_status("privacy") == "done"
+
+
+def test_nothing_is_sent_without_a_profile(tmp_path):
+    cfg = _project(tmp_path)
+    with pytest.raises(RuntimeError, match="Profile the source first"):
+        Pipeline(cfg, approver=recorded_approver(Workspace(cfg.workdir)), log=lambda m: None)._privacy_gate()
 
 
 def test_no_privacy_review_without_claude(tmp_path):

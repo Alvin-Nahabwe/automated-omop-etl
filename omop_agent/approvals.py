@@ -73,10 +73,10 @@ def _snapshot_path(ws: Workspace, stage: str) -> Path:
 
 
 def _privacy_payload(ws: Workspace) -> Any | None:
-    from .privacy_review import review_path
+    from .privacy_review import digest_payload, review_path
 
     path = review_path(ws)
-    return json.loads(path.read_text()) if path.exists() else None
+    return digest_payload(json.loads(path.read_text())) if path.exists() else None
 
 
 def _check_stage(stage: str) -> None:

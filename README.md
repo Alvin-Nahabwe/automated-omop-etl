@@ -144,11 +144,12 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   UPI, Huduma, OPD/IP numbers), addresses (plot and house numbers), GPS (including ODK
   geopoints) and free text (narratives, comments, "other, specify"). Value rules catch e-mail
   addresses, Kenyan and international phone numbers, coordinates and free text. Columns Claude
-  itself labels as identifiers or free text are withheld from then on. Values of patient,
-  parent, household and other key columns are never listed. Withheld columns can't be used in
-  the ETL spec or sent for mapping; the validator rejects them. List extra identifier columns
-  in `privacy.pii_columns`, and columns flagged by mistake (a CD4 count) in
-  `privacy.not_pii_columns`.
+  itself labels as identifiers or free text are withheld from then on. Values of patient and
+  parent keys are never listed, nor are those of household, visit and other record keys with
+  more than 50 distinct values. Withheld columns can't be used in the ETL spec or sent for
+  mapping; the validator rejects them. List extra identifier columns in `privacy.pii_columns`,
+  and columns flagged by mistake (a CD4 count) in `privacy.not_pii_columns` (their values are
+  collected the next time the source is profiled).
 * **A person checks what will be sent before Claude is first called.** Detection is
   heuristic, so a project that uses Claude stops for a *privacy review*: the withheld columns
   and the profile exactly as Claude will see it (`work/privacy_review.md`, or the Privacy tab of

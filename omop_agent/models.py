@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.json_schema import SkipJsonSchema
 
 # --------------------------------------------------------------------------------------
 # Stage 1: source profile ("White Rabbit")
@@ -95,6 +96,8 @@ class ColumnAnnotation(BaseModel):
         "vocabulary (e.g. 'ICD10', 'LOINC', 'RxNorm'), or 'local' for site-specific codes/labels.",
     )
     description: str = Field(..., description="One sentence on what the column holds.")
+    # Who labelled the column: Claude, or the rule-based fallback. Not part of the answer schema.
+    origin: SkipJsonSchema[Literal["llm", "rules"]] = "rules"
 
 
 class TableAnnotation(BaseModel):

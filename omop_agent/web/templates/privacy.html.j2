@@ -7,6 +7,8 @@
 
 {% if not sends %}
 <div class="card"><p>Not needed: this project does not send data to Claude (<code>llm.provider: {{ project.cfg.llm.provider }}</code>).</p></div>
+{% elif problem %}
+<div class="card"><div class="callout">{{ problem }}</div></div>
 {% elif review is none %}
 <div class="card"><p class="muted">The source has not been profiled yet. The first pipeline run profiles it and then stops here for this review, before anything is sent.</p></div>
 {% else %}
@@ -33,7 +35,8 @@
     <tbody>{% for w in review.withheld %}<tr><td>{{ w.table }}</td><td><code>{{ w.column }}</code></td><td class="small">{{ w.reason }}</td></tr>{% endfor %}</tbody>
   </table></div>
   {% else %}<div class="callout">No column was flagged. Check the profile below carefully.</div>{% endif %}
-  <p class="small">Check the columns that are <em>not</em> listed here too. To withhold another column, add <code>table.column</code> to <code>privacy.pii_columns</code> in <code>omop_agent.yaml</code>; to release one flagged by mistake (for example a CD4 count), add it to <code>privacy.not_pii_columns</code>. Then reload this page.</p>
+  {% if review.also_withheld %}<p class="small">Also withheld from later prompts, because Claude labelled them as identifiers or free text (no new review needed, this only removes data): {% for w in review.also_withheld %}<code>{{ w.table }}.{{ w.column }}</code>{{ ", " if not loop.last }}{% endfor %}.</p>{% endif %}
+  <p class="small">Check the columns that are <em>not</em> listed here too. To withhold another column, add <code>table.column</code> to <code>privacy.pii_columns</code> in <code>omop_agent.yaml</code> and reload this page. To release one flagged by mistake (for example a CD4 count), add it to <code>privacy.not_pii_columns</code>; its values were never collected, so they are sent only after the source is profiled again (<strong>Start over</strong>, or <code>omop-agent profile</code>).</p>
 </section>
 
 <section class="card">

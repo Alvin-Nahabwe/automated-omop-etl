@@ -8,6 +8,7 @@ survive.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import psycopg
@@ -44,15 +45,30 @@ INDEXES = [
 ]
 
 
-def ensure_indexes(conn: psycopg.Connection, schemas: Schemas) -> None:
+_INDEX_NAME = re.compile(r"CREATE INDEX IF NOT EXISTS (\w+) ON")
+
+
+def ensure_indexes(conn: psycopg.Connection, schemas: Schemas) -> list[str]:
     """Create any missing vocabulary indexes (a vocabulary loaded by an older version lacks some).
-    Idempotent; on a full Athena vocabulary the first run takes a few minutes."""
-    for stmt in INDEXES:
-        execute(conn, schemas.render(stmt))
-    if ensure_trigram(conn):
-        for stmt in TRGM_INDEXES:
-            execute(conn, schemas.render(stmt))
+    Idempotent; on a full Athena vocabulary the first run takes a few minutes. Returns the indexes
+    that are missing but could not be created (the vocabulary tables belong to another role)."""
+    have = {
+        r["indexname"]
+        for r in fetch_all(conn, "SELECT indexname FROM pg_indexes WHERE schemaname = %s", (schemas.vocab,))
+    }
+    stmts = INDEXES + (TRGM_INDEXES if ensure_trigram(conn) else [])
+    skipped: list[str] = []
+    for stmt in stmts:
+        m = _INDEX_NAME.search(stmt)
+        if m and m.group(1) in have:
+            continue
+        try:
+            with conn.transaction():
+                execute(conn, schemas.render(stmt))
+        except psycopg.errors.InsufficientPrivilege:
+            skipped.append(m.group(1) if m else stmt)
     conn.commit()
+    return skipped
 TRGM_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_concept_name_trgm ON {vocab}.concept USING gin (lower(concept_name) gin_trgm_ops)",
     "CREATE INDEX IF NOT EXISTS idx_concept_syn_trgm ON {vocab}.concept_synonym USING gin (lower(concept_synonym_name) gin_trgm_ops)",
@@ -140,9 +156,9 @@ def load_athena(
             if parts and parts[0] == "None" and len(parts) > 3:
                 new_version = parts[3]
     if not force and bundle and vocab_loaded(conn, schemas) and loaded_vocabularies(conn, schemas) == bundle:
-        ensure_indexes(conn, schemas)
+        missing = ensure_indexes(conn, schemas)
         if ws:
-            ws.audit("vocab_load_skipped", version=new_version, vocabularies=len(bundle))
+            ws.audit("vocab_load_skipped", version=new_version, vocabularies=len(bundle), indexes_not_created=missing)
         return {}
 
     counts: dict[str, int] = {}

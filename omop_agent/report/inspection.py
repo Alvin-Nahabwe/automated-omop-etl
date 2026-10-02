@@ -34,6 +34,7 @@ from pydantic import BaseModel
 from ..cdm.spec import LOAD_ORDER, load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, fetch_all, qi, short_error
+from ..privacy import apply_overrides
 from ..models import (
     CheckResult,
     DQReport,
@@ -329,6 +330,8 @@ def _relative(v: Any, root: Path) -> Any:
 
 def _timeline(stages: dict[str, dict[str, Any]], audit: list[dict[str, Any]], root: Path) -> dict[str, Any]:
     known = PIPELINE_STAGES + [s for s in STAGES if s not in PIPELINE_STAGES]
+    if "privacy" in stages:  # only projects that send data to Claude have this review step
+        known.insert(known.index("profile") + 1, "privacy")
     extra = sorted((s for s in stages if s not in known), key=lambda s: str(stages[s].get("at", "")))
     rows = []
     for name in known + extra:
@@ -1077,7 +1080,7 @@ def collect_report_data(
         "verdict_caveats": caveats if verdict == PASSED else [],
         "reviews": review_rows,
         "timeline": _timeline(stages, audit, ws.root),
-        "source": _source_section(profile, annotations) if profile else None,
+        "source": _source_section(apply_overrides(profile, cfg.privacy, annotations), annotations) if profile else None,
         "annotations": {"notes": notes, "n_tables": len(annotations.tables)} if annotations else None,
         "design": design,
         "vocab": vocab,
@@ -1095,7 +1098,7 @@ def collect_report_data(
 
 
 # Report fields that can carry database error text, which may quote record values.
-_ERROR_KEYS = {"error", "detail", "cdm_note"}
+_ERROR_KEYS = {"error", "detail", "details", "cdm_note"}
 _ERROR_LIST_KEYS = {"blocking_failures", "verdict_reasons", "reasons", "failures"}
 
 

@@ -536,6 +536,14 @@ def test_shareable_report_withholds_values_in_database_errors():
     assert out["mapping"]["rationale"] == 'kept "Hemoglobin"'  # only error fields are touched
 
 
+def test_shareable_report_withholds_values_in_the_stage_timeline(full_ws):
+    cfg, ws = full_ws
+    ws.mark("vocab_map", "failed", error='invalid input syntax for type integer: "Wanjiku Otieno 0712345678"')
+    for shareable in (False, True):
+        timeline = str(collect_report_data(cfg, ws, shareable=shareable)["timeline"])
+        assert ("Wanjiku" in timeline) is not shareable
+
+
 def test_report_counts_only_mappings_that_reach_the_cdm():
     from omop_agent.models import MappingDecision
     from omop_agent.report.inspection import _mapping_row
