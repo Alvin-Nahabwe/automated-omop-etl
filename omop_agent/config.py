@@ -113,18 +113,15 @@ class PrivacyConfig(_Base):
     send_values_to_llm: bool = Field(True, description="If false, the LLM sees column statistics but no values.")
     max_values_per_column: int = 25
     pii_columns: list[str] = Field(default_factory=list, description="Extra 'table.column' entries to treat as PII.")
+    not_pii_columns: list[str] = Field(
+        default_factory=list,
+        description="'table.column' entries that the automatic identifier detection flagged by mistake "
+        "(e.g. a CD4 cell count). They are treated as ordinary columns. pii_columns wins over this list.",
+    )
     pii_name_patterns: list[str] = Field(
-        default_factory=lambda: [
-            r"(^|_)(first|last|middle|given|family|sur|full|maiden|patient|client|person|individual|member|"
-            r"mother|mothers|father|fathers|guardian|kin|spouse|child)_?names?($|_)",
-            r"^names?$|(^|_)name_of_",
-            r"(^|_)(phone|telephone|tel|mobile|msisdn|cell|cellphone|contact|contact_?(no|number))($|_)",
-            r"e_?mail",
-            r"(^|_)(national_?id|passport|nhif|ssn|nin|mrn|id_?(no|num|number)|hospital_?(no|num|number)|"
-            r"record_?(no|num|number)|file_?(no|num|number))($|_)",
-            r"address|street|(^|_)gps|latitude|longitude|(^|_)(lat|lon|lng)($|_)",
-            r"next_?of_?kin",
-        ]
+        default_factory=list,
+        description="Extra regular expressions (matched against lower-case column names) for identifier "
+        "columns, on top of the built-in rules in omop_agent/privacy.py.",
     )
 
 
@@ -140,8 +137,25 @@ class MappingConfig(_Base):
 class QualityConfig(_Base):
     max_repair_iterations: int = 3
     blocking_severities: list[str] = Field(default_factory=lambda: ["fatal"])
+    blocking_checks: list[str] = Field(
+        default_factory=lambda: ["measurePersonCompleteness.observation_period"],
+        description="Checks that block the gate whatever their DQD severity: a check name "
+        "(e.g. 'etlRecordRetention') or a check key prefix (e.g. 'measurePersonCompleteness."
+        "observation_period': every person needs an observation period).",
+    )
+    min_record_retention_pct: float = Field(
+        50.0, ge=0, le=100,
+        description="A table mapping that loads less than this percentage of its source rows fails the "
+        "fatal etlRecordLoss check (e.g. a broken person key). Smaller losses are reported by "
+        "etlRecordRetention (threshold 5%) without blocking.",
+    )
     repair_severities: list[str] = Field(default_factory=lambda: ["fatal", "convention"])
     use_r_dqd: bool = Field(False, description="Also run the official R DataQualityDashboard + Achilles.")
+    require_r_dqd: bool = Field(
+        False,
+        description="With use_r_dqd: fail the quality gate when the R run is not possible or fails, "
+        "instead of continuing with the built-in checks only.",
+    )
     rscript: str = "Rscript"
 
 

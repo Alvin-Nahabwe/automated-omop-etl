@@ -30,6 +30,7 @@
 {% if project is defined and project and project.cfg %}
 <nav class="tabs" aria-label="Project">
   <a href="/p/{{ project.id }}" {% if tab == 'overview' %}aria-current="page"{% endif %}>Overview</a>
+  <a href="/p/{{ project.id }}/privacy" {% if tab == 'privacy' %}aria-current="page"{% endif %}>Privacy</a>
   <a href="/p/{{ project.id }}/spec" {% if tab == 'spec' %}aria-current="page"{% endif %}>ETL design</a>
   <a href="/p/{{ project.id }}/mappings" {% if tab == 'mappings' %}aria-current="page"{% endif %}>Code mappings</a>
   <a href="/p/{{ project.id }}/report" {% if tab == 'report' %}aria-current="page"{% endif %}>Report</a>

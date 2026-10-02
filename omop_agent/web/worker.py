@@ -80,6 +80,12 @@ def _run(job: Job, cfg, ws: Workspace, store: JobStore) -> None:
             "The CDM passed the data-quality gate." if report.passed
             else f"{len(report.blocking_failures)} blocking data-quality check(s) failed; see the report."
         )
+        if report.passed:
+            from ..report.inspection import review_caveats
+
+            caveats = review_caveats(cfg, ws)
+            if caveats:
+                job.message += " Not fully reviewed: " + "; ".join(caveats) + "."
     except PipelineStopped as e:
         job.status, job.stage = "waiting_review", e.stage
         what = GATE_PHRASES.get(e.stage or "", "artifacts")

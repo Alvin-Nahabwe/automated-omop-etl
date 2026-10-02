@@ -25,7 +25,7 @@ from ..config import ProjectConfig
 from ..db import normalize_url
 from ..models import CheckResult, DQReport
 from ..workspace import Workspace, utcnow
-from .checks import check_catalog, gate
+from .checks import FIELD_SUMMARY, NOT_IMPLEMENTED, check_catalog, gate
 
 R_PACKAGES = ("DatabaseConnector", "Achilles", "DataQualityDashboard")
 TEMPLATE = "run_achilles_dqd.R"
@@ -170,7 +170,8 @@ def parse_dqd_json(path: Path, cfg: ProjectConfig) -> list[CheckResult]:
         severity = _text(r.get("severity")).lower() or (info.severity if info else "convention")
         if severity not in {"fatal", "convention", "characterization"}:
             severity = info.severity if info else "convention"
-        concept = _num(r.get("conceptId"), default=float("nan"))
+        # DQD gives a group of concepts as one string ("4090861, 4025213"); keep the first id.
+        concept_ids = re.findall(r"\d+", _text(r.get("conceptId")))
         is_error = _flag(r.get("isError"))
         error = _text(r.get("error")) or ("DQD reported an error" if is_error else "")
         out.append(
@@ -179,7 +180,7 @@ def parse_dqd_json(path: Path, cfg: ProjectConfig) -> list[CheckResult]:
                 check_level=level,  # type: ignore[arg-type]
                 table=_text(r.get("cdmTableName")).lower(),
                 field=_text(r.get("cdmFieldName")).lower() or None,
-                concept_id=None if concept != concept else int(concept),
+                concept_id=int(concept_ids[0]) if concept_ids else None,
                 description=_text(r.get("checkDescription")) or (info.description if info else name),
                 category=_text(r.get("category")) or (info.category if info else ""),
                 subcategory=_text(r.get("subcategory")) or (info.subcategory if info else ""),
@@ -213,7 +214,7 @@ def run_r_dqd(cfg: ProjectConfig, ws: Workspace, timeout: int = 7200) -> DQRepor
     try:
         proc = subprocess.run(
             [shutil.which(cfg.quality.rscript) or cfg.quality.rscript, str(script)],
-            cwd=ws.root,
+            cwd=dqd_output_dir(ws),  # DatabaseConnector writes errorReportSql.txt into the working directory
             env=env,
             capture_output=True,
             text=True,
@@ -221,7 +222,9 @@ def run_r_dqd(cfg: ProjectConfig, ws: Workspace, timeout: int = 7200) -> DQRepor
         )
         log.write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
         returncode: int | str = proc.returncode
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
+        out, err = (x.decode(errors="replace") if isinstance(x, bytes) else (x or "") for x in (e.stdout, e.stderr))
+        log.write_text(out + "\n--- stderr ---\n" + err + f"\nError: timed out after {timeout} s\n")
         returncode = "timeout"
     except OSError as e:
         returncode = f"failed to start: {e}"
@@ -232,3 +235,54 @@ def run_r_dqd(cfg: ProjectConfig, ws: Workspace, timeout: int = 7200) -> DQRepor
     passed, blocking = gate(checks, cfg)
     ws.audit("dqd_r_done", checks=len(checks), failed=sum(c.failed for c in checks), passed=passed)
     return DQReport(run_at=utcnow(), engine="dqd", results=checks, passed=passed, blocking_failures=blocking)
+
+
+def r_failure_summary(ws: Workspace, max_lines: int = 3) -> str:
+    """The last R error in ``<workdir>/dqd/rscript.log`` (a few lines joined), for the pipeline log."""
+    log = dqd_output_dir(ws) / "rscript.log"
+    if not log.exists():
+        return "no rscript.log was written"
+    text = log.read_text(errors="replace").split("\n--- stderr ---\n")[-1]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("Picked up JAVA_TOOL_OPTIONS")]
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("Error")]
+    picked = lines[starts[-1] : starts[-1] + max_lines] if starts else lines[-max_lines:]
+    return " ".join(picked)[:500]
+
+
+R_RUN_CHECK = "officialDqdRun"
+
+
+def r_missing_result(problem: str) -> CheckResult:
+    """A failing fatal result standing for an official DQD run that could not happen
+    (``quality.require_r_dqd``), so the gate fails instead of passing on the built-in checks."""
+    return CheckResult(
+        check_name=R_RUN_CHECK,
+        check_level="ETL",
+        table="cdm",
+        description="The official R Achilles and DataQualityDashboard must run (quality.require_r_dqd), "
+        f"but did not: {problem}",
+        category="Conformance",
+        subcategory="Completeness of checks",
+        severity="fatal",
+        failed=True,
+        error=problem[:1000],
+    )
+
+
+def merge_results(builtin: list[CheckResult], dqd: list[CheckResult]) -> list[CheckResult]:
+    """All DQD results plus the built-in results DQD does not cover.
+
+    The built-in engine's "not implemented" placeholders and per-table field summaries are dropped,
+    and so is any built-in result for a check DQD also ran (same check, table, field and concept),
+    so each check is counted once and the official DQD result wins.
+    """
+    def key(r: CheckResult) -> tuple[str, str, str, int | None]:
+        return (r.check_name, r.table, r.field or "", r.concept_id)
+
+    covered = {key(r) for r in dqd}
+    keep = [
+        r
+        for r in builtin
+        if key(r) not in covered and r.check_name != FIELD_SUMMARY and NOT_IMPLEMENTED not in r.description
+    ]
+    return keep + dqd

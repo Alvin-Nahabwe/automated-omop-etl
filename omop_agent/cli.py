@@ -29,6 +29,8 @@ def _exclusive(p):
     """Hold the project's run lock (shared with the web app) while a stage changes the workspace."""
     from .runlock import RunInProgress, run_lock
 
+    from .pipeline import PipelineStopped
+
     stack = ExitStack()
     try:
         stack.enter_context(run_lock(p.ws, f"command line, pid {os.getpid()}"))
@@ -37,26 +39,52 @@ def _exclusive(p):
         p.close()
         raise typer.Exit(3)
     with stack:
-        yield
+        try:
+            yield
+        except PipelineStopped as e:
+            console.print(f"[yellow]{e}[/]")
+            p.close()
+            raise typer.Exit(2)
 
 
-def _pipeline(config: Path, yes: bool = True, recorded: bool = False):
-    from .approvals import recorded_approver
-    from .pipeline import Pipeline
+def _pipeline(config: Path, mode: str = "stage"):
+    """A Pipeline whose review gates behave as ``mode`` says:
+
+    * ``interactive`` (``omop-agent run``): ask at the terminal; a yes is recorded as an approval
+      by the logged-in user, and an artifact already approved as it is now passes without asking;
+    * ``recorded`` (``run --recorded-approvals``): pass only with a recorded approval;
+    * ``skip`` (``run --yes``, ``demo``): do not stop (and say so in the audit log and report);
+    * ``stage`` (single stage commands): the design and mapping gates are not checked (the stage is
+      an explicit action and its output is reviewed afterwards), but data goes to Claude only after
+      a recorded privacy review.
+    """
+    import getpass
+
+    from .approvals import GATE_PHRASES, GATES, gate_state, record_approval, recorded_approver
+    from .pipeline import Pipeline, auto_approve
 
     cfg = load_config(config)
+    p = Pipeline(cfg, log=lambda m: console.print(m, highlight=False))
+    recorded = recorded_approver(p.ws)
 
-    def approver(stage: str, message: str, paths: list[str]) -> bool:
-        if yes:
+    def interactive(stage: str, message: str, paths: list[str]) -> bool:
+        if stage in GATES and gate_state(p.ws, stage).current:
             return True
-        console.print(f"\n[bold yellow]Review gate: {stage}[/] {message}")
-        for p in paths:
-            console.print(f"  • {p}")
-        return typer.confirm("Continue with these artifacts?", default=True)
+        console.print(f"\n[bold yellow]Review: {GATES.get(stage, stage)}[/] {message}")
+        for path in paths:
+            console.print(f"  • {path}")
+        if not typer.confirm(f"Approve the {GATE_PHRASES.get(stage, stage)} and continue?", default=False):
+            return False
+        if stage in GATES:
+            record_approval(p.ws, stage, f"{getpass.getuser()} (terminal)")
+        return True
 
-    p = Pipeline(cfg, approver=approver, log=lambda m: console.print(m, highlight=False))
-    if recorded:
-        p.approver = recorded_approver(p.ws)
+    def stage_command(stage: str, message: str, paths: list[str]) -> bool:
+        return recorded(stage, message, paths) if stage == "privacy" else True
+
+    interactive.mode = "interactive"  # type: ignore[attr-defined]
+    stage_command.mode = "stage"  # type: ignore[attr-defined]
+    p.approver = {"interactive": interactive, "recorded": recorded, "skip": auto_approve, "stage": stage_command}[mode]
     return p
 
 
@@ -145,7 +173,9 @@ mapping:
 quality:
   max_repair_iterations: 3
   blocking_severities: [fatal]
-  use_r_dqd: false             # also run the official Achilles + DataQualityDashboard (needs R)
+  # The official R Achilles + DataQualityDashboard: on in the omop-agent R image (Dockerfile.r).
+  use_r_dqd: ${{OMOP_AGENT_USE_R_DQD:-false}}
+  require_r_dqd: ${{OMOP_AGENT_REQUIRE_R_DQD:-false}}   # fail the gate if R cannot run
 
 cdm_source:
   cdm_source_name: {q(name)}
@@ -180,7 +210,7 @@ def run(
 
     if yes and recorded_approvals:
         raise typer.BadParameter("use either --yes or --recorded-approvals, not both")
-    p = _pipeline(config, yes, recorded=recorded_approvals)
+    p = _pipeline(config, "skip" if yes else "recorded" if recorded_approvals else "interactive")
     with _exclusive(p):
         try:
             report = p.run_all(fresh=fresh, redesign=redesign, remap=remap)
@@ -327,7 +357,9 @@ def check(config: Path = ConfigOpt) -> None:
 @app.command()
 def report(
     config: Path = ConfigOpt,
-    shareable: bool = typer.Option(False, help="Also write report.shareable.* with rare source terms withheld."),
+    shareable: bool = typer.Option(
+        True, help="Also write report.shareable.* (rare source terms and database error values withheld)."
+    ),
 ) -> None:
     """Write the inspection report (report.md / report.html)."""
     p = _pipeline(config)
@@ -349,8 +381,15 @@ def status(config: Path = ConfigOpt) -> None:
     for stage, info in ws.state().get("stages", {}).items():
         table.add_row(stage, info.get("status", ""), info.get("at", ""))
     console.print(table)
+    from .privacy_review import refresh, sends_to_llm
+
+    if sends_to_llm(cfg):
+        refresh(cfg, ws)
     gates = Table("review gate", "state", "approved by", "at")
     for stage in GATES:
+        if stage == "privacy" and not sends_to_llm(cfg):
+            gates.add_row(stage, "not needed (no data sent to Claude)", "", "")
+            continue
         g = gate_state(ws, stage)
         a = g.approval
         gates.add_row(stage, g.label, a.by if a else "", a.at.isoformat(timespec="seconds") if a else "")
@@ -359,22 +398,33 @@ def status(config: Path = ConfigOpt) -> None:
 
 @app.command()
 def approve(
-    stage: str = typer.Argument(..., help="design (the ETL spec) or vocab_map (the code mappings)."),
+    stage: str = typer.Argument(
+        ..., help="privacy (what is sent to Claude), design (the ETL spec) or vocab_map (the code mappings)."
+    ),
     by: str = typer.Option(..., "--by", help="Reviewer's name, recorded with the approval."),
     note: str = typer.Option("", help="Optional comment kept with the approval."),
     config: Path = ConfigOpt,
 ) -> None:
-    """Record that a reviewer approved the current ETL spec or code mappings.
+    """Record that a reviewer approved what will be sent to Claude, the ETL spec or the code mappings.
 
+    Check the artifact first: work/privacy_review.md, work/etl_spec.md, or work/mappings/*.csv.
     `omop-agent run --recorded-approvals` (and runs started from the web app) continue past a
     review gate only while what was approved is unchanged."""
     from .approvals import GATES, record_approval
+    from .privacy_review import REVIEW_MD, refresh, sends_to_llm
     from .workspace import Workspace
 
     stage = {"mappings": "vocab_map", "spec": "design"}.get(stage, stage)
     if stage not in GATES:
         raise typer.BadParameter(f"stage must be one of: {', '.join(GATES)}")
-    ws = Workspace(load_config(config).workdir)
+    cfg = load_config(config)
+    ws = Workspace(cfg.workdir)
+    if stage == "privacy":
+        if not sends_to_llm(cfg):
+            console.print(f"Not needed: this project does not send data to Claude (llm.provider: {cfg.llm.provider}).")
+            return
+        if refresh(cfg, ws) is not None:
+            console.print(f"Approving {ws.root / REVIEW_MD} as it is now (rebuilt from the current profile and settings).")
     try:
         a = record_approval(ws, stage, by, note)
     except FileNotFoundError as e:
@@ -398,7 +448,7 @@ def demo(
     cfg_path = create_demo_project(directory, db_url, provider=provider, n_people=people, schema_prefix=schema_prefix)
     console.print(f"Demo project written to {directory} (config {cfg_path})")
     if run_pipeline:
-        p = _pipeline(cfg_path, yes=True)
+        p = _pipeline(cfg_path, "skip")
         with _exclusive(p):
             report = p.run_all(fresh=True)
         console.print(f"\n[bold {'green' if report.passed else 'red'}]{'PASSED' if report.passed else 'FAILED'}[/] -> {p.ws.report_html}")

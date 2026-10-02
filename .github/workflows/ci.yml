@@ -73,3 +73,38 @@ jobs:
       - name: Logs
         if: failure()
         run: docker compose logs
+
+  docker-r:
+    # The R image (Dockerfile.r): Achilles and the official DataQualityDashboard must run on the demo.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: deploy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure the bundle for the R image
+        run: |
+          cp .env.example .env
+          sed -i "s/^POSTGRES_PASSWORD=$/POSTGRES_PASSWORD=$(openssl rand -hex 16)/; s/^OMOP_DB_PASSWORD=$/OMOP_DB_PASSWORD=$(openssl rand -hex 16)/" .env
+          sed -i "s/^OMOP_AGENT_DOCKERFILE=Dockerfile$/OMOP_AGENT_DOCKERFILE=Dockerfile.r/; s/^OMOP_AGENT_IMAGE_TAG=local$/OMOP_AGENT_IMAGE_TAG=local-r/" .env
+          mkdir -p projects data athena source
+          sudo chown 10001:10001 projects data athena
+      - name: Build and start
+        run: docker compose up -d --build --wait
+      - name: Demo with Achilles and the official DQD
+        run: |
+          docker compose run --rm -T app demo /srv/projects/demo
+          python3 - <<'PY'
+          import json
+          d = json.load(open("projects/demo/work/dq_results.json"))
+          assert d["engine"] == "builtin+dqd", d["engine"]
+          assert d["passed"] and len(d["results"]) > 2000, (d["passed"], len(d["results"]))
+          print("official DQD ran:", len(d["results"]), "checks")
+          PY
+          test "$(docker compose exec -T db psql -U postgres -d omop -tAc 'select count(*) > 0 from demo_results.achilles_results')" = t
+      - name: Logs
+        if: failure()
+        run: |
+          docker compose logs
+          cat projects/demo/work/dqd/rscript.log || true

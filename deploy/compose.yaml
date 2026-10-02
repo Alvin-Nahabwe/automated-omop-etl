@@ -36,9 +36,12 @@ services:
   app:
     build:
       context: ..
+      # Dockerfile.r adds R, Achilles and the official DataQualityDashboard (about 1 GB more).
+      dockerfile: ${OMOP_AGENT_DOCKERFILE:-Dockerfile}
       args:
         PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
-    image: omop-agent:local
+        UBUNTU_IMAGE: ${UBUNTU_IMAGE:-ubuntu:24.04}
+    image: omop-agent:${OMOP_AGENT_IMAGE_TAG:-local}
     restart: unless-stopped
     init: true  # reaps the processes of finished pipeline runs
     depends_on:

@@ -34,7 +34,25 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_concept_rel_1 ON {vocab}.concept_relationship (concept_id_1, relationship_id)",
     "CREATE INDEX IF NOT EXISTS idx_concept_syn ON {vocab}.concept_synonym (concept_id)",
     "CREATE INDEX IF NOT EXISTS idx_concept_anc_d ON {vocab}.concept_ancestor (descendant_concept_id)",
+    # The lookups by id that the official OHDSI DDL indexes (OMOPCDM_postgresql_5.4_indices.sql)
+    # and that ATLAS, the mapping review and the coverage evaluation rely on.
+    "CREATE INDEX IF NOT EXISTS idx_concept_concept_id ON {vocab}.concept (concept_id)",
+    "CREATE INDEX IF NOT EXISTS idx_concept_relationship_id_2 ON {vocab}.concept_relationship (concept_id_2)",
+    "CREATE INDEX IF NOT EXISTS idx_concept_ancestor_id_1 ON {vocab}.concept_ancestor (ancestor_concept_id)",
+    "CREATE INDEX IF NOT EXISTS idx_drug_strength_id_1 ON {vocab}.drug_strength (drug_concept_id)",
+    "CREATE INDEX IF NOT EXISTS idx_drug_strength_id_2 ON {vocab}.drug_strength (ingredient_concept_id)",
 ]
+
+
+def ensure_indexes(conn: psycopg.Connection, schemas: Schemas) -> None:
+    """Create any missing vocabulary indexes (a vocabulary loaded by an older version lacks some).
+    Idempotent; on a full Athena vocabulary the first run takes a few minutes."""
+    for stmt in INDEXES:
+        execute(conn, schemas.render(stmt))
+    if ensure_trigram(conn):
+        for stmt in TRGM_INDEXES:
+            execute(conn, schemas.render(stmt))
+    conn.commit()
 TRGM_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_concept_name_trgm ON {vocab}.concept USING gin (lower(concept_name) gin_trgm_ops)",
     "CREATE INDEX IF NOT EXISTS idx_concept_syn_trgm ON {vocab}.concept_synonym USING gin (lower(concept_synonym_name) gin_trgm_ops)",
@@ -122,6 +140,7 @@ def load_athena(
             if parts and parts[0] == "None" and len(parts) > 3:
                 new_version = parts[3]
     if not force and bundle and vocab_loaded(conn, schemas) and loaded_vocabularies(conn, schemas) == bundle:
+        ensure_indexes(conn, schemas)
         if ws:
             ws.audit("vocab_load_skipped", version=new_version, vocabularies=len(bundle))
         return {}

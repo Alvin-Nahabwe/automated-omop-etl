@@ -339,21 +339,74 @@ def _timeline(stages: dict[str, dict[str, Any]], audit: list[dict[str, Any]], ro
         rest = {k: v for k, v in info.items() if k not in ("status", "at")}
         status = str(info.get("status", "unknown"))
         rows.append({"stage": name, "status": status, "at": fmt_dt(info.get("at")), "details": _kv(rest)})
-    approvals = []
+    return {"stages": rows, "has_state": bool(stages)}
+
+
+def review_caveats(cfg: ProjectConfig, ws: Workspace) -> list[str]:
+    """What still needs a person's review before the CDM built in ``ws`` is used (see _reviews)."""
+    problems: list[str] = []
+    decisions = _load(ws.mappings_dir / "decisions.json", _model_list(MappingDecision), problems)
+    repairs = _load(ws.repairs_json, _model_list(RepairAction), problems)
+    return _reviews(cfg, ws, _read_audit(ws, problems), repairs, decisions)[1]
+
+
+_PASS_HOW = {
+    "approved": "approved",
+    "skipped": "not checked (run with --yes)",
+    "not_checked": "not checked (single stage command)",
+    "stopped": "stopped for review",
+}
+
+
+def _reviews(
+    cfg: ProjectConfig, ws: Workspace, audit: list[dict[str, Any]], repairs: list[RepairAction] | None,
+    decisions: list[MappingDecision] | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """The review gates as they stand for the CDM just built, and the caveats that qualify a PASS:
+    artifacts nobody approved, or that changed after approval (for example by automatic repairs),
+    and unreviewed mappings that were loaded."""
+    from ..approvals import GATES, gate_state
+    from ..privacy_review import refresh, sends_to_llm
+
+    sends = sends_to_llm(cfg)
+    if sends:
+        refresh(cfg, ws)
+    last_pass: dict[str, str] = {}
     for e in audit:
-        if e.get("event") != "human_approval":
+        if e.get("event") == "review_gate" and e.get("stage"):
+            last_pass[str(e["stage"])] = _PASS_HOW.get(str(e.get("outcome")), str(e.get("outcome")))
+    applied = [a for a in repairs or [] if not a.reverted]
+    rows: list[dict[str, Any]] = []
+    caveats: list[str] = []
+    for stage, label in GATES.items():
+        if stage == "privacy" and not sends:
+            rows.append({"gate": label, "state": "not needed", "by": "", "at": "", "note": "no data is sent to Claude",
+                         "last_pass": ""})
             continue
-        approved = e.get("approved")
-        rest = {k: _relative(v, root) for k, v in e.items() if k not in ("ts", "event", "stage", "approved")}
-        approvals.append(
-            {
-                "at": fmt_dt(e.get("ts")),
-                "stage": str(e.get("stage") or ""),
-                "decision": "approved" if approved is True else "declined" if approved is False else "recorded",
-                "details": _kv(rest),
-            }
-        )
-    return {"stages": rows, "approvals": approvals, "has_state": bool(stages)}
+        g = gate_state(ws, stage)
+        a = g.approval
+        rows.append({
+            "gate": label,
+            "state": g.label,
+            "by": a.by if a else "",
+            "at": fmt_dt(a.at) if a else "",
+            "note": a.note if a else "",
+            "last_pass": last_pass.get(stage, ""),
+        })
+        if not g.ready or g.current:
+            continue
+        if stage == "privacy":
+            caveats.append("data was sent to Claude without an approved privacy review of the current profile")
+        elif stage == "design":
+            why = f": {len(applied)} automatic repair(s) changed it after review" if g.approval and applied else ""
+            caveats.append(f"the ETL design this CDM was built from is {g.label}{why}")
+        else:
+            caveats.append(f"the code mappings used are {g.label}")
+    if decisions is not None and cfg.mapping.use_unchecked_in_etl:
+        n = sum(1 for d in decisions if d.status == "UNCHECKED" and d.target_concept_id)
+        if n:
+            caveats.append(f"{n} mapping(s) nobody reviewed (UNCHECKED) were loaded")
+    return rows, caveats
 
 
 def _source_section(profile: SourceProfile, annotations: SourceAnnotations | None) -> dict[str, Any]:
@@ -481,10 +534,13 @@ def _vocab_section(ev: dict[str, Any], min_cell_count: int, shareable: bool = Fa
     }
 
 
-def _mapping_row(name: str, ds: list[MappingDecision]) -> dict[str, Any]:
+def _mapping_row(name: str, ds: list[MappingDecision], include_unchecked: bool = True) -> dict[str, Any]:
     status = Counter(d.status for d in ds)
     records = sum(d.frequency for d in ds)
-    mapped = sum(d.frequency for d in ds if d.target_concept_id and d.status != "REJECTED")
+    # Records whose term is actually written to source_to_concept_map (what reaches the CDM):
+    # FLAGGED and REJECTED terms never are, UNCHECKED ones only with mapping.use_unchecked_in_etl.
+    usable = {"APPROVED", "UNCHECKED"} if include_unchecked else {"APPROVED"}
+    mapped = sum(d.frequency for d in ds if d.target_concept_id and d.status in usable)
     return {
         "source_vocabulary_id": name,
         "terms": len(ds),
@@ -526,8 +582,8 @@ def _mapping_section(decisions: list[MappingDecision], cfg: ProjectConfig, share
         for d in pending[:MAX_REVIEW_ROWS]
     ]
     return {
-        "vocabularies": [_mapping_row(k, groups[k]) for k in sorted(groups)],
-        "totals": _mapping_row("all", decisions),
+        "vocabularies": [_mapping_row(k, groups[k], cfg.mapping.use_unchecked_in_etl) for k in sorted(groups)],
+        "totals": _mapping_row("all", decisions, cfg.mapping.use_unchecked_in_etl),
         "review": review,
         "review_total": len(pending),
         "use_unchecked_in_etl": cfg.mapping.use_unchecked_in_etl,
@@ -985,6 +1041,7 @@ def collect_report_data(
             cdm_note = f"CDM characterisation failed: {short_error(e)}"
 
     verdict, reasons = _verdict(dq, etl_run, stages)
+    review_rows, caveats = _reviews(cfg, ws, audit, repairs, decisions)
     design = _design_section(spec) if spec else None
     vocab = _vocab_section(vocab_eval, mcc, shareable) if vocab_eval is not None else None
     mapping = _mapping_section(decisions, cfg, shareable) if decisions is not None else None
@@ -992,11 +1049,13 @@ def collect_report_data(
     dq_data = _dq_section(dq, cfg) if dq else None
     notes = list(annotations.notes) if annotations else []
     llm = _llm_section(cfg, ws, audit)
-    r_dqd_ran = (dq is not None and dq.engine == "dqd") or any(e.get("event") == "dqd_r_done" for e in audit)
+    # Done only when the current dq_results.json holds DQD results; an older successful run in the
+    # audit log does not count once a later check fell back to the built-in engine.
+    r_dqd_ran = dq is not None and dq.engine != "builtin"
 
     vocab_version = (vocab or {}).get("vocabulary_version") or (cdm or {}).get("vocabulary_version")
     cdm_version = spec.cdm_version if spec else ((cdm or {}).get("cdm_source") or {}).get("cdm_version") or "5.4"
-    return {
+    data = {
         "project": {
             "name": cfg.name,
             "generated_at": fmt_dt(utcnow()),
@@ -1015,6 +1074,8 @@ def collect_report_data(
         },
         "verdict": verdict,
         "verdict_reasons": reasons,
+        "verdict_caveats": caveats if verdict == PASSED else [],
+        "reviews": review_rows,
         "timeline": _timeline(stages, audit, ws.root),
         "source": _source_section(profile, annotations) if profile else None,
         "annotations": {"notes": notes, "n_tables": len(annotations.tables)} if annotations else None,
@@ -1030,6 +1091,28 @@ def collect_report_data(
         "next_steps": _next_steps(verdict, design, notes, mapping, etl, dq_data, schemas, r_dqd_ran),
         "problems": problems,
     }
+    return _redact_errors(data) if shareable else data
+
+
+# Report fields that can carry database error text, which may quote record values.
+_ERROR_KEYS = {"error", "detail", "cdm_note"}
+_ERROR_LIST_KEYS = {"blocking_failures", "verdict_reasons", "reasons", "failures"}
+
+
+def _redact_errors(obj: Any, key: str | None = None) -> Any:
+    """For the shareable report: database error messages with record values removed (the same
+    redaction as for prompts; PostgreSQL's DETAIL can quote a whole failing row)."""
+    from ..quality.repair import redact_error
+
+    if isinstance(obj, dict):
+        return {k: _redact_errors(v, k) for k, v in obj.items()}
+    if isinstance(obj, list):
+        if key in _ERROR_LIST_KEYS:
+            return [redact_error(x) if isinstance(x, str) else _redact_errors(x) for x in obj]
+        return [_redact_errors(x) for x in obj]
+    if isinstance(obj, str) and key in _ERROR_KEYS and obj:
+        return redact_error(obj)
+    return obj
 
 
 def _template_source(name: str) -> str | None:

@@ -132,6 +132,11 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
       <ul>{% for r in verdict_reasons %}<li>{{ r }}</li>{% endfor %}</ul>
     </div>
   </div>
+  {% if verdict_caveats %}
+  <div class="callout warn"><strong>Not fully reviewed.</strong> The data-quality checks passed, but a person still needs to review this before the CDM is used:
+    <ul class="plain">{% for c in verdict_caveats %}<li>{{ c }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
   <dl class="facts">
     <div><dt>Project</dt><dd>{{ project.name }}</dd></div>
     <div><dt>Generated</dt><dd>{{ project.generated_at }}</dd></div>
@@ -172,17 +177,16 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     </tbody>
   </table></div>
   {% else %}{{ empty('Not run: no state.json in the workspace.') }}{% endif %}
-  <h3>Human approvals</h3>
-  {% if timeline.approvals %}
+  <h3>Reviews</h3>
+  <p class="muted">As they stand for this build.</p>
   <div class="tw"><table>
-    <thead><tr><th>Time</th><th>Stage</th><th>Decision</th><th>Details</th></tr></thead>
+    <thead><tr><th>Review</th><th>State</th><th>Approved by</th><th>When</th><th>Note</th><th>Last run</th></tr></thead>
     <tbody>
-    {% for a in timeline.approvals %}
-      <tr><td class="n">{{ a.at }}</td><td>{{ a.stage }}</td><td>{{ badge(a.decision, {'approved': 'ok', 'declined': 'fail'}.get(a.decision, 'muted')) }}</td><td class="wrap">{{ a.details }}</td></tr>
+    {% for r in reviews %}
+      <tr><td>{{ r.gate }}</td><td>{{ badge(r.state, {'approved': 'ok', 'not needed': 'muted'}.get(r.state, 'warn')) }}</td><td>{{ r.by }}</td><td class="n">{{ r.at }}</td><td class="wrap">{{ r.note }}</td><td>{{ r.last_pass }}</td></tr>
     {% endfor %}
     </tbody>
   </table></div>
-  {% else %}{{ empty('None recorded.') }}{% endif %}
 </section>
 
 {# ---------------------------------------------------------------- 3. source #}

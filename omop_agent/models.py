@@ -357,7 +357,7 @@ class CheckResult(BaseModel):
 
 class DQReport(BaseModel):
     run_at: datetime
-    engine: Literal["builtin", "dqd"] = "builtin"
+    engine: Literal["builtin", "dqd", "builtin+dqd"] = "builtin"
     results: list[CheckResult]
     passed: bool
     blocking_failures: list[str] = Field(
@@ -408,3 +408,4 @@ class RepairAction(BaseModel):
     change: str
     rationale: str
     trigger: str = Field(..., description="Check key or ETL error that prompted the change.")
+    reverted: bool = Field(False, description="Rolled back because its build was worse than the one before.")

@@ -611,3 +611,32 @@ def test_record_approval_refuses_a_stale_digest(site):
         record_approval(ws, "vocab_map", "rita", expected_digest=digest)
     a = record_approval(ws, "vocab_map", "rita", expected_digest=artifact_digest(ws, "vocab_map"))
     assert gate_state(ws, "vocab_map").current and a.by == "rita"
+
+
+def test_privacy_review_page(site):
+    from omop_agent.models import ColumnProfile, SourceProfile, TableProfile, ValueFreq
+    from omop_agent.workspace import utcnow
+
+    client, ws, *_ = site
+    login(client, "rita")
+    assert "Not needed" in client.get("/p/demo/privacy").text  # this project's provider is none
+    cfg_path = ws.root.parent / "omop_agent.yaml"
+    cfg_path.write_text(cfg_path.read_text().replace("llm: {provider: none}", "llm: {provider: anthropic}"))
+    ws.save_json(ws.profile_json, SourceProfile(source_type="csv", generated_at=utcnow(), min_cell_count=5, tables=[
+        TableProfile(name="va", n_rows=100, columns=[
+            ColumnProfile(name="deceased_name", inferred_type="string", n_rows=100, n_null=0, n_distinct=80,
+                          unique=False, is_pii=True, pii_reason="the column name suggests a person's name"),
+            ColumnProfile(name="cause", inferred_type="string", n_rows=100, n_null=0, n_distinct=2, unique=False,
+                          top_values=[ValueFreq(value="Malaria", count=60)]),
+        ])]))
+    page = client.get("/p/demo/privacy").text
+    assert "deceased_name" in page and "a person&#39;s name" in page and "Malaria" in page
+    assert "Check what is sent to Claude" in client.get("/p/demo").text
+    digest = re.search(r'name="expected_digest" value="([^"]+)"', page).group(1)
+    client.post("/p/demo/privacy/approve", data={"csrf_token": _csrf(client, "/p/demo/privacy"),
+                                                  "expected_digest": digest, "note": "checked the VA columns"})
+    g = gate_state(ws, "privacy")
+    assert g.current and g.approval.by == "rita"
+    client.cookies.clear()
+    login(client, "vera")
+    assert "Approve the privacy review" not in client.get("/p/demo/privacy").text

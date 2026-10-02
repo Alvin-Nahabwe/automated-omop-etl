@@ -33,10 +33,19 @@ TABLESAMPLE_ABOVE = 200_000  # tables larger than this are block-sampled for typ
 PII_SAMPLE_VALUES = 50  # distinct values handed to privacy.detect_pii
 KEY_MAX_LISTED_DISTINCT = 50  # other id-named columns with more distinct values list none
 _MAX_TARGETS = 600  # select-list entries per aggregate query (Postgres caps it at 1664)
+# Keys of people (patients, HDSS individuals and their parents or household heads): never listed.
 _PERSON_KEY_NAME = re.compile(
-    r"(patient|person|individual|client|subject|participant|member)_?(id|no|num|number|uuid)$", re.I
+    r"(patient|person|individual|indiv|client|subject|participant|member|resident|mother|father|guardian|"
+    r"respondent|deceased|child|spouse|head|perm|ext)_?(id|no|num|number|uuid)$|^pid$",
+    re.I,
 )
-_KEY_NAME = re.compile(r"(^|_)(id|uuid|guid)(_|$)|(visit|encounter|record|episode|household)_?(id|no|num|number)$", re.I)
+# Other keys (visits, households, locations, ODK submissions): not listed when they have many values.
+_KEY_NAME = re.compile(
+    r"(^|_)(id|uuid|guid|key|pid)(_|$)|[a-z](id|uuid|guid)$|(^|_)(parent_)?key$"
+    r"|(visit|encounter|record|episode|household|hh|location|socialgroup|instance|submission|form)_?"
+    r"(id|key|no|num|number)$",
+    re.I,
+)
 
 _TRIM_CHARS = "E' \\t\\r\\n'"
 _BOOL_VALUES = ("true", "false", "yes", "no", "y", "n", "t", "f")

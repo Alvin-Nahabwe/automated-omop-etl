@@ -20,6 +20,21 @@ It also uses four folders next to `compose.yaml`:
 | `athena/` | The unpacked Athena vocabulary download. |
 | `source/` | Source CSV exports. The app can read them but not change them. |
 
+## Two images
+
+* `Dockerfile` (the default): the command line and the web app. Quality checks use the
+  built-in engine.
+* `Dockerfile.r`: the same plus R, Java, Achilles and the official OHDSI DataQualityDashboard,
+  about 1 GB larger. Projects created in it run Achilles and the full DQD on every final CDM
+  (`quality.use_r_dqd`), and a run fails rather than silently skipping them if R cannot run
+  (`quality.require_r_dqd`). Achilles' results in the results schema are what ATLAS needs for
+  its Data Sources pages. To use it, set in `.env`:
+
+  ```bash
+  OMOP_AGENT_DOCKERFILE=Dockerfile.r
+  OMOP_AGENT_IMAGE_TAG=local-r
+  ```
+
 ## Requirements
 
 * Linux with Docker Engine and Docker Compose v2.
@@ -122,18 +137,46 @@ internal network or VPN.
    each other; the app refuses to run a project whose schemas another project uses. Review the
    privacy settings and `cdm_source` in that file.
 4. In the browser, open the project and press **Continue the pipeline**. The first run
-   profiles the source, loads the vocabulary (a few minutes for a full bundle) and drafts the
-   ETL design. It then stops until a reviewer approves the design.
-5. A reviewer reads **ETL design** and approves it, or asks for changes. Changes are made by
+   profiles the source and then stops for the **privacy review**, before anything is sent to
+   Claude. A reviewer opens the **Privacy** tab, checks the withheld columns and the profile
+   exactly as Claude will see it (look for names, phone numbers, local ID numbers, GPS or free
+   text among the listed values), fixes the settings if needed (`privacy.pii_columns`,
+   `privacy.not_pii_columns`) and approves it.
+5. **Continue the pipeline** again: Claude interprets the profile, the vocabulary is loaded (a
+   few minutes for a full bundle) and the ETL design is drafted. The run then stops until a
+   reviewer approves the design.
+6. A reviewer reads **ETL design** and approves it, or asks for changes. Changes are made by
    editing `projects/<name>/work/etl_spec.yaml` on the server and approving again. The page
    shows what changed.
-6. **Continue the pipeline** again: the codes are mapped and the run stops at the mappings.
+7. **Continue the pipeline** again: the codes are mapped and the run stops at the mappings.
    Reviewers work through **Code mappings** (the "Needs review" filter first) and approve them.
-7. **Continue the pipeline**: the CDM is built, checked and repaired, and the report is written.
+8. **Continue the pipeline**: the CDM is built, checked and repaired, and the report is written.
 
 A run pauses at a review step whenever what was approved has changed. That happens after a
 hand edit, after the repair agent changes the design, or when new source codes appear. The
 spec page shows those changes as a diff.
+
+## Data protection
+
+Before the first real project, agree the following with APHRC's data protection officer or
+ethics committee. Sending aggregates to the Claude API is a transfer of data derived from
+health records to a service outside Kenya, which the Data Protection Act expects to be covered.
+
+* **What leaves the server**, and only for projects with `llm.provider: anthropic`: column
+  names and statistics, values seen at least `privacy.min_cell_count` times (5 by default),
+  the source codes being mapped with their counts, aggregate counts from the repair agent, and
+  database error messages with their values removed. Never patient rows, rare values or the
+  values of withheld columns. Every prompt and answer is kept in the project's
+  `work/llm_calls/`. `privacy.send_values_to_llm: false` sends statistics only;
+  `llm.provider: none` sends nothing (you then write the ETL design yourself).
+* **The privacy review** is the control point: a named reviewer approves what will be sent
+  before the first call, and again whenever the source or the settings change.
+* **What stays on the server**: the staged copy of the source (including identifier columns)
+  in the `<project>_src` schema, the CDM, the work folders and the backups. Keep the server,
+  the backups and `.env` under the same controls as the source data.
+* **Ending a project**: drop its schemas (`DROP SCHEMA <project>_src, <project>_cdm, ... CASCADE`
+  as the `postgres` user), delete `projects/<project>/` (which holds `llm_calls/`) and remove it
+  from the backups, as your retention policy requires.
 
 ## Roles
 

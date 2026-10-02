@@ -572,8 +572,9 @@ def _not_implemented_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
     return out
 
 
-def etl_checks(etl_result: ETLRunResult) -> list[CheckResult]:
-    """``etlStepError`` for failed steps, ``etlRecordRetention`` for steps that report source rows."""
+def etl_checks(etl_result: ETLRunResult, min_retention_pct: float = 50.0) -> list[CheckResult]:
+    """``etlStepError`` for failed steps; ``etlRecordRetention`` for steps that report source rows,
+    and the fatal ``etlRecordLoss`` when a step keeps less than ``min_retention_pct`` of them."""
     out: list[CheckResult] = []
     for s in etl_result.steps:
         if s.error:
@@ -592,7 +593,24 @@ def etl_checks(etl_result: ETLRunResult) -> list[CheckResult]:
                 )
             )
         elif s.source_rows is not None:
-            out.append(_retention(s))
+            kept = _retention(s)
+            out.append(kept)
+            if kept.num_denominator_rows and (1 - kept.pct_violated_rows) * 100 < min_retention_pct:
+                out.append(
+                    kept.model_copy(
+                        update={
+                            "check_name": "etlRecordLoss",
+                            "description": (
+                                f"ETL step '{s.step}' loaded less than {min_retention_pct:g}% of its source rows into "
+                                f"{s.target_table}: {kept.num_violated_rows} of {kept.num_denominator_rows} dropped. "
+                                "Usually a broken person or visit key, or a join that matches nothing."
+                            ),
+                            "severity": "fatal",
+                            "threshold_pct": 100 - min_retention_pct,
+                            "failed": True,
+                        }
+                    )
+                )
     return out
 
 
@@ -619,8 +637,8 @@ def _retention(s: TableLoadResult) -> CheckResult:
         table=s.target_table,
         description=(
             f"The number and percent of source rows of ETL step '{s.step}' that were not loaded into "
-            f"{s.target_table}: {dropped} of {source} records dropped (for example rows whose person key has "
-            f"no matching person, rows lost in an inner join, or rows removed by a filter).{extra}"
+            f"{s.target_table}: {dropped} of {source} records dropped (for example rows whose person or visit key "
+            f"has no match). Rows the mapping's own filter or inner joins leave out are not counted here.{extra}"
         ),
         category="Completeness",
         subcategory="ETL",
@@ -644,18 +662,27 @@ def summarize(r: CheckResult) -> str:
     )
 
 
+def is_listed_check(r: CheckResult, entries: list[str]) -> bool:
+    """True when ``r`` is named in ``entries`` by check name or by a key prefix."""
+    return any(e == r.check_name or e == r.key or r.key.startswith(e + ".") for e in entries)
+
+
 def gate(
     results: list[CheckResult], cfg: ProjectConfig, etl_result: ETLRunResult | None = None
 ) -> tuple[bool, list[str]]:
-    """Pass iff no failed or errored check has a blocking severity and no ETL step errored.
+    """Pass iff no failed or errored check has a blocking severity or is listed in
+    ``quality.blocking_checks``, and no ETL step errored.
 
     Returns (passed, one line per blocking problem).
     """
     blocking_sev = set(cfg.quality.blocking_severities)
+    always = list(cfg.quality.blocking_checks)
     blocking: list[str] = []
     step_errors_seen: set[tuple[str, str]] = set()
     for r in results:
-        if r.not_applicable or not (r.failed or r.error) or r.severity not in blocking_sev:
+        if r.not_applicable or not (r.failed or r.error):
+            continue
+        if r.severity not in blocking_sev and not is_listed_check(r, always):
             continue
         blocking.append(summarize(r))
         if r.check_name == "etlStepError":
@@ -706,6 +733,6 @@ def run_builtin_checks(
                 results.extend(_field_checks(ctx, t))
                 results.extend(_not_implemented_checks(ctx, t))
     if etl_result is not None:
-        results.extend(etl_checks(etl_result))
+        results.extend(etl_checks(etl_result, cfg.quality.min_record_retention_pct))
     passed, blocking = gate(results, cfg, etl_result)
     return DQReport(run_at=utcnow(), engine="builtin", results=results, passed=passed, blocking_failures=blocking)
