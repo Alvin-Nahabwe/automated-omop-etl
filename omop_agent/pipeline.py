@@ -15,6 +15,7 @@ re-run on its own (``omop-agent <stage>``) after a human edits an artifact.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -23,16 +24,24 @@ import psycopg
 from .cdm.ddl import create_cdm_tables, create_etl_tables
 from .config import ProjectConfig
 from .db import Schemas, connect
+from .fsutil import atomic_write_text
 from .llm import LLMClient, make_llm
 from .models import DQReport, ETLRunResult, ETLSpec, MappingDecision, SourceAnnotations, SourceProfile
 from .workspace import Workspace
 
-# Called at review gates with (stage, message, artifact paths); returns True to continue.
+# Called at review gates with (stage, message, artifact paths); returns True to continue. An
+# approver may have a ``mode`` attribute, recorded with each gate: "interactive" (asked at the
+# terminal), "recorded" (passes only with a recorded approval of the artifact as it is now),
+# "skip" (--yes: gates are not checked) or "stage" (a single stage command: the design and mapping
+# gates are not checked there, the privacy gate needs a recorded approval).
 Approver = Callable[[str, str, list[str]], bool]
 
 
 def auto_approve(stage: str, message: str, paths: list[str]) -> bool:
     return True
+
+
+auto_approve.mode = "skip"  # type: ignore[attr-defined]
 
 
 class PipelineStopped(Exception):
@@ -56,6 +65,7 @@ class Pipeline:
     schemas: Schemas = field(init=False)
     llm: LLMClient = field(init=False)
     _conn: psycopg.Connection | None = field(default=None, init=False)
+    _privacy_checked: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self.ws = Workspace(self.cfg.workdir)
@@ -74,11 +84,70 @@ class Pipeline:
             self._conn.close()
 
     def _gate(self, stage: str, message: str, paths: list[str]) -> None:
+        mode = getattr(self.approver, "mode", "custom")
+        if mode == "stage":
+            mode = "recorded" if stage == "privacy" else "stage"
         ok = self.approver(stage, message, paths)
-        self.ws.audit("human_approval", stage=stage, approved=ok, artifacts=paths)
+        outcome = "stopped" if not ok else {"skip": "skipped", "stage": "not_checked"}.get(mode, "approved")
+        self.ws.audit("review_gate", stage=stage, outcome=outcome, mode=mode, artifacts=paths)
+        if outcome == "skipped" and stage == "privacy":
+            self.log("  ! privacy review skipped (--yes): data goes to Claude without a recorded review")
         if not ok:
             self.ws.mark(stage, "awaiting_review")
+            if mode == "recorded":
+                from .approvals import GATE_PHRASES
+
+                raise PipelineStopped(
+                    f"Waiting for a reviewer to approve the {GATE_PHRASES.get(stage, stage)} (in the web app, or "
+                    f"`omop-agent approve {stage} --by NAME` after checking {', '.join(paths)}).",
+                    stage,
+                )
             raise PipelineStopped(f"Stopped for review at '{stage}'. Edit {', '.join(paths)} and re-run.", stage)
+
+    def _privacy_gate(self) -> None:
+        """Before any step that sends source data to Claude: the privacy review must be approved."""
+        from .privacy_review import REVIEW_MD, refresh, sends_to_llm
+
+        if self._privacy_checked:
+            return
+        if not sends_to_llm(self.cfg):
+            if self.ws.stage_status("privacy") == "awaiting_review":
+                self.ws.mark("privacy", "done", note="nothing is sent to Claude")
+            return
+        if not self.ws.profile_json.exists() or refresh(self.cfg, self.ws) is None:
+            raise RuntimeError(
+                "Profile the source first (`omop-agent profile`): the privacy review is built from the "
+                "profile and must be approved before anything is sent to Claude."
+            )
+        self._gate(
+            "privacy",
+            "Check what will be sent to Claude: the withheld columns and the profile exactly as Claude will see it.",
+            [str(self.ws.root / REVIEW_MD)],
+        )
+        if self.ws.stage_status("privacy") != "done":
+            self.ws.mark("privacy", "done")
+        self._privacy_checked = True
+
+    # A run that stops at a review gate is continued by a plain run, so what the operator asked
+    # for (start over, redraft, map again) is kept here until the step has been done.
+    def _pending(self) -> dict[str, bool]:
+        try:
+            raw = json.loads(self.ws.pending_json.read_text()) if self.ws.pending_json.exists() else {}
+        except ValueError:
+            raw = {}
+        return {k: bool(v) for k, v in raw.items() if k in PENDING_STEPS and v}
+
+    def _save_pending(self, flags: dict[str, bool]) -> None:
+        flags = {k: True for k, v in flags.items() if v}
+        if flags:
+            atomic_write_text(self.ws.pending_json, json.dumps(flags, indent=2) + "\n")
+        elif self.ws.pending_json.exists():
+            self.ws.pending_json.unlink()
+
+    def _done_pending(self, step: str) -> None:
+        flags = self._pending()
+        if flags.pop(step, False):
+            self._save_pending(flags)
 
     def _run_stage(self, stage: str, fn: Callable[[], object]) -> object:
         self.log(f"▶ {stage}")
@@ -94,7 +163,12 @@ class Pipeline:
 
     # ---- artifacts ---------------------------------------------------------------------
     def load_profile(self) -> SourceProfile:
-        return self.ws.load_json(self.ws.profile_json, SourceProfile)
+        """The profile with the current privacy decisions applied (privacy.pii_columns /
+        not_pii_columns, and columns Claude labelled as identifiers or free text)."""
+        from .privacy import apply_overrides
+
+        profile = self.ws.load_json(self.ws.profile_json, SourceProfile)
+        return apply_overrides(profile, self.cfg.privacy, self.load_annotations())
 
     def load_annotations(self) -> SourceAnnotations | None:
         p = self.ws.annotations_json
@@ -119,10 +193,15 @@ class Pipeline:
             self.log(f"  profiled {len(profile.tables)} tables; {n_pii} identifier columns withheld from the LLM")
             return profile
 
-        return self._run_stage("profile", run)  # type: ignore[return-value]
+        profile = self._run_stage("profile", run)
+        self._privacy_checked = False  # a new profile needs its own review
+        self._done_pending("profile")
+        return profile  # type: ignore[return-value]
 
     def annotate(self) -> SourceAnnotations:
         from .profiling.annotate import annotate
+
+        self._privacy_gate()
 
         def run() -> SourceAnnotations:
             ann = annotate(self.load_profile(), self.cfg, self.llm)
@@ -131,7 +210,9 @@ class Pipeline:
                 self.log(f"  note: {note}")
             return ann
 
-        return self._run_stage("annotate", run)  # type: ignore[return-value]
+        ann = self._run_stage("annotate", run)
+        self._done_pending("annotate")
+        return ann  # type: ignore[return-value]
 
     def load_vocabulary(self, force: bool = False) -> None:
         from .vocab.loader import load_athena, vocab_loaded
@@ -165,6 +246,8 @@ class Pipeline:
             self.log(f"▶ design: using the existing {self.ws.spec_yaml.name} (pass --redesign to redraft)")
             self.ws.audit("design_reused", tables=[m.target_table for m in spec.table_mappings])
         else:
+            self._privacy_gate()
+
             def run() -> ETLSpec:
                 if self.ws.spec_yaml.exists():
                     n = 1
@@ -180,6 +263,7 @@ class Pipeline:
                 return spec
 
             spec = self._run_stage("design", run)  # type: ignore[assignment]
+            self._done_pending("redesign")
         self._gate(
             "design",
             "Review the ETL design (etl_spec.md). Edit etl_spec.yaml to change it.",
@@ -203,6 +287,8 @@ class Pipeline:
             write_source_to_concept_map,
         )
         from .vocab.review import export_review, import_review
+
+        self._privacy_gate()
 
         def run() -> list[MappingDecision]:
             spec = self.load_spec()
@@ -239,6 +325,7 @@ class Pipeline:
             return decisions
 
         decisions = self._run_stage("vocab_map", run)
+        self._done_pending("remap")
         self._gate(
             "vocab_map",
             "Review the code mappings in mappings/*.csv (set status/target_concept_id), then continue.",
@@ -291,9 +378,14 @@ class Pipeline:
 
         return self._run_stage("build", run)  # type: ignore[return-value]
 
-    def check(self, spec: ETLSpec | None = None, etl_result: ETLRunResult | None = None) -> DQReport:
+    def check(
+        self, spec: ETLSpec | None = None, etl_result: ETLRunResult | None = None, include_r: bool = True
+    ) -> DQReport:
+        """Run the data-quality checks: the built-in engine, plus the official R Achilles and
+        DataQualityDashboard when ``quality.use_r_dqd`` is set and ``include_r`` (the repair loop
+        checks with the built-in engine only and runs R once, on the final CDM)."""
         from .quality.checks import gate, run_builtin_checks
-        from .quality.dqd_r import r_available, run_r_dqd
+        from .quality.dqd_r import merge_results, r_available, r_failure_summary, r_missing_result, run_r_dqd
 
         def run() -> DQReport:
             spec_ = spec or self.load_spec()
@@ -301,17 +393,46 @@ class Pipeline:
                 self.ws.load_json(self.ws.etl_run_json, ETLRunResult) if self.ws.etl_run_json.exists() else None
             )
             report = run_builtin_checks(self.conn, self.schemas, self.cfg, spec_, etl)
-            if self.cfg.quality.use_r_dqd:
-                if r_available(self.cfg):
+            if self.cfg.quality.use_r_dqd and include_r:
+                problem = None
+                if not r_available(self.cfg):
+                    problem = (
+                        f"R, or one of the R packages DatabaseConnector, Achilles and DataQualityDashboard, "
+                        f"is not installed (quality.rscript: {self.cfg.quality.rscript})"
+                    )
+                    self.log(f"  ✗ {problem}; built-in checks only")
+                    r_report = None
+                else:
                     r_report = run_r_dqd(self.cfg, self.ws)
-                    if r_report is not None:
-                        results = report.results + r_report.results
+                    if r_report is None:
+                        problem = f"the R run failed: {r_failure_summary(self.ws)}"
+                        self.log(
+                            "  ✗ R Achilles/DataQualityDashboard failed; built-in checks only "
+                            f"(see {self.ws.root / 'dqd' / 'rscript.log'}): {r_failure_summary(self.ws)}"
+                        )
+                if problem is not None:
+                    self.ws.audit("dqd_r_fallback_builtin", reason=problem[:500])
+                    if self.cfg.quality.require_r_dqd:
+                        results = report.results + [r_missing_result(problem)]
                         passed, blocking = gate(results, self.cfg, etl)
                         report = report.model_copy(
                             update={"results": results, "passed": passed, "blocking_failures": blocking}
                         )
-                else:
-                    self.log("  R DataQualityDashboard not available; built-in checks only")
+                if r_report is not None:
+                    results = merge_results(report.results, r_report.results)
+                    passed, blocking = gate(results, self.cfg, etl)
+                    self.log(
+                        f"  R DataQualityDashboard: {len(r_report.results)} checks, "
+                        f"{len(r_report.failed())} failed; Achilles results in {self.schemas.results}"
+                    )
+                    report = report.model_copy(
+                        update={
+                            "engine": "builtin+dqd",
+                            "results": results,
+                            "passed": passed,
+                            "blocking_failures": blocking,
+                        }
+                    )
             self.ws.save_json(self.ws.dq_json, report)
             failed = report.failed()
             self.log(
@@ -338,26 +459,35 @@ class Pipeline:
         profile = self.load_profile() if self.ws.profile_json.exists() else None
         max_iter = self.cfg.quality.max_repair_iterations
         iteration = 0
-        best: tuple[tuple, ETLSpec] | None = None
+        best: tuple[tuple, ETLSpec, int] | None = None  # (score, spec, iteration)
+        seen = _BuildHistory()
         while True:
             etl = self.build(spec)
-            report = self.check(spec, etl) if etl.ok else None
-            score = self._score(etl, report)
+            report = self.check(spec, etl, include_r=False) if etl.ok else None
+            losses = seen.losses(etl, report) if iteration > 0 else []
+            score = self._score(etl, report, losses)
             if best is not None and score < best[0]:
-                self.log(f"  repair iteration {iteration} made the result worse; restoring the previous spec")
-                self.ws.audit("repair_reverted", iteration=iteration)
+                why = f" ({'; '.join(losses[:3])})" if losses else ""
+                self.log(f"  repair iteration {iteration} made the result worse{why}; restoring the previous spec")
+                self.ws.audit("repair_reverted", iteration=iteration, reasons=losses[:20])
+                _mark_reverted(self.ws, after_iteration=best[2])
                 spec = best[1]
                 self.ws.save_yaml(self.ws.spec_yaml, spec, header=SPEC_HEADER)
-                etl = self.build(spec)
-                return self.check(spec, etl)
+                from .design.render import render_spec_md
+
+                self.ws.spec_md.write_text(render_spec_md(spec))
+                etl, report = self.build(spec), None
+                break
             if best is None or score >= best[0]:
-                best = (score, spec)
+                best = (score, spec, iteration)
+            seen.add(etl, report)
             if report is not None and report.passed and not self._repairable(report):
-                return report
+                break
             if iteration >= max_iter:
                 self.log(f"  stopping after {max_iter} repair iterations")
-                return report if report is not None else self.check(spec, etl)
+                break
             iteration += 1
+            self._privacy_gate()
             self.log(f"▶ repair (iteration {iteration})")
             spec, actions = repair_spec(
                 spec, iteration=iteration, dq=report, etl_result=etl, llm=self.llm, conn=self.conn,
@@ -367,21 +497,47 @@ class Pipeline:
                 self.log(f"  ✎ {a.target_table}.{a.target_field or '*'}: {a.change}")
             if not actions:
                 self.log("  repair agent made no changes")
-                return report if report is not None else self.check(spec, etl)
+                break
+        # The final CDM: the official R checks (if enabled) run once, here, not in every iteration.
+        if report is None or (self.cfg.quality.use_r_dqd and etl.ok):
+            report = self.check(spec, etl)
+        self._refresh_vocab_evaluation(spec)
+        return report
 
-    def _score(self, etl: ETLRunResult, report: DQReport | None) -> tuple:
-        """Higher is better: gate passed, fewer ETL errors, fewer blocking and repairable failures."""
+    def _refresh_vocab_evaluation(self, spec: ETLSpec) -> None:
+        """Re-measure vocabulary coverage for the spec that built the CDM: repairs and hand edits
+        change the vocab_code expressions after the mapping stage measured them."""
+        from .vocab.evaluate import evaluate_vocabulary, render_vocab_evaluation_md
+
+        if not self.ws.vocab_eval_json.exists():
+            return
+        try:
+            ev = evaluate_vocabulary(self.conn, self.schemas, spec, self.cfg)
+        except psycopg.Error as e:
+            self.conn.rollback()
+            self.log(f"  could not re-measure vocabulary coverage: {e.__class__.__name__}")
+            return
+        self.ws.save_json(self.ws.vocab_eval_json, ev)
+        (self.ws.root / "vocab_evaluation.md").write_text(render_vocab_evaluation_md(ev))
+
+    def _score(self, etl: ETLRunResult, report: DQReport | None, losses: list[str] | None = None) -> tuple:
+        """Higher is better: no records or data lost compared with earlier builds, then gate passed,
+        fewer ETL errors, fewer blocking and repairable failures. Losing data ranks below any
+        failing check, so a repair that drops records or blanks fields to pass is rolled back."""
+        no_loss = not losses
         if report is None:
-            return (False, -len(etl.errors()), -10**9, -10**9)
+            return (no_loss, False, -len(etl.errors()), -10**9, -10**9)
         sev = set(self.cfg.quality.repair_severities)
         repairable = sum((r.failed or bool(r.error)) and r.severity in sev and not r.not_applicable for r in report.results)
-        return (report.passed, -len(etl.errors()), -len(report.blocking_failures), -repairable)
+        return (no_loss, report.passed, -len(etl.errors()), -len(report.blocking_failures), -repairable)
 
     def _repairable(self, report: DQReport) -> bool:
         sev = set(self.cfg.quality.repair_severities)
         return any((r.failed or r.error) and r.severity in sev and not r.not_applicable for r in report.results)
 
-    def report(self, shareable: bool = False) -> None:
+    def report(self, shareable: bool = True) -> None:
+        """Write the inspection report, and (by default) the shareable copy beside it, so the two
+        always describe the same build."""
         from .report.inspection import build_report
 
         def run() -> None:
@@ -389,7 +545,7 @@ class Pipeline:
             self.log(f"  inspection report: {md} and {html}")
             if shareable:
                 md, html = build_report(self.cfg, self.ws, self.conn, self.schemas, shareable=True)
-                self.log(f"  shareable version (rare source terms withheld): {md} and {html}")
+                self.log(f"  shareable version (rare source terms and database error values withheld): {md}")
 
         self._run_stage("report", run)
 
@@ -403,15 +559,22 @@ class Pipeline:
             fresh=fresh, redesign=redesign, remap=remap,
         )
         try:
-            if fresh or not self.ws.profile_json.exists():
+            asked = {"profile": fresh, "annotate": fresh, "redesign": fresh or redesign, "remap": fresh or remap}
+            earlier = self._pending()
+            if earlier:
+                self.log(f"  continuing an earlier request: {', '.join(sorted(earlier))}")
+            todo = {k: v or earlier.get(k, False) for k, v in asked.items()}
+            self._save_pending(todo)
+            if todo["profile"] or not self.ws.profile_json.exists():
                 self.stage_and_profile()
             else:
                 self.log("▶ profile: reusing the staged source and profile.json")
-            if fresh or not self.ws.annotations_json.exists():
+            self._privacy_gate()
+            if todo["annotate"] or not self.ws.annotations_json.exists():
                 self.annotate()
             self.load_vocabulary()
-            self.design(redraft=fresh or redesign or not self.ws.spec_yaml.exists())
-            self.map_vocabulary(remap=fresh or remap)
+            self.design(redraft=todo["redesign"] or not self.ws.spec_yaml.exists())
+            self.map_vocabulary(remap=todo["remap"])
             report = self.build_check_repair()
             self.report()
             self.ws.audit("pipeline_end", passed=report.passed)
@@ -420,4 +583,61 @@ class Pipeline:
             self.close()
 
 
+PENDING_STEPS = ("profile", "annotate", "redesign", "remap")
+
 SPEC_HEADER = "# ETL specification (restored by the repair loop). Edit and re-run `omop-agent build`."
+
+# A table that keeps less than this share of the rows an earlier build loaded has lost data.
+LOSS_TOLERANCE = 0.95
+
+
+class _BuildHistory:
+    """What earlier builds of one repair session loaded, to spot a repair that loses data."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, int] = {}
+        self.applicable: set[str] = set()
+
+    @staticmethod
+    def _rows(etl: ETLRunResult) -> dict[str, int]:
+        """Rows loaded per CDM table (the id maps are append-only, so a rebuild adds none to them)."""
+        from .cdm.spec import load_cdm_spec
+
+        cdm = load_cdm_spec()
+        out: dict[str, int] = {}
+        for s in etl.steps:
+            if not s.error and s.target_table and cdm.has_table(s.target_table):
+                out[s.target_table] = out.get(s.target_table, 0) + int(s.rows_inserted or 0)
+        return out
+
+    def add(self, etl: ETLRunResult, report: DQReport | None) -> None:
+        for table, n in self._rows(etl).items():
+            self.rows[table] = max(self.rows.get(table, 0), n)
+        if report is not None:
+            self.applicable |= {r.key for r in report.results if not r.not_applicable and r.check_level != "ETL"}
+
+    def losses(self, etl: ETLRunResult, report: DQReport | None) -> list[str]:
+        out: list[str] = []
+        now = self._rows(etl)
+        for table, before in sorted(self.rows.items()):
+            n = now.get(table, 0)
+            if before > 0 and n < LOSS_TOLERANCE * before:
+                out.append(f"{table} loaded {n} rows, {before} before")
+        if report is not None:
+            blanked = sorted(r.key for r in report.results if r.not_applicable and r.key in self.applicable)
+            if blanked:
+                out.append(f"{len(blanked)} check(s) no longer apply, e.g. {blanked[0]} (a field or table emptied)")
+        return out
+
+
+def _mark_reverted(ws: Workspace, after_iteration: int) -> None:
+    """Mark the repairs made after ``after_iteration`` as rolled back in repairs.json."""
+    from .models import RepairAction
+
+    if not ws.repairs_json.exists():
+        return
+    actions = ws.load_json_list(ws.repairs_json, RepairAction)
+    ws.save_json(
+        ws.repairs_json,
+        [a.model_copy(update={"reverted": True}) if a.iteration > after_iteration else a for a in actions],
+    )

@@ -320,6 +320,14 @@ def create_app(
         ws = proj.ws
         stages = ws.state().get("stages", {})
         out["stages"] = stages
+        from ..privacy_review import refresh, sends_to_llm
+
+        out["sends_data"] = sends_to_llm(proj.cfg)
+        if out["sends_data"]:
+            try:
+                refresh(proj.cfg, ws)
+            except (OSError, ValueError):  # an unreadable profile: the privacy page says why
+                pass
         out["gates"] = {g: gate_state(ws, g) for g in GATES}
         jobs = JobStore(ws)
         active = jobs.active()
@@ -362,6 +370,31 @@ def create_app(
         if not proj.ws.decisions_json.exists():
             return None
         return _counts(import_review(proj.ws))
+
+    # ---- privacy review ----------------------------------------------------------------
+    @app.get("/p/{pid}/privacy")
+    def privacy_page(request: Request, pid: str):
+        from ..privacy_review import build_review, refresh, sends_to_llm
+
+        user = need(request)
+        proj = configured(project_or_404(pid))
+        ws = proj.ws
+        sends = sends_to_llm(proj.cfg)  # type: ignore[arg-type]
+        review, problem = None, None
+        try:
+            if sends and refresh(proj.cfg, ws) is not None:  # type: ignore[arg-type]
+                review = build_review(proj.cfg, ws)  # type: ignore[arg-type]
+        except (OSError, ValueError) as e:
+            problem = f"The profile or the annotations could not be read ({type(e).__name__}). Profile the source again."
+        return render(
+            request, "privacy.html.j2", user=user, project=proj, tab="privacy", sends=sends, review=review,
+            problem=problem, gate=gate_state(ws, "privacy"),
+        )
+
+    @app.post("/p/{pid}/privacy/approve")
+    async def approve_privacy(request: Request, pid: str):
+        form = await form_of(request)
+        return await run_in_threadpool(_approve_gate, request, pid, "privacy", form, f"/p/{pid}/privacy")
 
     # ---- ETL design --------------------------------------------------------------------
     @app.get("/p/{pid}/spec")

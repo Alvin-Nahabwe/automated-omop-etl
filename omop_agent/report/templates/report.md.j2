@@ -6,6 +6,10 @@
 ## 1. Summary
 
 **Verdict: {{ verdict }}**: {{ verdict_reasons|map('md')|join('; ') }}.
+{% if verdict_caveats %}
+
+> **Not fully reviewed:** {{ verdict_caveats|map('md')|join('; ') }}. The data-quality checks passed, but a person still needs to review this before the CDM is used.
+{% endif %}
 
 | | |
 |---|---|
@@ -38,18 +42,13 @@
 _Not run: no state.json in the workspace._
 {% endif %}
 
-**Human approvals**
-{% if timeline.approvals %}
+**Reviews** (as they stand for this build)
 
-| Time | Stage | Decision | Details |
-|---|---|---|---|
-{% for a in timeline.approvals %}
-| {{ a.at }} | {{ a.stage|md }} | {{ a.decision }} | {{ a.details|md }} |
+| Review | State | Approved by | When | Note | Last run |
+|---|---|---|---|---|---|
+{% for r in reviews %}
+| {{ r.gate }} | {{ r.state }} | {{ r.by|md }} | {{ r.at }} | {{ r.note|md }} | {{ r.last_pass }} |
 {% endfor %}
-{% else %}
-
-_None recorded._
-{% endif %}
 
 ## 3. Source summary
 

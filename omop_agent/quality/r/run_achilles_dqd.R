@@ -13,6 +13,15 @@
 
 library(DatabaseConnector)
 
+# R's SIGPIPE handler raises an R error. With TLS (pgJDBC's default sslmode=prefer) closing a
+# connection can write to a socket the server has already closed, so that error is raised inside
+# rJava and aborts DatabaseConnector::disconnect() ("ignoring SIGPIPE signal") or crashes the JVM
+# later. Achilles and DQD connect and disconnect many times, so ignore SIGPIPE, as the JVM does.
+invisible(rJava::.jinit())
+invisible(rJava::J("sun.misc.Signal")$handle(
+  rJava::.jnew("sun.misc.Signal", "PIPE"), rJava::J("sun.misc.SignalHandler")$SIG_IGN
+))
+
 # ---- settings (filled in by omop-agent) -------------------------------------------------------
 server          <- {{server}}            # "host/database"
 port            <- {{port}}
@@ -27,13 +36,22 @@ smallCellCount  <- {{small_cell_count}}  # Achilles suppresses counts below this
 runAchilles     <- {{run_achilles}}
 
 # ---- connection -------------------------------------------------------------------------------
+# DatabaseConnector needs exactly one file named postgresql-<version>.jar in the folder. The
+# omop-agent R image provides one (DATABASECONNECTOR_JAR_FOLDER=/opt/jdbc); elsewhere it is
+# downloaded once into <output folder>/jdbc, which needs internet access.
 driverFolder <- Sys.getenv("DATABASECONNECTOR_JAR_FOLDER")
 if (driverFolder == "") {
   driverFolder <- file.path(outputFolder, "jdbc")
   dir.create(driverFolder, recursive = TRUE, showWarnings = FALSE)
-  if (length(list.files(driverFolder, pattern = "postgresql.*\\.jar$")) == 0) {
+  if (length(list.files(driverFolder, pattern = "^postgresql-.*\\.jar$")) == 0) {
     DatabaseConnector::downloadJdbcDrivers("postgresql", pathToDriver = driverFolder)
   }
+}
+if (length(list.files(driverFolder, pattern = "^postgresql-.*\\.jar$")) != 1) {
+  stop(paste0(
+    "need exactly one PostgreSQL JDBC driver named postgresql-<version>.jar in ", driverFolder,
+    " (set DATABASECONNECTOR_JAR_FOLDER to a folder that holds one)"
+  ))
 }
 
 connectionDetails <- DatabaseConnector::createConnectionDetails(
@@ -74,6 +92,9 @@ DataQualityDashboard::executeDqChecks(
   cdmDatabaseSchema = cdmSchema,
   resultsDatabaseSchema = resultsSchema,
   vocabDatabaseSchema = vocabSchema,
+  # omop-agent creates COHORT and COHORT_DEFINITION in the CDM schema; DQD looks for them in
+  # cohortDatabaseSchema (default: the results schema).
+  cohortDatabaseSchema = cdmSchema,
   cdmSourceName = cdmSourceName,
   cdmVersion = "5.4",
   outputFolder = outputFolder,

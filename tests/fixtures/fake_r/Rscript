@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""A stand-in for Rscript in tests: no R needed.
+
+`Rscript -e <probe>` succeeds (all packages "installed"). `Rscript <script.R>` reads outputFolder and
+resultsFile from the generated script and, depending on FAKE_R_MODE, writes a small DQD results file
+(ok, fatal) or fails like the real SIGPIPE error (fail). Each run appends a line to FAKE_R_CALLS.
+"""
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+if len(sys.argv) >= 2 and sys.argv[1] == "-e":
+    sys.exit(0)
+script = Path(sys.argv[1]).read_text()
+calls = os.environ.get("FAKE_R_CALLS")
+if calls:
+    with open(calls, "a") as fh:
+        fh.write("run\n")
+mode = os.environ.get("FAKE_R_MODE", "ok")
+if mode == "fail":
+    print("Connecting using PostgreSQL driver")
+    print('Error in rJava::.jcall(connection@jConnection, "V", "close") : \n  ignoring SIGPIPE signal', file=sys.stderr)
+    sys.exit(1)
+folder = re.search(r'^outputFolder\s*<-\s*"(.*)"', script, re.M).group(1)
+name = re.search(r'^resultsFile\s*<-\s*"(.*)"', script, re.M).group(1)
+rows = [
+    {"checkName": "cdmTable", "checkLevel": "TABLE", "cdmTableName": "PERSON", "numViolatedRows": 0,
+     "pctViolatedRows": 0, "numDenominatorRows": 1, "failed": 0, "notApplicable": 0, "isError": 0},
+    {"checkName": "isRequired", "checkLevel": "FIELD", "cdmTableName": "PERSON", "cdmFieldName": "PERSON_ID",
+     "numViolatedRows": 0, "pctViolatedRows": 0, "numDenominatorRows": 10, "failed": 0, "thresholdValue": 0},
+    {"checkName": "plausibleGenderUseDescendants", "checkLevel": "CONCEPT", "cdmTableName": "CONDITION_OCCURRENCE",
+     "cdmFieldName": "CONDITION_CONCEPT_ID", "conceptId": "4090861, 4025213", "numViolatedRows": 2,
+     "pctViolatedRows": 0.2, "numDenominatorRows": 10, "failed": 1, "thresholdValue": 5},
+]
+if mode == "fatal":
+    rows.append({"checkName": "cdmField", "checkLevel": "FIELD", "cdmTableName": "PERSON", "cdmFieldName": "GENDER_CONCEPT_ID",
+                 "numViolatedRows": 1, "pctViolatedRows": 1, "numDenominatorRows": 1, "failed": 1, "thresholdValue": 0})
+Path(folder).mkdir(parents=True, exist_ok=True)
+(Path(folder) / name).write_text(json.dumps({"CheckResults": rows}))
+print("DQD done")

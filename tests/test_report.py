@@ -228,7 +228,12 @@ def full_ws(tmp_path: Path) -> tuple[ProjectConfig, Workspace]:
     )
     for stage in ("profile", "annotate", "design", "vocab_map", "build", "quality"):
         ws.mark(stage, "done")
-    ws.audit("human_approval", stage="design", approved=True, artifacts=[str(ws.spec_md), str(ws.spec_yaml)])
+    ws.audit("review_gate", stage="design", outcome="approved", mode="interactive",
+             artifacts=[str(ws.spec_md), str(ws.spec_yaml)])
+    if ws.spec_yaml.exists():
+        from omop_agent.approvals import record_approval
+
+        record_approval(ws, "design", "alice", note="keys checked")
     ws.audit("repair", iteration=1, actions=1, trigger="isRequired.person.gender_concept_id", summary="Mapped sex 9.")
     ws.audit("repair_skipped", iteration=2, reason="no recording for repair/iteration:2", trigger="etl:measurement")
     usage = {"input_tokens": 1000, "output_tokens": 200, "cache_read_input_tokens": 500}
@@ -385,8 +390,10 @@ def test_sections_content(full_ws):
     timeline = data["timeline"]
     assert next(s for s in timeline["stages"] if s["stage"] == "build")["status"] == "done"
     assert next(s for s in timeline["stages"] if s["stage"] == "report")["status"] == "not run"
-    assert timeline["approvals"][0]["decision"] == "approved"
-    assert timeline["approvals"][0]["details"] == 'artifacts=["etl_spec.md", "etl_spec.yaml"]'
+    reviews = {r["gate"]: r for r in data["reviews"]}
+    assert (reviews["ETL design"]["state"], reviews["ETL design"]["by"], reviews["ETL design"]["note"]) == (
+        "approved", "alice", "keys checked")
+    assert reviews["ETL design"]["last_pass"] == "approved"
 
     steps = {s["text"].split(" ")[0]: s["done"] for s in data["next_steps"]}
     assert steps["Review"] is False and steps["Register"] is False
@@ -513,3 +520,38 @@ def test_characterize_cdm_withholds_small_distributions(pg):
     ]
     assert out["observation_period"]["suppressed"] and out["observation_period"]["median_days"] is None
     assert out["gender"] == [] and out["vocabulary_version"] is None
+
+
+def test_shareable_report_withholds_values_in_database_errors():
+    from omop_agent.report.inspection import _redact_errors
+
+    data = {
+        "etl": {"steps": [{"error": 'null value in column "visit_end_date" violates not-null constraint '
+                                    "DETAIL: Failing row contains (1, 2, 9202, 2019-04-22, KH000123)"}]},
+        "verdict_reasons": ["stage 'build' failed: invalid input syntax for type date: \"31/02/1990\""],
+        "mapping": {"rationale": 'kept "Hemoglobin"'},
+    }
+    out = _redact_errors(data)
+    assert "KH000123" not in str(out) and "31/02/1990" not in str(out)
+    assert out["mapping"]["rationale"] == 'kept "Hemoglobin"'  # only error fields are touched
+
+
+def test_shareable_report_withholds_values_in_the_stage_timeline(full_ws):
+    cfg, ws = full_ws
+    ws.mark("vocab_map", "failed", error='invalid input syntax for type integer: "Wanjiku Otieno 0712345678"')
+    for shareable in (False, True):
+        timeline = str(collect_report_data(cfg, ws, shareable=shareable)["timeline"])
+        assert ("Wanjiku" in timeline) is not shareable
+
+
+def test_report_counts_only_mappings_that_reach_the_cdm():
+    from omop_agent.models import MappingDecision
+    from omop_agent.report.inspection import _mapping_row
+
+    def d(code, status, target, n):
+        return MappingDecision(source_vocabulary_id="SRC", source_code=code, source_name=code, frequency=n,
+                               target_concept_id=target, status=status)
+
+    ds = [d("a", "APPROVED", 1, 100), d("b", "UNCHECKED", 2, 50), d("c", "FLAGGED", 3, 30), d("e", "REJECTED", 4, 20)]
+    assert _mapping_row("SRC", ds)["records_mapped"] == 150
+    assert _mapping_row("SRC", ds, include_unchecked=False)["records_mapped"] == 100

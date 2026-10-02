@@ -138,11 +138,23 @@ Health data is sensitive, so these rules are enforced in code rather than left t
 * **Small-cell suppression.** A value seen fewer than `min_cell_count` times is never shown to
   the LLM. That covers the profile, vocabulary terms and repair-agent results. Rare codes are
   left for human mapping.
-* **Direct identifiers are detected and withheld.** That covers names, phone numbers,
-  national, hospital and record numbers, e-mail, addresses and GPS. Values of patient-key
-  columns are never listed. Direct-identifier columns can't be used in the ETL spec or sent
-  for mapping; the validator rejects them. You can list extra identifier columns in
-  `privacy.pii_columns`.
+* **Direct identifiers are detected and withheld.** Column-name rules cover names (including
+  `deceased_name`, `hh_head_name`, `fname`, "Mother's Name" and the WHO verbal autopsy name
+  questions), staff names, phone numbers, e-mail, national, health and register numbers (CCC,
+  UPI, Huduma, OPD/IP numbers), addresses (plot and house numbers), GPS (including ODK
+  geopoints) and free text (narratives, comments, "other, specify"). Value rules catch e-mail
+  addresses, Kenyan and international phone numbers, coordinates and free text. Columns Claude
+  itself labels as identifiers or free text are withheld from then on. Values of patient and
+  parent keys are never listed, nor are those of household, visit and other record keys with
+  more than 50 distinct values. Withheld columns can't be used in the ETL spec or sent for
+  mapping; the validator rejects them. List extra identifier columns in `privacy.pii_columns`,
+  and columns flagged by mistake (a CD4 count) in `privacy.not_pii_columns` (their values are
+  collected the next time the source is profiled).
+* **A person checks what will be sent before Claude is first called.** Detection is
+  heuristic, so a project that uses Claude stops for a *privacy review*: the withheld columns
+  and the profile exactly as Claude will see it (`work/privacy_review.md`, or the Privacy tab of
+  the web app). Nothing goes to Claude until a reviewer approves it, and a re-staged source or a
+  changed privacy setting needs a new approval.
 * **The repair agent can only count.** It can't write SQL to read data. Its `count_records`
   tool takes a table, up to three grouping columns and typed filters, and the tool builds the
   query itself with bound parameters. It returns `COUNT(*)` per group, withholds groups below
@@ -155,8 +167,14 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   INSERT/TRUNCATE on CDM/ETL) and the build runs under it.
 * **Nothing Claude produces is trusted blindly.** Concept ids must exist in your vocabulary
   as valid standard concepts in the right domain. Person and visit ids always come from the id
-  maps, so events can't attach to the wrong patient. A repair that makes results worse is
-  rolled back, and DQ verdicts come from SQL.
+  maps, so events can't attach to the wrong patient. The repair agent may not filter out
+  records, add inner joins or blank fields; a repair that makes results worse, or loads fewer
+  records, is rolled back; and DQ verdicts come from SQL.
+* **A PASS means the data is there.** Besides fatal DQD failures, the gate blocks when a table
+  mapping loads less than half of its source rows (`etlRecordLoss`) and when persons have no
+  observation period (`quality.blocking_checks`). A CDM built from a design or mappings that
+  nobody approved, or that automatic repairs changed after approval, is reported as "PASSED,
+  not fully reviewed".
 * **Source files are staged exactly or not at all.** CSVs are decoded strictly: set
   `source.encoding` for Latin-1 or cp1252 exports. Rows with the wrong number of fields stop
   the run with their line numbers, unless you set `source.skip_ragged_rows`.
@@ -164,8 +182,9 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   prompt, every tool result and the agent's intermediate messages, verbatim. `repairs.json`
   records every automatic change with its rationale.
 * **Reports are marked confidential.** The inspection report lists source terms, rare ones
-  included, because reviewers need them. `omop-agent report --shareable` also writes a
-  version with the rare terms withheld.
+  included, because reviewers need them. Every report is written with a shareable copy
+  (`report.shareable.*`) in which rare terms are withheld and database error messages lose the
+  record values they can quote.
 * `privacy.send_values_to_llm: false` goes further. Claude then sees statistics only, code
   mapping is lexical only, and the repair agent can only group by concept ids.
 
@@ -219,14 +238,18 @@ runs the demo inside it.
   domain stays in the table the spec chose, and DQD flags it.
 * The eras (`condition_era`, `drug_era`), `visit_detail`, `note`/NLP and `cost` tables are not
   generated automatically; add them as table mappings or `custom_sql` in the spec.
-* The built-in checks cover DQD's table and field levels. Concept-level checks (plausible
-  gender, plausible units) need the official R DQD (`quality.use_r_dqd: true`).
+* The built-in checks cover most of DQD's table and field checks (19 of 27 check types, and
+  they agree with DQD wherever both run). Concept-level checks (plausible gender, plausible
+  units), the schema checks and Achilles need the official R route: the R image
+  (`Dockerfile.r`, see docs/deploy.md), or R installed with `deploy/r/install_r_dqd.sh`, and
+  `quality.use_r_dqd: true`. It runs once, on the final CDM, and adds about 2–3 minutes.
 * The demo vocabulary and the recorded LLM answers are synthetic and hand-written. Never load
   the fixture vocabulary into a real CDM.
 * The web app has local accounts only (no single sign-on or two-factor login yet). Keep it on
   the internal network or VPN, behind HTTPS. The ETL design is reviewed in the browser but
-  edited on the server (`etl_spec.yaml`). The Docker image does not include R, so the
-  official R Achilles/DQD (`quality.use_r_dqd`) needs R installed separately.
+  edited on the server (`etl_spec.yaml`).
+* Identifier detection is rule-based (column names and value patterns), which is why the
+  privacy review exists: a person still has to look.
 
 ## Licence and attribution
 

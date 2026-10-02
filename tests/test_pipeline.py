@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -122,7 +123,47 @@ def test_review_gate_stops(demo_project):
     with pytest.raises(PipelineStopped):
         p.run_all()
     assert p.ws.stage_status("design") == "awaiting_review"
-    assert any(e["event"] == "human_approval" and not e["approved"] for e in p.ws.read_audit())
+    assert any(e["event"] == "review_gate" and e["stage"] == "design" and e["outcome"] == "stopped"
+               for e in p.ws.read_audit())
+
+
+@pytest.mark.postgres
+def test_start_over_survives_a_privacy_stop(demo_project, monkeypatch):
+    """A run that stops at the privacy review is continued by a plain run: what the operator asked
+    for (start over) still happens, and the approved review leaves no unfinished stage behind."""
+    import omop_agent.privacy_review as privacy_review
+    from omop_agent.approvals import record_approval, recorded_approver
+
+    cfg = load_config(demo_project)
+    Pipeline(cfg, log=lambda m: None).run_all()
+    spec_path = cfg.workdir / "etl_spec.yaml"
+    spec_path.write_text(spec_path.read_text() + "\n# reviewer note\n")
+    annotated_at = (cfg.workdir / "annotations.json").stat().st_mtime_ns
+
+    monkeypatch.setattr(privacy_review, "sends_to_llm", lambda c: True)  # as if the project used Claude
+    p = Pipeline(cfg, log=lambda m: None)
+    ws, approver = p.ws, recorded_approver(p.ws)
+
+    def run(**kw):
+        with pytest.raises(PipelineStopped) as e:
+            Pipeline(cfg, approver=approver, log=lambda m: None).run_all(**kw)
+        return e.value.stage
+
+    assert run(fresh=True) == "privacy"
+    assert json.loads(ws.pending_json.read_text()) == {"annotate": True, "redesign": True, "remap": True}
+    record_approval(ws, "privacy", "rita")
+    assert run() == "design"
+    assert (cfg.workdir / "annotations.json").stat().st_mtime_ns != annotated_at  # interpreted again
+    assert "# reviewer note" not in spec_path.read_text()  # redrafted...
+    assert "# reviewer note" in (cfg.workdir / "etl_spec.1.yaml").read_text()  # ...after a backup
+    assert json.loads(ws.pending_json.read_text()) == {"remap": True}
+    record_approval(ws, "design", "rita")
+    assert run() == "vocab_map"
+    assert not ws.pending_json.exists()
+    record_approval(ws, "vocab_map", "rita")
+    report = Pipeline(cfg, approver=approver, log=lambda m: None).run_all()
+    assert report.passed and ws.stage_status("privacy") == "done"
+    assert "Verdict: PASSED" in ws.report_md.read_text()
 
 
 def test_cli_init(tmp_path, monkeypatch):
@@ -180,3 +221,47 @@ def test_unsafe_hand_edit_is_refused_at_build(demo_project):
     with pytest.raises(SpecInvalid, match="first_name"):
         p2.build_check_repair()
     p2.close()
+
+
+FAKE_R = Path(__file__).parent / "fixtures" / "fake_r" / "Rscript"
+
+
+@pytest.mark.postgres
+def test_official_dqd_runs_once_after_repairs_and_failures_are_visible(demo_project, tmp_path, monkeypatch):
+    """The R bridge, end to end with a stand-in Rscript: results are merged without duplicates,
+    R runs once (after the repair loop), and a failed R run is reported, or fails the gate when
+    quality.require_r_dqd is set."""
+    calls = tmp_path / "r_calls.txt"
+    monkeypatch.setenv("FAKE_R_CALLS", str(calls))
+    cfg = load_config(demo_project)
+    cfg.quality.use_r_dqd = True
+    cfg.quality.rscript = str(FAKE_R)
+    logs: list[str] = []
+    p = Pipeline(cfg, log=logs.append)
+    report = p.run_all(fresh=True)
+    assert report.passed and report.engine == "builtin+dqd"
+    assert calls.read_text().count("run") == 1  # the demo's repair loop builds 3 times; R ran once
+    keys = [r.key for r in report.results]
+    assert len(keys) == len(set(keys))
+    gender = next(r for r in report.results if r.check_name == "plausibleGenderUseDescendants")
+    assert gender.concept_id == 4090861
+    assert any("R DataQualityDashboard: 3 checks" in m for m in logs)
+    assert "builtin+dqd" in p.ws.report_md.read_text()
+
+    monkeypatch.setenv("FAKE_R_MODE", "fail")
+    logs.clear()
+    p = Pipeline(cfg, log=logs.append)
+    report = p.check()
+    assert report.passed and report.engine == "builtin"
+    assert any("✗ R Achilles/DataQualityDashboard failed" in m and "SIGPIPE" in m for m in logs)
+
+    cfg.quality.require_r_dqd = True
+    p = Pipeline(cfg, log=logs.append)
+    report = p.check()
+    assert not report.passed and any(b.startswith("officialDqdRun") for b in report.blocking_failures)
+
+    monkeypatch.setenv("FAKE_R_MODE", "fatal")
+    cfg.quality.require_r_dqd = False
+    report = Pipeline(cfg, log=logs.append).check()
+    assert not report.passed and any(b.startswith("cdmField.person.gender_concept_id") for b in report.blocking_failures)
+    p.close()

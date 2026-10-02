@@ -161,9 +161,9 @@ def reconcile(answer: SourceAnnotations, profile: SourceProfile) -> SourceAnnota
             if ca is None:
                 columns.append(fb_cols[(tp.name, cp.name)])
             elif cp.is_pii and ca.semantic_type != "pii":
-                columns.append(ca.model_copy(update={"semantic_type": "pii", "coding_system": None}))
+                columns.append(ca.model_copy(update={"semantic_type": "pii", "coding_system": None, "origin": "llm"}))
             else:
-                columns.append(ca)
+                columns.append(ca.model_copy(update={"origin": "llm"}))
     return SourceAnnotations(tables=tables, columns=columns, notes=list(answer.notes))
 
 

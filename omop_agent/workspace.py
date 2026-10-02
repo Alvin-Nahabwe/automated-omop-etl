@@ -117,6 +117,11 @@ class Workspace:
         return self.root / "state.json"
 
     @property
+    def pending_json(self) -> Path:
+        """What a stopped run was asked to redo (start over, redraft, map again)."""
+        return self.root / "pending_run.json"
+
+    @property
     def jobs_dir(self) -> Path:
         return self.root / "jobs"
 

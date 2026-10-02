@@ -723,7 +723,6 @@ def test_replace_table_mapping(repair_env):
     for fm in tm["fields"]:
         if fm["target_field"] == "condition_concept_id":
             fm["expression"] = normalised
-    tm["where"] = "d.icd10 IS NOT NULL"
 
     assert replace({"target_table": "condition_occurrence", "mapping_yaml": "fields: [", "rationale": "x"}).startswith(
         "REJECTED: invalid YAML")
@@ -747,9 +746,27 @@ def test_replace_table_mapping(repair_env):
             fm["expression"] = "i.first_name"
     out = replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(join), "rationale": "x"})
     assert out.startswith("REJECTED:") and "individuals.first_name" in out
+    # the repair agent may not remove records or data to make a check pass
+    filtered = {**tm, "where": "d.icd10 IS NOT NULL"}
+    out = replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(filtered), "rationale": "x"})
+    assert out.startswith("REJECTED:") and "adds the filter" in out and "may not remove records" in out
+    inner = {**copy.deepcopy(tm), "joins": [{"table": "{src}.individuals", "alias": "i", "join_type": "inner",
+                                             "on": "i.individual_id = d.individual_id"}]}
+    out = replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(inner), "rationale": "x"})
+    assert out.startswith("REJECTED:") and "inner join" in out
+    blank = copy.deepcopy(tm)
+    for fm in blank["fields"]:
+        if fm["target_field"] == "condition_source_value":
+            fm.update(kind="null", expression=None)
+    out = replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(blank), "rationale": "x"})
+    assert out.startswith("REJECTED:") and "blanks condition_occurrence.condition_source_value" in out
+    out = tools["update_field_mapping"].invoke({"target_table": "condition_occurrence",
+                                                "target_field": "condition_source_value", "kind": "null",
+                                                "rationale": "x"})
+    assert out.startswith("REJECTED:") and "blanks" in out
     bad_where = {**tm, "where": "d.icd10 IS NOT NULL; DELETE FROM x"}
-    assert "';'" in replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(bad_where),
-                             "rationale": "x"})
+    assert replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(bad_where),
+                    "rationale": "x"}).startswith("REJECTED:")
     assert state.actions == []
 
     out = replace({"target_table": "condition_occurrence", "mapping_yaml": yaml.safe_dump(tm),
@@ -757,8 +774,7 @@ def test_replace_table_mapping(repair_env):
     assert out.startswith("OK:"), out
     (action,) = state.actions
     assert action.target_field is None and "condition_concept_id: vocab_code: d.icd10" in action.change
-    assert "where: (none) → d.icd10 IS NOT NULL" in action.change
-    assert state.spec.mapping_for("condition_occurrence").where == "d.icd10 IS NOT NULL"
+    assert state.spec.mapping_for("condition_occurrence").where is None
 
 
 def test_repair_prompt_suppresses_small_counts(tmp_path):
@@ -875,3 +891,98 @@ def test_repair_spec_without_llm_or_failures(staged, tmp_path):
     clean = DQReport(run_at=NOW, passed=True, results=[])
     assert repair_spec(spec, iteration=1, dq=clean, etl_result=None, **kwargs) == (spec, [])
     assert len(ws.read_audit()) == 1 and not ws.repairs_json.exists()
+
+
+def test_merge_results_counts_each_check_once():
+    from omop_agent.quality.checks import FIELD_SUMMARY, NOT_IMPLEMENTED
+
+    def r(name, table, field=None, desc="", failed=False, concept=None):
+        return CheckResult(check_name=name, check_level="FIELD", table=table, field=field, concept_id=concept,
+                           description=desc or name, failed=failed)
+
+    builtin = [
+        r("isRequired", "person", "person_id"),
+        r("etlRecordRetention", "measurement", desc="kept rows"),
+        r("cdmTable", "person", desc=f"cdmTable: {NOT_IMPLEMENTED}"),
+        r(FIELD_SUMMARY, "note", desc="no rows"),
+    ]
+    dqd = [r("isRequired", "person", "person_id", failed=True), r("cdmTable", "person")]
+    merged = dqd_r.merge_results(builtin, dqd)
+    keys = sorted((x.check_name, x.table, x.field or "") for x in merged)
+    assert keys == [("cdmTable", "person", ""), ("etlRecordRetention", "measurement", ""), ("isRequired", "person", "person_id")]
+    assert next(x for x in merged if x.check_name == "isRequired").failed  # DQD's result wins
+
+
+def test_r_missing_result_blocks_the_gate(tmp_path):
+    cfg = plain_config(tmp_path)
+    passed, blocking = gate([dqd_r.r_missing_result("R is not installed")], cfg)
+    assert not passed and blocking and blocking[0].startswith("officialDqdRun.cdm (fatal)")
+
+
+def test_r_failure_summary_picks_the_last_error(tmp_path):
+    ws = Workspace(tmp_path / "work")
+    assert dqd_r.r_failure_summary(ws) == "no rscript.log was written"
+    (ws.root / "dqd").mkdir()
+    (ws.root / "dqd" / "rscript.log").write_text(
+        "Connecting\n--- stderr ---\nPicked up JAVA_TOOL_OPTIONS: x\nWarning: y\n"
+        'Error in rJava::.jcall(connection@jConnection, "V", "close") : \n  ignoring SIGPIPE signal\nExecution halted\n'
+    )
+    summary = dqd_r.r_failure_summary(ws)
+    assert summary.startswith("Error in rJava") and "SIGPIPE" in summary and "JAVA_TOOL" not in summary
+
+
+def test_r_script_ignores_sigpipe_and_finds_cohort_tables(tmp_path):
+    text = dqd_r.render_r_script(plain_config(tmp_path), Workspace(tmp_path / "work"))
+    assert 'rJava::.jnew("sun.misc.Signal", "PIPE")' in text and "SIG_IGN" in text
+    assert "cohortDatabaseSchema = cdmSchema" in text
+    assert 'pattern = "^postgresql-.*\\\\.jar$"' in text
+
+
+def test_catastrophic_record_loss_blocks(tmp_path):
+    cfg = plain_config(tmp_path)
+    run = ETLRunResult(started_at=NOW, steps=[
+        TableLoadResult(target_table="measurement", step="05_measurement", source_rows=6435, retained_rows=0),
+        TableLoadResult(target_table="drug_exposure", step="06_drug", source_rows=1000, retained_rows=940),
+    ])
+    results = etl_checks(run, cfg.quality.min_record_retention_pct)
+    names = sorted((r.check_name, r.table, r.failed) for r in results)
+    assert names == [("etlRecordLoss", "measurement", True), ("etlRecordRetention", "drug_exposure", True),
+                     ("etlRecordRetention", "measurement", True)]
+    passed, blocking = gate(results, cfg, run)
+    assert not passed and blocking == [next(b for b in blocking if b.startswith("etlRecordLoss.measurement (fatal)"))]
+
+
+def test_blocking_checks_block_whatever_their_severity(tmp_path):
+    cfg = plain_config(tmp_path)
+    no_period = CheckResult(check_name="measurePersonCompleteness", check_level="TABLE", table="observation_period",
+                            description="d", severity="convention", num_violated_rows=410, num_denominator_rows=1500,
+                            pct_violated_rows=410 / 1500, failed=True)
+    no_visit = no_period.model_copy(update={"table": "visit_occurrence"})
+    passed, blocking = gate([no_period, no_visit], cfg)
+    assert not passed and len(blocking) == 1 and blocking[0].startswith("measurePersonCompleteness.observation_period")
+    cfg.quality.blocking_checks = []
+    assert gate([no_period, no_visit], cfg)[0]
+
+
+def test_build_history_spots_lost_records_and_blanked_fields():
+    from omop_agent.models import DQReport
+    from omop_agent.pipeline import _BuildHistory
+
+    def run(rows, mapped=1500):
+        return ETLRunResult(started_at=NOW, steps=[
+            TableLoadResult(target_table="person_map", step="00_map", rows_inserted=mapped),
+            TableLoadResult(target_table="measurement", step="05", rows_inserted=rows),
+        ])
+
+    def report(na):
+        r = CheckResult(check_name="isRequired", check_level="FIELD", table="measurement", field="unit_concept_id",
+                        description="d", not_applicable=na)
+        return DQReport(run_at=NOW, results=[r], passed=True)
+
+    h = _BuildHistory()
+    h.add(run(6400), report(False))
+    assert h.losses(run(6400), report(False)) == []
+    assert h.losses(run(6400, mapped=0), report(False)) == []  # id maps are append-only: 0 new rows is fine
+    assert h.losses(run(2986), report(False)) == ["measurement loaded 2986 rows, 6400 before"]
+    lost = h.losses(run(6400), report(True))
+    assert len(lost) == 1 and "no longer apply" in lost[0]

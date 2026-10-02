@@ -67,7 +67,7 @@ from ..models import (
     TableLoadResult,
     TableMapping,
 )
-from ..privacy import pii_columns, pii_references, profile_prompt_text
+from ..privacy import name_rule, pii_columns, pii_references, profile_prompt_text
 from ..profiling.profiler import KEY_MAX_LISTED_DISTINCT, _is_key_column
 from ..sqlguard import fragment_issues, strip_literals
 from ..workspace import Workspace, utcnow
@@ -113,7 +113,8 @@ How to work:
 3. Prefer the smallest change that follows OMOP conventions (for example, a visit without an end date
    ends on its start date; an unknown value maps to concept 0 rather than to a guessed concept).
 4. Do not paper over real data problems. Never filter out or delete records just to make a check pass,
-   and never invent concept ids, dates or values. When the cause lies in the source data or in the
+   and never invent concept ids, dates or values. Edits that can only remove data are refused: a new or
+   changed filter, a new or changed inner join, another source table, or blanking a populated field. When the cause lies in the source data or in the
    vocabulary coverage (unmapped local codes, implausible dates recorded at source), leave the spec as
    it is and explain the problem for a human.
 5. Privacy: you only ever see aggregates. count_records returns counts of records, optionally grouped by
@@ -370,7 +371,7 @@ def _tokens(text: str | None) -> set[str]:
 
 
 def _pii_pattern(name: str, state: RepairState) -> bool:
-    return any(re.search(p, name.lower()) for p in state.cfg.privacy.pii_name_patterns)
+    return name_rule(name, state.cfg.privacy) is not None
 
 
 def source_column_denial(state: RepairState, table: str, column: str) -> str | None:
@@ -831,6 +832,43 @@ def validate_mapping(tm: TableMapping, spec: ETLSpec, conn: psycopg.Connection, 
     return None
 
 
+def _norm_sql(text: str | None) -> str:
+    return " ".join((text or "").split()).lower()
+
+
+def data_loss_issues(old: TableMapping | None, new: TableMapping) -> list[str]:
+    """Edits that can only remove records or data, which the repair agent may not make: a new or
+    changed filter, a new or changed inner join, a different source table, or a populated field
+    turned to NULL. (An added mapping may filter: it adds records, for example to route the
+    observation-domain codes of a source table to observation.)"""
+    if old is None:
+        return []
+    out: list[str] = []
+    if old.source.table.lower() != new.source.table.lower():
+        out.append(f"it changes the source table ({old.source.table} → {new.source.table})")
+    if new.where and _norm_sql(new.where) != _norm_sql(old.where):
+        out.append(f"it {'changes' if old.where else 'adds'} the filter (where: {new.where})")
+    old_joins = {j.alias.lower(): j for j in old.joins}
+    for j in new.joins:
+        before = old_joins.get(j.alias.lower())
+        if j.join_type == "inner" and (
+            before is None
+            or before.join_type != "inner"
+            or _norm_sql(before.on) != _norm_sql(j.on)
+            or before.table.lower() != j.table.lower()
+        ):
+            out.append(f"it adds or changes an inner join ({j.table} {j.alias} on {j.on})")
+    old_fields = {f.target_field: f for f in old.fields}
+    for f in new.fields:
+        before = old_fields.get(f.target_field)
+        if f.kind == "null" and before is not None and before.kind != "null":
+            out.append(f"it blanks {new.target_table}.{f.target_field} (was {before.kind})")
+    for name, before in old_fields.items():
+        if before.kind != "null" and name not in {f.target_field for f in new.fields}:
+            out.append(f"it removes the mapping of {new.target_table}.{name}")
+    return out
+
+
 def _apply(
     state: RepairState,
     pos: int | None,
@@ -840,6 +878,13 @@ def _apply(
     change: str,
     rationale: str,
 ) -> str:
+    loss = data_loss_issues(state.spec.table_mappings[pos] if pos is not None else None, new_tm)
+    if loss:
+        return (
+            "REJECTED: " + "; ".join(loss) + ". The repair agent may not remove records or data to make a check "
+            "pass. If records really should be excluded, leave the spec as it is and explain why in your summary, "
+            "for a person to decide."
+        )
     issues = mapping_issues(state, new_tm)
     if issues:
         return "REJECTED: " + "; ".join(issues)

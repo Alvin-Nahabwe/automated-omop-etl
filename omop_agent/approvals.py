@@ -1,7 +1,8 @@
-"""Recorded reviewer approvals for the pipeline's two review gates.
+"""Recorded reviewer approvals for the pipeline's review gates.
 
-A reviewer approves what a gate shows, the ETL design (``design``) or the code mappings
-(``vocab_map``), in the web app or with ``omop-agent approve``. The approval is stored in
+A reviewer approves what a gate shows: what will be sent to Claude (``privacy``, see
+privacy_review.py), the ETL design (``design``) or the code mappings (``vocab_map``), in the web
+app, at the terminal during ``omop-agent run``, or with ``omop-agent approve``. The approval is stored in
 ``<workdir>/approvals.json`` together with a digest of what was approved, and a copy of it is
 kept under ``<workdir>/approvals/`` so a later change can be shown as a diff.
 
@@ -26,11 +27,13 @@ from .models import ETLSpec
 from .workspace import Workspace, utcnow
 
 GATES = {
+    "privacy": "Privacy review",
     "design": "ETL design",
     "vocab_map": "Code mappings",
 }
 # The same, for use inside a sentence.
 GATE_PHRASES = {
+    "privacy": "data that will be sent to Claude",
     "design": "ETL design",
     "vocab_map": "code mappings",
 }
@@ -69,6 +72,13 @@ def _snapshot_path(ws: Workspace, stage: str) -> Path:
     return ws.root / "approvals" / (f"{stage}.yaml" if stage == "design" else f"{stage}.json")
 
 
+def _privacy_payload(ws: Workspace) -> Any | None:
+    from .privacy_review import digest_payload, review_path
+
+    path = review_path(ws)
+    return digest_payload(json.loads(path.read_text())) if path.exists() else None
+
+
 def _check_stage(stage: str) -> None:
     if stage not in GATES:
         raise ValueError(f"unknown review gate '{stage}'; use one of: {', '.join(GATES)}")
@@ -103,6 +113,8 @@ def _mapping_rows(ws: Workspace) -> list[list[Any]] | None:
 
 def _payload(ws: Workspace, stage: str) -> Any | None:
     _check_stage(stage)
+    if stage == "privacy":
+        return _privacy_payload(ws)
     return _spec_payload(ws) if stage == "design" else _mapping_rows(ws)
 
 
@@ -158,10 +170,14 @@ def record_approval(
             text = ws.spec_yaml.read_text() if ws.spec_yaml.exists() else None
             payload = None if text is None else _spec_payload_of(text)
         else:
-            payload = _mapping_rows(ws)
-            text = None if payload is None else json.dumps(payload, indent=1) + "\n"
+            payload = _privacy_payload(ws) if stage == "privacy" else _mapping_rows(ws)
+            text = None if payload is None else json.dumps(payload, indent=1, sort_keys=True) + "\n"
         if payload is None or text is None:
-            what = "etl_spec.yaml" if stage == "design" else "mappings/decisions.json"
+            what = {
+                "privacy": "the privacy review (profile the source first)",
+                "design": "etl_spec.yaml",
+                "vocab_map": "mappings/decisions.json",
+            }[stage]
             raise FileNotFoundError(f"nothing to approve yet: {what} does not exist")
         digest = _digest(payload)
         if expected_digest is not None and expected_digest != digest:
@@ -214,4 +230,5 @@ def recorded_approver(ws: Workspace):
             return True
         return gate_state(ws, stage).current
 
+    approve.mode = "recorded"  # type: ignore[attr-defined]
     return approve

@@ -9,7 +9,7 @@ by Claude and checked by code. A human can review and edit every hand-off betwee
 flowchart LR
     SRC[(Source data<br/>CSV / database)] --> STAGE[Stage to Postgres<br/><i>text copy</i>]
     STAGE --> PROF[Profile<br/><i>White Rabbit</i>]
-    PROF --> ANN[Interpret profile<br/><b>Claude</b>]
+    PROF -->|privacy review| ANN[Interpret profile<br/><b>Claude</b>]
     ATH[Athena download] --> VLOAD[Load vocabulary]
     ANN --> DES[Design ETL<br/><i>Rabbit-in-a-Hat</i><br/><b>Claude</b> + validator]
     VLOAD --> DES
@@ -19,7 +19,8 @@ flowchart LR
     BUILD --> DQ[Quality checks<br/><i>DQD rules, Achilles-lite</i>]
     DQ -->|fail| REP[Repair agent<br/><b>Claude</b> + tools]
     REP --> BUILD
-    DQ -->|pass| CDM[(OMOP CDM)]
+    DQ -->|after repairs| RDQD[Official DQD + Achilles<br/><i>R, optional</i>]
+    RDQD -->|pass| CDM[(OMOP CDM)]
     CDM --> REPORT[Inspection report]
     CDM --> ATLAS[ATLAS / R analysis]
 ```
@@ -33,18 +34,25 @@ flowchart LR
 2. **Patient data never goes to the LLM.** Prompts contain aggregate metadata only: names,
    types, counts, coarsened ranges and frequent values. Values seen fewer than
    `min_cell_count` times, and every value of a detected direct identifier (names, phones,
-   IDs, GPS), are withheld by construction (`omop_agent/privacy.py`). The repair agent can
+   e-mail, ID numbers, addresses, GPS, free text), are withheld by construction
+   (`omop_agent/privacy.py`). Detection uses column-name rules (including common local ones
+   such as `nupi`, `ccc_no` and the WHO verbal-autopsy name fields) and value patterns; a
+   column Claude labels as an identifier or free text is withheld from then on. Before the
+   first call a reviewer approves the profile exactly as Claude will see it (the privacy
+   review, `privacy_review.py`). The repair agent can
    only count records through a tool that builds the query itself, withholds small groups and
    refuses identifiers. Database errors are redacted before they reach the model. Every prompt
    and tool result is stored verbatim in `work/llm_calls/` for audit.
-3. **Human in the loop at the right places.** The ETL spec (`etl_spec.yaml`) and the
-   vocabulary mappings (`mappings/*.csv`, Usagi-like columns) are plain files. `omop-agent
-   run` stops after each one unless `--yes` is passed. Edits are picked up on the next step.
+3. **Human in the loop at the right places.** What is sent to Claude, the ETL spec
+   (`etl_spec.yaml`) and the vocabulary mappings (`mappings/*.csv`, Usagi-like columns) are
+   each reviewed before the pipeline moves on, unless `--yes` is passed. Spec and mappings are
+   plain files; edits are picked up on the next step.
 4. **Deterministic replays.** Every LLM call has a `(stage, key)` name. With
    `llm.record_dir` a live run is recorded; with `provider: replay` it runs offline. The demo
    and the test-suite use hand-written replays.
 5. **Everything is audited.** `work/audit.jsonl` records stage transitions, LLM calls (with
-   token usage), human approvals, SQL errors and each repair made to the spec.
+   token usage), each review gate and its outcome, SQL errors and each repair made to the
+   spec.
 
 ## Stages and modules
 
@@ -52,6 +60,7 @@ flowchart LR
 |---|---|---|
 | Stage source | `profiling/loader.py` | `src.*` text tables, `staging_manifest.json` |
 | Profile | `profiling/profiler.py`, `profiling/render.py` | `profile.json`, `profile.md` |
+| Privacy review | `privacy.py`, `privacy_review.py` | `privacy_review.json`, `privacy_review.md` |
 | Interpret | `profiling/annotate.py` | `annotations.json` |
 | Load vocabulary | `vocab/loader.py` | vocabulary tables |
 | Design | `design/designer.py`, `design/validate.py`, `design/render.py` | `etl_spec.yaml`, `etl_spec.md` |
@@ -101,8 +110,12 @@ PostgreSQL. Names, thresholds and severities are read from DQD's own v5.4 metada
 source rows with rows kept after the person/visit joins for each table mapping. DQD checks the
 built-in engine doesn't implement are listed as not applicable, and so is each empty table, as a
 single summary row. The run passes when no check with a
-blocking severity (default `fatal`) fails and no ETL step errored. Otherwise the repair agent
-gets the failures and a set of tools:
+blocking severity (default `fatal`) fails, no check listed in `quality.blocking_checks` fails
+(by default `measurePersonCompleteness` on `observation_period`, because analyses in ATLAS
+need every person to have one) and no ETL step errored. A table mapping that keeps fewer than
+`quality.min_record_retention_pct` (default 50%) of its source rows fails the fatal
+`etlRecordLoss` check, so a build that silently drops most records cannot pass. Otherwise the
+repair agent gets the failures and a set of tools:
 
 * `get_table_mapping`, `get_cdm_table`, `get_source_profile`: read context;
 * `count_records`: counts only. The tool builds `SELECT g…, COUNT(*) AS n FROM <table>
@@ -112,22 +125,41 @@ gets the failures and a set of tools:
 * `update_field_mapping`, `replace_table_mapping`: change the spec. A change is applied only
   if it passes the SQL guard (`sqlguard.py`) and the PII and person-link rules, and the table
   still compiles and `EXPLAIN`s cleanly. An edit identical to the current mapping is a no-op.
+  The repair agent may not make a check pass by removing data: adding or changing a `WHERE`
+  filter, adding an inner join, changing the source table, blanking a field or removing a
+  field mapping is rejected, and the agent is told to leave such failures to a person.
 
-The ETL is rebuilt and re-checked, up to `quality.max_repair_iterations` times. An iteration
-that makes the result worse (an ETL error, or more failing checks) is rolled back to the last
-best spec. `etl_spec.before_repair.yaml` keeps the spec as it was before automatic repairs,
-and every change is recorded in `repairs.json` and the audit log.
+The ETL is rebuilt and re-checked, up to `quality.max_repair_iterations` times. Each build is
+scored: losing data (a CDM table keeping under 95% of the rows an earlier build loaded, or
+checks that applied before becoming not applicable) ranks below any number of failing checks,
+then ETL errors, then blocking and repairable failures. An iteration that makes the score worse
+is rolled back to the best spec, rebuilt, and its repairs are marked `reverted` in
+`repairs.json`. `etl_spec.before_repair.yaml` keeps the spec as it was before automatic
+repairs, and every change is recorded in `repairs.json` and the audit log.
 
-With `quality.use_r_dqd: true` and R available, the official Achilles and
-DataQualityDashboard packages also run through a generated R script. Their JSON results feed
-the same gate.
+With `quality.use_r_dqd: true` and R available (the `Dockerfile.r` image, or
+`deploy/r/install_r_dqd.sh`), the official Achilles and DataQualityDashboard packages run once,
+on the CDM the repair loop settled on, through a generated R script
+(`quality/r/run_achilles_dqd.R`). Their results replace the built-in ones for the checks DQD
+ran and feed the same gate; the report's engine reads `builtin+dqd`. If R is missing or fails,
+the run says so and falls back to the built-in checks, unless `quality.require_r_dqd` is set,
+in which case the run fails. Vocabulary coverage is measured again on the final build.
 
 ## Review gates, the web app and deployment
 
-The pipeline stops twice for people: after the ETL design and after code mapping. How a gate
-decides depends on how the pipeline is run:
+The pipeline stops three times for people:
 
-* `omop-agent run` asks at the terminal; `--yes` skips both gates (for demos and CI).
+* **privacy**: before the first call to Claude (only when `llm.provider` is `anthropic`). The
+  reviewer sees the withheld columns and the profile text exactly as it will be sent. The
+  digest covers that text and the privacy and LLM settings, so a new source extract or a
+  changed setting needs a new approval;
+* **design**: after the ETL design;
+* **vocab_map**: after code mapping.
+
+How a gate decides depends on how the pipeline is run:
+
+* `omop-agent run` asks at the terminal; `--yes` skips all gates (for demos and CI), and the
+  report then says the run was not fully reviewed.
 * `omop-agent run --recorded-approvals`, and every run started from the web app, continue only
   when a reviewer approved what the gate shows *as it is now*. `approvals.py` stores each
   approval in `work/approvals.json` with a sha256 digest. For the design, the digest covers the
@@ -135,6 +167,15 @@ decides depends on how the pipeline is run:
   term's target concept and status. A hand edit, a redraft, a repair, a changed mapping or a
   new source code changes the digest, and the run stops with status `waiting_review`. A copy of
   what was approved is kept under `work/approvals/`, so the web app can show what changed.
+
+A stopped run is continued by a plain run. What the stopped run was asked to redo (start over,
+redraft the design, map again) is kept in `work/pending_run.json` until that step has run, so
+stopping at the privacy review, which comes before that work, doesn't lose the request.
+
+Every gate writes a `review_gate` audit event (approved, skipped, stopped or not checked). The
+report's Reviews table is built from those events and the approvals, and a PASSED verdict
+carries a "Not fully reviewed" caveat when a gate was skipped, the repair agent changed the
+design after it was approved, or mappings nobody reviewed (`UNCHECKED`) were loaded.
 
 The web app (`omop_agent/web/`, FastAPI with server-rendered Jinja pages) is an interface to
 the same files the command line uses, not a separate system:
