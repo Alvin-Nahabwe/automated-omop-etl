@@ -121,6 +121,55 @@ its filter, so a filtered-out or dropped visit counts here, while a `visit_key` 
 mapping writes and keys of an older spec do not). The rest name a key that no visit mapping
 reads.
 
+**Observation periods.** With `observation_period: table_mapping` the mappings (or custom
+SQL) load one row per source episode (residency, enrolment, follow-up), with a NULL end for an
+episode that is still open; with `from_events` the build derives one period per person from
+their first to their last record. After the last writer of `observation_period`, and so after
+`death`, the `observation_period_merge` step replaces those rows by each person's periods, in
+one statement that returns its statistics (`TableLoadResult.stats`):
+
+* an episode is open when its end is NULL (loaded as `9999-12-31`) or a placeholder on or after
+  2099-01-01. It ends at the source release date, or at the person's death when that comes
+  first; an open episode that starts after the release date, or after the person's death, keeps
+  one day. Real exits are never clipped. Periods derived from the records (`from_events`) are
+  never open: the merge only renumbers them and derives the release date;
+* the release date is `cdm_source.source_release_date` when configured. Otherwise it is derived
+  from the data, without the build date: the k-th latest exit of the valid closed episodes,
+  k = max(5, n / 10,000), so a few mistyped future exits do not move it (with too few closed
+  episodes, the k-th latest start, then the earliest start). It is stored in
+  `etl.build_facts` (emptied at the start of every build) and written to
+  `cdm_source.source_release_date`;
+* episodes that end before they start are dropped and counted; the others merge where they
+  overlap or are back to back (DQD `measureObservationPeriodOverlap`: an end + 1 day = the next
+  start), keeping the type of the first episode. Periods are numbered from 1.
+
+The statistics are `episodes`, `inserted` (periods), `dropped_inverted`, `open_episodes`,
+`open_closed_at_death`, `open_starting_after_death`, `open_starting_after_release`,
+`exits_after_release`, `ending_from_release` (periods that end on the release date or later),
+`persons_overlapping` (true overlaps, not adjacency), `persons_stale_open` (an open episode
+followed by a later one), `persons`, `persons_without_period` (persons whose episodes were all
+dropped), `release_date`, `configured` and `closed_episodes`; the report's ETL table shows the
+episodes, periods, dropped and open episodes and the persons with overlapping or stale open
+episodes. With `table_mapping` the `observation_period_fill` step then
+gives every person without a period one from their first to their last record (not clipped), so
+clinic-only persons and persons with only invalid episodes are observed; it returns `inserted`
+and the `persons_without_period` before it. `etlObservationPeriodMerge` reports the episodes
+whose dates the merge could not use as written: those dropped, and those loaded as open because
+the mapping could not read their exit date (convention, 5%; a fatal `etlRecordLoss` copy when
+more than 100 - `min_record_retention_pct` percent are dropped), with the other statistics.
+`etlSourceReleaseDate` (convention, threshold 0, not repairable) fails while open episodes end on
+a derived date (set `cdm_source.source_release_date` to the extract date), or when episodes start
+(open) or end after a configured date (stale); it is fatal when the derived date is after the day
+of the build (placeholder or mistyped exit dates). When the build derived periods (the fill, or
+`from_events`), `measurePersonCompleteness.observation_period` counts persons without a valid
+episode and without a record: it still blocks, but is not sent to the repair agent. The repair
+agent may not change which episodes are open: an edit of the end date that opens episodes with
+real exit dates, or gives open ones their start date, is refused (the dry run, and the
+validator's end-date rules), and the build history counts the valid episodes the merge took (not
+the merged periods, which a fix of an episode's dates can join).
+`withinObservationPeriod` (characterization, 5%) counts the records of each event and era table
+whose start date lies in no period of their person.
+
 Concept lookups yield `0` when the source value exists but has no mapping. When the source
 value is NULL they yield NULL, or 0 if the CDM field is required. `varchar(n)` targets are
 truncated to `n` characters. The `cdm_source` row is generated from `cdm_source` in the config;
@@ -145,7 +194,7 @@ PostgreSQL neither merges them nor evaluates a value twice:
    |---|---|---|
    | a concept (`*_concept_id`) | 0 | `defaulted` |
    | `visit_end_date`, `visit_detail_end_date`, `drug_exposure_end_date` | the start date | `defaulted` |
-   | `observation_period_end_date` | left as written (the load fails, as before) | - |
+   | `observation_period_end_date` | `9999-12-31`: the episode is still open (the merge ends it) | - (the merge counts open episodes) |
    | any other: start and event dates, `year_of_birth`, `death_date`, `note_text`, ... | the row is dropped | `required_null` per field, `row.dropped` |
 
    This layer is left out when no required field is computed from the source.

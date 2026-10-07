@@ -219,15 +219,15 @@ _Not run: no mappings/decisions.json in the workspace._
 ## 7. ETL run
 
 {% if etl %}
-Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }} ({{ etl.duration|secs }}){% endif %}. {{ etl.steps|length }} steps, {{ etl.total_rows|num }} rows loaded, {{ etl.n_errors }} error(s).
+Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }} ({{ etl.duration|secs }}){% endif %}. {{ etl.steps|length }} steps, {{ etl.total_rows|num }} rows loaded{% if etl.derived_rows %} ({{ etl.derived_rows|num }} derived by the build: observation periods){% endif %}, {{ etl.n_errors }} error(s).
 
-| Step | Table | Rows inserted | Source rows | Retention | One row per key | Visit links | Time | Error |
+| Step | Table | Rows inserted | Source rows | Retention | Statistics | Visit links | Time | Error |
 |---|---|--:|--:|--:|---|---|--:|---|
 {% for s in etl.steps %}
-| {{ s.step|md }} | {{ s.table|md }} | {{ s.rows|num }} | {{ s.source_rows|num }} | {{ s.retention|pct }} | {{ s.one_row_per_key|md }} | {{ s.visit_links|md }} | {{ s.seconds|secs }} | {{ ('**ERROR** ' ~ s.error)|md if s.error else '' }} |
+| {{ s.step|md }} | {{ s.table|md }} | {{ s.rows|num }} | {{ s.source_rows|num }} | {{ s.retention|pct }} | {{ (s.one_row_per_key or s.periods)|md }} | {{ s.visit_links|md }} | {{ s.seconds|secs }} | {{ ('**ERROR** ' ~ s.error)|md if s.error else '' }} |
 {% endfor %}
 
-Retention: rows inserted per source row; for steps that keep one row per key, source rows kept (rows that lost to another row of their key are not lost). One row per key: source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays. Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.
+Retention: rows inserted per source row; for steps that keep one row per key, source rows kept (rows that lost to another row of their key are not lost). Statistics: for steps that keep one row per key, source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays; for the observation-period merge, the episodes loaded and the periods they became (episodes that end before they start are dropped; open episodes end at the source release date, configured or derived from the exit dates, or at death; overlapping and back-to-back episodes merge; the persons with overlapping episodes, or with an open episode followed by a later one, are counted for review), and the persons without a period that the fill gave one from their events. Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.
 {% else %}
 _Not run: no etl_run.json in the workspace._
 {% endif %}
@@ -360,6 +360,9 @@ _The CDM tables are empty._
 distribution withheld (fewer than {{ cdm.min_cell_count }} periods).
 {% else %}
 median {{ cdm.observation_period.median_days|num }} days (p10 {{ cdm.observation_period.p10_days|num }}, p90 {{ cdm.observation_period.p90_days|num }}).
+{% endif %}
+{% if cdm.observation_period.multi_period_persons %}
+Persons with more than one period: {{ cdm.observation_period.multi_period_persons|md }}. Source release date: {{ cdm.observation_period.release_date or 'none' }}{% if cdm.observation_period.release_basis %} ({{ cdm.observation_period.release_basis }}){% endif %}; periods ending on it: {{ cdm.observation_period.ending_at_release|md }}.
 {% endif %}
 {% endif %}
 {% for t in cdm.top_concepts %}

@@ -244,8 +244,11 @@ class ETLSpec(BaseModel):
     visit_key: KeySpec | None = None
     observation_period: Literal["from_events", "table_mapping"] = Field(
         "from_events",
-        description="'from_events' derives one period per person from min/max event dates; "
-        "'table_mapping' means a TableMapping for observation_period is provided.",
+        description="'from_events': one period per person from the first to the last event date. 'table_mapping': "
+        "mappings (or custom SQL) load one row per source episode (enrolment, residency, follow-up). Either way the "
+        "build merges each person's overlapping and back-to-back periods; with 'table_mapping' it ends open periods "
+        "(NULL end) at cdm_source.source_release_date or at death and gives persons without a valid episode a "
+        "period from their events.",
     )
     observation_period_type_concept_id: int = 32817
     route_by_domain: bool = Field(
@@ -502,8 +505,14 @@ class ETLRunResult(BaseModel):
 
     def rows_loaded(self) -> int:
         """Rows the steps without an error wrote to the CDM. The id-map and pruning steps write only
-        the id maps (new and retired keys) and are left out."""
-        return sum(s.rows_inserted for s in self.steps if s.error is None and s.kind not in ("id_map", "prune"))
+        the id maps (new and retired keys) and are left out, and so is the observation-period merge,
+        whose periods replace the episodes its table's writers loaded."""
+        return sum(s.rows_inserted for s in self.steps if s.error is None and s.kind not in ("id_map", "prune", "merge"))
+
+    def rows_derived(self) -> int:
+        """Of ``rows_loaded``, the rows the build derived from other CDM tables (observation periods
+        from events, the fill of persons without a period)."""
+        return sum(s.rows_inserted for s in self.steps if s.error is None and s.kind == "derived")
 
 
 class RepairAction(BaseModel):

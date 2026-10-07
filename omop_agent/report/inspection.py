@@ -630,6 +630,35 @@ def _link_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
     return ", ".join([text] + extra)
 
 
+def _period_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
+    """The observation-period merge and fill steps: episodes -> periods, dropped and open episodes,
+    the release date, and the persons whose episodes overlap or have an open episode followed by a
+    later one (merged: for review), e.g. '560 episodes -> 440 periods (40 dropped: end before start;
+    20 open, closed at 2023-12-31 (configured) or at death (3); persons with overlapping episodes:
+    12, with an open episode followed by a later one: 2)'; persons the fill gave a period from
+    their events."""
+    st = s.stats
+    if s.error:
+        return ""
+
+    def n(key: str) -> int:
+        return int(st.get(key) or 0)
+
+    if s.kind == "merge" and "episodes" in st:
+        how = "configured" if st.get("configured") else "derived"
+        closed = f", closed at {st['release_date']} ({how})" if st.get("release_date") else ""
+        if n("open_closed_at_death"):
+            closed += f" or at death ({count(n('open_closed_at_death'))})"
+        return (f"{count(n('episodes'))} episodes → {count(n('inserted'))} periods "
+                f"({count(n('dropped_inverted'))} dropped: end before start; {count(n('open_episodes'))} open{closed}; "
+                f"persons with overlapping episodes: {count(n('persons_overlapping'))}, with an open episode followed "
+                f"by a later one: {count(n('persons_stale_open'))})")
+    if s.kind == "derived" and st.get("persons_without_period") is not None:
+        return (f"{count(int(st.get('inserted') or 0))} of {count(int(st['persons_without_period']))} persons without "
+                "a period got one from their events")
+    return ""
+
+
 def _retention(s: TableLoadResult) -> float | None:
     """Rows inserted per source row; for a step that keeps one row per key, the source rows kept
     (``retained_rows``, the etlRecordRetention basis): rows that lost to another row of their key,
@@ -651,6 +680,7 @@ def _etl_section(run: ETLRunResult, min_cell_count: int = 5, shareable: bool = F
             "source_rows": s.source_rows,
             "retention": _retention(s) if s.error is None else None,
             "one_row_per_key": _key_stats(s, count),
+            "periods": _period_stats(s, count),
             "visit_links": _link_stats(s, count),
             "seconds": s.seconds,
             "error": _short(s.error, 600) if s.error else "",
@@ -663,7 +693,8 @@ def _etl_section(run: ETLRunResult, min_cell_count: int = 5, shareable: bool = F
         "finished_at": fmt_dt(run.finished_at),
         "duration": (end - start).total_seconds() if start and end else None,
         "steps": steps,
-        "total_rows": run.rows_loaded(),
+        "total_rows": run.rows_loaded(),  # the merge's periods replace rows already counted
+        "derived_rows": run.rows_derived(),
         "n_errors": len(run.errors()),
         "ok": run.ok,
     }
@@ -910,9 +941,22 @@ def _concept_label(concept_id: Any, name: Any) -> str:
     return "No matching concept" if concept_id == 0 else "(not in vocabulary)"
 
 
-def characterize_cdm(conn: psycopg.Connection, schemas: Schemas, min_cell_count: int = 5) -> dict[str, Any]:
+def _release_basis(run: ETLRunResult | None) -> str | None:
+    """How the build got the source release date: 'configured' or 'derived' (by the merge step)."""
+    merge = next((s for s in (run.steps if run else []) if s.kind == "merge" and not s.error), None)
+    if merge is None or not merge.stats.get("release_date"):
+        return None
+    return "configured" if merge.stats.get("configured") else "derived"
+
+
+def characterize_cdm(
+    conn: psycopg.Connection, schemas: Schemas, min_cell_count: int = 5, release_basis: str | None = None
+) -> dict[str, Any]:
     """Summarise the loaded CDM: record counts, demographics, observation time, top concepts.
 
+    Observation time includes the persons with more than one period and the periods that end on
+    cdm_source.source_release_date (open episodes the build ended there), with how the build got
+    that date (``release_basis``: 'configured' or 'derived', from the merge step; None: unknown).
     Every count in (0, min_cell_count) is returned as ``<min_cell_count`` with ``count=None``;
     distribution statistics over fewer than ``min_cell_count`` records are withheld.
     Queries that fail (e.g. a missing table) are listed in ``errors`` and skipped.
@@ -1018,6 +1062,24 @@ def characterize_cdm(conn: psycopg.Connection, schemas: Schemas, min_cell_count:
                 "p90_days": round(r["p90"]) if enough and r["p90"] is not None else None,
                 "suppressed": not enough,
             }
+            release = (f"(SELECT source_release_date FROM {cdm}.cdm_source LIMIT 1)" if counts.get("cdm_source")
+                       else "NULL::date")
+            rows = q(
+                "observation periods per person",
+                f"""SELECT (SELECT COUNT(*) FROM (SELECT person_id FROM {cdm}.observation_period GROUP BY person_id
+                                                  HAVING COUNT(*) > 1) m) AS multi,
+                           (SELECT COUNT(*) FROM {cdm}.observation_period
+                            WHERE observation_period_end_date = {release}) AS at_release,
+                           {release}::text AS release_date""",
+            )
+            if rows:
+                r = rows[0]
+                obs |= {
+                    "multi_period_persons": cell(r["multi"])["display"],
+                    "ending_at_release": cell(r["at_release"])["display"],
+                    "release_date": r["release_date"],
+                    "release_basis": release_basis,
+                }
 
     top = [
         {"table": t, "field": f, "rows": by_concept(f"top concepts in {t}", t, f, limit=10)}
@@ -1090,7 +1152,7 @@ def collect_report_data(
     cdm_note = "No database connection was given, so the loaded CDM was not characterised."
     if conn is not None:
         try:
-            cdm = characterize_cdm(conn, schemas, mcc)
+            cdm = characterize_cdm(conn, schemas, mcc, _release_basis(etl_run))
         except psycopg.Error as e:
             cdm_note = f"CDM characterisation failed: {short_error(e)}"
 

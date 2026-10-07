@@ -9,9 +9,10 @@ and counts every row it touched (``etl.compiler``, layer 2):
 * ``start``: an end date the CDM conventions allow to equal the start (``visit_end_date``,
   ``visit_detail_end_date``, ``drug_exposure_end_date``) takes the row's start date, counted as
   ``defaulted``;
-* ``open``: ``observation_period_end_date`` means "still observed". Until the build merges
-  observation periods and closes open ones at the data extract date, it is left as written, so
-  a NULL end fails the load as before;
+* ``open``: a NULL ``observation_period_end_date`` means "still observed" (a residency episode
+  without an exit). It is loaded as ``OPEN_END`` (9999-12-31), not counted here, and the build's
+  merge step ends it at the data extract date or at death (``etl.compiler``,
+  observation_period_merge), which counts the open episodes;
 * ``drop``: every other required field (start and event dates, ``year_of_birth``,
   ``death_date``, ``note_text``, ...): the row is dropped, counted per field as
   ``required_null`` and once per row as ``row.dropped``, so the record retention checks see it.
@@ -47,8 +48,15 @@ END_FROM_START: dict[tuple[str, str], str] = {
     ("visit_detail", "visit_detail_end_date"): "visit_detail_start_date",
     ("drug_exposure", "drug_exposure_end_date"): "drug_exposure_start_date",
 }
-# NULL means the person is still observed
-OPEN_ENDS = frozenset({("observation_period", "observation_period_end_date")})
+# NULL means the person is still observed (end date -> the start date of the same episode)
+OPEN_ENDS: dict[tuple[str, str], str] = {
+    ("observation_period", "observation_period_end_date"): "observation_period_start_date",
+}
+# What an open end is loaded as, and the dates from which an end counts as open in the merge (NULL
+# ends loaded as OPEN_END, and placeholder exits such as 9999-12-31 or 2999-01-01 in the source):
+# no real exit date lies that far ahead.
+OPEN_END = "DATE '9999-12-31'"
+OPEN_FROM = "DATE '2099-01-01'"
 # The field kinds the policies apply to. The others cannot be NULL (id maps, auto_id), already
 # give a required concept 0 (vocab_code, concept_map), or are refused by the validator (null).
 POLICY_KINDS = frozenset({"column", "expression", "constant"})

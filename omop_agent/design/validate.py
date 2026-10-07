@@ -22,6 +22,13 @@ column); so is a strftime template ('%d/%m/%Y'). A to_date template that differs
 profiled format, and a mapped days_supply that the drug_exposure_end_date does not use, are
 warnings.
 
+Observation periods: 'from_events' together with a mapping or custom SQL into observation_period
+is an error (use 'table_mapping': persons without an episode get a period from their events). An
+observation_period mapping that reads another table in a subquery (merging or filtering episodes,
+which the build does), or whose end date has a fallback (the build date, the start date, a date
+literal, a constant: an open episode must stay NULL so that the build ends it at the release date
+or at death), gets a warning.
+
 Keys can come from several sources: every person and visit_occurrence mapping adds the keys of
 its rows to the id map (``compiler.key_sources``). Keys written in another form than the
 person_key / visit_key over the key table, unprefixed keys from another table, and records whose
@@ -63,6 +70,7 @@ from ..etl.compiler import (
     key_sources,
     source_ref,
 )
+from ..etl.policies import OPEN_ENDS
 from ..etl.session import apply_session
 from ..etl.tolerant import DATE_KINDS, LexError, lex, rewrite, without_conversions
 from ..models import CustomSQL, ETLSpec, KeySpec, SourceProfile, TableMapping
@@ -434,6 +442,96 @@ def _days_supply_issue(tm: TableMapping) -> str | None:
     return None
 
 
+# The build date: never an observation period end (an open episode ends at the release date).
+_BUILD_DATE = re.compile(
+    r"\b(current_date|current_timestamp|localtimestamp|now|transaction_timestamp|statement_timestamp|"
+    r"clock_timestamp)\b", re.I)
+_DATE_LITERAL = re.compile(r"'\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4}|\d{8})\s*'")
+_OPEN_END = ("leave the end NULL when the episode is still open: the build ends open episodes at "
+             "cdm_source.source_release_date or at death, and merges, drops or fills periods itself")
+_CASE_WORD = re.compile(r"\b(case|when|then|else|end)\b", re.I)
+_LITERAL = re.compile(r"'(?:[^']|'')*'")
+_NULL_RESULT = re.compile(r"\s*\(*\s*null\s*\)*\s*(::\s*date\s*)?[\s,)]*", re.I)
+
+
+def _case_parts(expr: str) -> tuple[list[str], list[str], bool] | None:
+    """The WHEN conditions and the THEN / ELSE results of the CASE expressions in ``expr`` (nested
+    ones included), and whether one of them can give NULL (a NULL result, or no ELSE); None
+    without a CASE. Keywords inside string literals are not read."""
+    literals: list[str] = []
+
+    def keep(m: re.Match) -> str:
+        literals.append(m.group(0))
+        return f"\x00{len(literals) - 1}\x00"
+
+    def restore(s: str) -> str:
+        return re.sub("\x00(\\d+)\x00", lambda m: literals[int(m.group(1))], s)
+
+    parts = _CASE_WORD.split(_LITERAL.sub(keep, expr))
+    words = [w.lower() for w in parts[1::2]]
+    if "case" not in words:
+        return None
+    conditions = [restore(s) for w, s in zip(words, parts[2::2]) if w == "when"]
+    results = [restore(s) for w, s in zip(words, parts[2::2]) if w in ("then", "else")]
+    nullable = words.count("else") < words.count("case") or any(_NULL_RESULT.fullmatch(r) for r in results)
+    return conditions, results, nullable
+
+
+def observation_period_end_issue(tm: TableMapping) -> str | None:
+    """Why the observation_period_end_date of ``tm`` closes episodes the source leaves open, or opens
+    episodes it closes (None: it does neither): a constant, the build date, a fallback onto the start
+    date (COALESCE, GREATEST, or a CASE result), a placeholder date literal as a COALESCE or CASE
+    result, or a CASE that makes the end NULL depending on the start (episodes that end before they
+    start become open). A NULL constant, and a CASE or NULLIF that turns a placeholder into NULL,
+    are fine. The validator warns about it; the repair agent may not write it."""
+    by = {fm.target_field: fm for fm in tm.fields}
+    end, start = by.get("observation_period_end_date"), by.get("observation_period_start_date")
+    if end is None or end.kind not in ("column", "expression", "constant") or not (end.expression or "").strip():
+        return None
+    expr = end.expression or ""
+    text = strip_literals(expr).lower()
+    starts = set(alias_refs(start.expression)) if start is not None and start.kind in ("column", "expression") else set()
+    case = _case_parts(expr)
+    conditions, results, nullable = case if case is not None else ([], [], False)
+    in_results = set().union(*(alias_refs(r) for r in results)) if results else set()
+    in_conditions = set().union(*(alias_refs(c) for c in conditions)) if conditions else set()
+    reason = None
+    if end.kind == "constant" and text.strip().split("::")[0].strip() != "null":
+        reason = "a constant end date ends every episode on the same day"
+    elif _BUILD_DATE.search(text):
+        reason = "the build date as the end of open episodes changes with every build and is later than the data"
+    elif starts & (in_results | (set(alias_refs(expr)) if re.search(r"\b(coalesce|greatest)\b", text) else set())):
+        reason = "an end that falls back to the start date makes an open episode one day long"
+    elif nullable and starts & in_conditions:
+        return ("an end made NULL depending on the start date turns episodes that end before they start into open "
+                "ones that run to cdm_source.source_release_date; keep the exit date as the source has it (the build "
+                "drops such episodes and counts them in etlObservationPeriodMerge) and leave the end NULL only when "
+                "the episode is still open")
+    elif any(_DATE_LITERAL.search(r) for r in results) or (re.search(r"\bcoalesce\b", text)
+                                                           and _DATE_LITERAL.search(expr)):
+        reason = "a placeholder date as the end of open episodes"
+    return f"{reason}; {_OPEN_END}" if reason else None
+
+
+def _observation_period_issues(tm: TableMapping, aliases: dict[str, str]) -> list[tuple[str | None, str]]:
+    """Warnings for an observation_period mapping that does the build's work itself: an expression
+    that reads another table (a correlated subquery that merges or filters episodes; slow, and the
+    build merges them), and an end date that closes open episodes or opens closed ones
+    (``observation_period_end_issue``)."""
+    out: list[tuple[str | None, str]] = []
+    for field, what, expr in _fragments(tm):
+        tables = [t for t, _ in _inner_tables(expr)
+                  if not ("{" not in t and "." in t and t.split(".")[0].lower() in aliases)]  # not a column
+        if tables:
+            out.append((field, f"the {what} reads {', '.join(tables)} in a subquery: map one row per episode and "
+                        "let the build merge each person's overlapping and back-to-back episodes (a correlated "
+                        "subquery runs once per row)"))
+    issue = observation_period_end_issue(tm)
+    if issue:
+        out.append(("observation_period_end_date", issue))
+    return out
+
+
 def _static_mapping(
     tm: TableMapping, spec: ETLSpec, cat: _SourceCatalog, privacy: PrivacyConfig | None = None
 ) -> list[SpecIssue]:
@@ -475,6 +573,9 @@ def _static_mapping(
             else:
                 hint = " (use kind auto_id for a surrogate key)" if f.is_pk else ""
             err(f"required field is not mapped{hint}", f.name)
+        elif fm.kind == "null" and (tt, f.name) in OPEN_ENDS:
+            err("required field is mapped to NULL: when every episode is still open, use kind constant with "
+                "expression NULL::date (the build ends open episodes at the release date or at death)", f.name)
         elif fm.kind == "null":
             err("required field is mapped to NULL", f.name)
 
@@ -612,6 +713,9 @@ def _static_mapping(
     days = _days_supply_issue(tm)
     if days:
         warn(days, "drug_exposure_end_date")
+    if tt == "observation_period":
+        for field, msg in _observation_period_issues(tm, aliases):
+            warn(msg, field)
     return issues
 
 
@@ -650,10 +754,10 @@ def _static_spec(spec: ETLSpec, cat: _SourceCatalog) -> list[SpecIssue]:
     if spec.observation_period == "from_events" and has_op_mapping:
         issues.append(
             SpecIssue(
-                severity="warning",
+                severity="error",
                 target_table="observation_period",
-                message="observation_period is 'from_events' but a mapping also loads observation_period; "
-                "both will insert periods",
+                message="observation_period is 'from_events' but a mapping also loads observation_period: use "
+                "'table_mapping'; persons without an episode get a period from their events automatically",
             )
         )
     issues += _key_source_issues(spec)

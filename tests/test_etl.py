@@ -79,12 +79,15 @@ def test_step_order_and_targets():
         "09_measurement",
         "10_death",
         "11_observation_period",
-        "12_cdm_source",
+        "12_observation_period_merge",
+        "13_observation_period_fill",
+        "14_cdm_source",
     ]
     assert [s.kind for s in steps] == ["id_map", "id_map", "insert", "prune", "insert", "prune"] + ["insert"] * 5 + [
-        "metadata"
+        "merge", "derived", "metadata"
     ]
-    assert [s.requires for s in steps if s.requires] == []  # pruning runs after a failed load too
+    # pruning, the merge and the fill run after a failed load too
+    assert [s.requires for s in steps if s.requires] == []
     # sort keys: (load index of the table, band, sequence); id maps first, cdm_source last
     assert [s.slot for s in steps] == sorted(s.slot for s in steps)
     assert steps[0].slot[0] == steps[1].slot[0] == -1 and steps[-1].slot[0] > len(LOAD_ORDER) - 1
@@ -95,7 +98,8 @@ def test_step_order_and_targets():
     # the visit pruning); the spec kinds. The inserts count the required values they complete or
     # drop (per field, and the dropped rows), the generated steps count nothing
     assert all(s.blocking for s in steps)
-    assert [s.label for s in steps if s.returns != "rowcount"] == ["person", "visit_occurrence", "death"]
+    assert [s.label for s in steps if s.returns != "rowcount"] == [
+        "person", "visit_occurrence", "death", "observation_period_merge", "observation_period_fill"]
     assert {s.returns for s in steps if s.label in ("person", "visit_occurrence", "death")} == {"row"}
     assert all(s.count_sites == () for s in steps if s.kind != "insert")
     # and the tolerant conversions count the values they cannot read, per field
@@ -103,7 +107,8 @@ def test_step_order_and_targets():
         "visit_concept_id", "visit_start_date", "visit_start_datetime", "visit_end_date", "visit_type_concept_id", "row")
     assert step(steps, "death").count_sites == ("death_date", "row")
     assert all("\n".join(s.statements) == s.sql for s in steps)
-    assert [s.label for s in steps if len(s.statements) > 1] == ["person_map", "visit_map", "visit_map_prune"]
+    assert [s.label for s in steps if len(s.statements) > 1] == [
+        "person_map", "visit_map", "visit_map_prune", "observation_period_merge"]
     assert {s.kind for s in steps if s.kind in SPEC_KINDS} == {"id_map", "insert"}
     assert target_tables(spec) == [
         "person", "visit_occurrence", "condition_occurrence", "drug_exposure",
@@ -332,7 +337,8 @@ def test_where_joins_and_custom_sql():
     names = [s.name for s in steps]
     assert names.index("09_custom_drop_orphans") == names.index("08_drug_exposure") + 1
     # custom SQL of a table without a mapping runs at that table's place in the load order
-    assert names[-4:] == ["11_death", "12_custom_note", "13_observation_period", "14_cdm_source"]
+    assert names[-6:] == ["11_death", "12_custom_note", "13_observation_period", "14_observation_period_merge",
+                          "15_observation_period_fill", "16_cdm_source"]
     de = step(steps, "drug_exposure")
     # the joins and the filter apply to the source rows (layer 1), before the id-map joins' rows
     # are counted and before the required-field policies
@@ -381,15 +387,15 @@ def test_custom_sql_runs_at_its_tables_load_order_slot():
     assert labels == [
         "person_map", "visit_map", "custom_sites", "person", "person_map_prune", "visit_occurrence",
         "visit_map_prune", "condition_occurrence", "drug_exposure", "measurement", "death", "custom_va_deaths",
-        "custom_specimens", "custom_more_specimens", "observation_period", "custom_dates", "custom_eras",
-        "custom_other", "cdm_source",
+        "custom_specimens", "custom_more_specimens", "observation_period", "custom_dates",
+        "observation_period_merge", "observation_period_fill", "custom_eras", "custom_other", "cdm_source",
     ]
-    # a derived observation period follows every spec writer of observation_period
+    # a derived observation period follows every spec writer of observation_period, the merge follows it
     spec = spec.model_copy(update={"observation_period": "from_events"})
     spec.table_mappings = [tm for tm in spec.table_mappings if tm.target_table != "observation_period"]
     labels = [s.label for s in compile_spec(spec, S)]
     assert labels[labels.index("custom_specimens"):labels.index("custom_eras")] == [
-        "custom_specimens", "custom_more_specimens", "custom_dates", "observation_period"]
+        "custom_specimens", "custom_more_specimens", "custom_dates", "observation_period", "observation_period_merge"]
     assert step_label("05_person_2") == "person_2" and step_label("person") == "person"
 
 
@@ -441,7 +447,9 @@ def test_from_events_and_cdm_source_steps():
     assert cs.name.endswith("_cdm_source") and cs.kind == "metadata"
     assert "vocabulary_id = 'CDM' AND concept_code IN ('CDM v5.4.0', 'CDM v5.4')" in cs.sql
     assert "WHERE vocabulary_id = 'None'), 'unknown')" in cs.sql
-    assert "    'omop-agent',\n    CURRENT_DATE,\n    CURRENT_DATE," in cs.sql
+    # the release date the merge derived (in build_facts), else the build date
+    assert ("    'omop-agent',\n    COALESCE((SELECT MAX(value::date) FROM etl.build_facts"
+            " WHERE name = 'source_release_date'), CURRENT_DATE),\n    CURRENT_DATE,") in cs.sql
     # a configured extract date is the source release date
     from datetime import date
 
@@ -510,11 +518,18 @@ def test_compiled_insert_shape():
     assert ("    WHERE CASE WHEN v.note_date IS NOT NULL AND v.note_text IS NOT NULL THEN true\n"
             "               ELSE {etl}.omop_drop(ARRAY['note_date', 'note_text'],"
             " ARRAY[v.note_date IS NULL, v.note_text IS NULL]) END\n") in c.insert
-    # the observation period end ('open') is left as written until periods are merged
+    # the observation period end ('open') is loaded as 9999-12-31 when NULL, uncounted: the merge
+    # counts the open episodes and ends them; its counter site is the conversion's (invalid dates)
     op = _compile(spec.mapping_for("observation_period"), spec)
-    assert "observation_period_end_date" not in op.required and op.count_sites == (
+    assert op.required["observation_period_end_date"] == "open" and op.count_sites == (
         "observation_period_start_date", "observation_period_end_date", "period_type_concept_id", "row")
-    assert "        v.observation_period_end_date,\n" in op.insert
+    assert ("        COALESCE(v.observation_period_end_date, DATE '9999-12-31') AS observation_period_end_date,"
+            "  -- NULL = still open (ended by the observation_period_merge step)\n") in op.insert
+    constant_end = set_field(spec, "observation_period", "observation_period_end_date", kind="constant",
+                             expression="NULL::date")
+    op = _compile(constant_end.mapping_for("observation_period"), constant_end)
+    assert op.count_sites == ("observation_period_start_date", "period_type_concept_id", "row")
+    assert "COALESCE(v.observation_period_end_date, DATE '9999-12-31') AS observation_period_end_date" in op.insert
 
     # no required field computed from the source: no layer 2
     loc = TableMapping(target_table="location", source={"table": "clinic_visits", "alias": "v"}, fields=[
@@ -628,7 +643,7 @@ def test_run_reference_spec(staged):
     no_discharge = int(scalar(conn, f"SELECT COUNT(*) FROM {src}.clinic_visits WHERE discharge_date IS NULL"))
     assert 0 < no_discharge < visits
     assert count(conn, schemas, "person") == 400 and count(conn, schemas, "visit_occurrence") == visits
-    by_table = {s.target_table: s for s in result.steps}
+    by_table = {s.target_table: s for s in result.steps if s.kind not in ("merge", "derived")}
     vo = by_table["visit_occurrence"]
     assert vo.value_counts == {"defaulted": {"visit_end_date": no_discharge}}
     assert (vo.source_rows, vo.id_retained_rows, vo.retained_rows, vo.rows_inserted) == (visits,) * 4
@@ -651,6 +666,20 @@ def test_run_reference_spec(staged):
     assert by_table["person_map_prune"].rows_inserted == 0 and by_table["person_map_prune"].error is None
     assert by_table["visit_map_prune"].rows_inserted == 0
     assert count(conn, schemas, "cdm_source") == 1
+    # one closed residency episode per person: the merge only renumbers them, the fill finds nobody
+    # without a period, and the release date is derived from the exit dates (the demo's END)
+    merge = next(s for s in result.steps if s.kind == "merge")
+    assert merge.error is None and merge.source_rows is None and merge.value_counts == {}
+    assert {k: merge.stats[k] for k in ("inserted", "episodes", "dropped_inverted", "open_episodes",
+                                        "persons_overlapping", "persons_without_period", "release_date",
+                                        "configured", "fact_rows")} == {
+        "inserted": by_table["observation_period"].rows_inserted, "episodes": by_table["observation_period"].rows_inserted,
+        "dropped_inverted": 0, "open_episodes": 0, "persons_overlapping": 0, "persons_without_period": 0,
+        "release_date": "2023-12-31", "configured": False, "fact_rows": 1}
+    assert merge.rows_inserted == merge.stats["inserted"]
+    fill = next(s for s in result.steps if s.step.endswith("_observation_period_fill"))
+    assert fill.error is None and fill.rows_inserted == 0
+    assert scalar(conn, f"SELECT source_release_date FROM {schemas.cdm}.cdm_source") == date(2023, 12, 31)
     audit = [e for e in ws.read_audit() if e["event"] == "etl_step" and e["step"] == vo.step]
     assert audit[0]["value_counts"] == vo.value_counts and audit[0]["retained_rows"] == visits
     assert [e["retained_rows"] for e in ws.read_audit() if e.get("step") == "09_measurement"] == [m.retained_rows]

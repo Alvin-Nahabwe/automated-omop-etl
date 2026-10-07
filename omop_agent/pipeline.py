@@ -374,7 +374,10 @@ class Pipeline:
 
         def run() -> ETLRunResult:
             result = run_etl(self.conn, self.schemas, spec or self.validated_spec(), self.cfg, self.ws)
-            self.log(f"  {len(result.steps)} steps, {result.rows_loaded()} rows loaded, {len(result.errors())} errors")
+            derived = result.rows_derived()
+            self.log(f"  {len(result.steps)} steps, {result.rows_loaded()} rows loaded"
+                     + (f" ({derived} derived by the build: observation periods)" if derived else "")
+                     + f", {len(result.errors())} errors")
             for s in result.errors():
                 self.log(f"  ✗ {s.step}: {s.error}")
             return result
@@ -608,14 +611,28 @@ class _BuildHistory:
 
     @staticmethod
     def _rows(etl: ETLRunResult) -> dict[str, int]:
-        """Rows loaded per CDM table (the id-map and pruning steps write no CDM table and are left out)."""
+        """Rows loaded per CDM table (the id-map and pruning steps write no CDM table and are left out).
+        When its periods were merged, observation_period counts the valid episodes the merge took
+        (episodes, or event periods, less those dropped because they end before they start) plus the
+        fill's periods. Not the merged periods: a repair that fixes an episode's dates can join two
+        periods into one, and must not count as a loss; this number grows whenever more episodes are
+        valid (a person the fill covered who now has a valid episode adds at least as many)."""
         from .cdm.spec import load_cdm_spec
+        from .etl.compiler import step_label
 
         cdm = load_cdm_spec()
         out: dict[str, int] = {}
+        merge = next((s for s in etl.steps if s.kind == "merge" and not s.error and "episodes" in s.stats), None)
         for s in etl.steps:
-            if not s.error and s.target_table and cdm.has_table(s.target_table):
-                out[s.target_table] = out.get(s.target_table, 0) + int(s.rows_inserted or 0)
+            if s.error or not s.target_table or not cdm.has_table(s.target_table):
+                continue
+            n = int(s.rows_inserted or 0)
+            if merge is not None and s.target_table == "observation_period":
+                if s is merge:
+                    n = int(s.stats.get("episodes") or 0) - int(s.stats.get("dropped_inverted") or 0)
+                elif step_label(s.step) != "observation_period_fill":
+                    continue  # the episodes (or event periods) the merge took, counted above
+            out[s.target_table] = out.get(s.target_table, 0) + n
         return out
 
     @staticmethod

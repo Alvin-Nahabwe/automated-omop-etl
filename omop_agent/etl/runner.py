@@ -27,7 +27,9 @@ that role (``SET LOCAL ROLE``), which needs USAGE and SELECT on the staging and 
 schemas, SELECT/INSERT/DELETE on the CDM and ETL schemas (DELETE for retiring and restoring
 id-map keys, and for custom SQL), and membership of the connecting user. ETL tables the build
 creates (such as those a new version adds) are granted to the role. The CDM tables are emptied
-before the steps run, and ANALYZEd, as the connecting user.
+before the steps run, and ANALYZEd, as the connecting user; the facts an earlier build derived
+(``{etl}.build_facts``: the release date the observation-period merge stores for cdm_source) are
+deleted in the same transaction.
 """
 
 from __future__ import annotations
@@ -312,6 +314,8 @@ def run_etl(
     create_etl_tables(conn, schemas, cfg.target.etl_role)
     tables = sorted(set(target_tables(spec)) | _previous_tables(ws))
     truncate_cdm_tables(conn, schemas, tables)
+    # what an earlier build derived (the release date) goes with the rows it was derived from
+    execute(conn, f"DELETE FROM {qi(schemas.etl)}.build_facts")
     conn.commit()
 
     steps = compile_spec(spec, schemas, cfg.cdm_source, etl=cfg.etl, strict=False)

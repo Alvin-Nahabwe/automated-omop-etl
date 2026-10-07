@@ -325,19 +325,20 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
   <div class="stats">
     <div class="stat"><div class="v">{{ etl.steps|length }}</div><div class="k">steps</div></div>
     <div class="stat"><div class="v">{{ etl.total_rows|num }}</div><div class="k">rows loaded</div></div>
+    {% if etl.derived_rows %}<div class="stat"><div class="v">{{ etl.derived_rows|num }}</div><div class="k">derived by the build (observation periods)</div></div>{% endif %}
     <div class="stat"><div class="v">{{ etl.n_errors }}</div><div class="k">errors</div></div>
     <div class="stat"><div class="v">{{ etl.duration|secs }}</div><div class="k">duration</div></div>
   </div>
   <p class="muted">Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }}{% endif %}.</p>
   <div class="tw"><table>
-    <thead><tr><th>Step</th><th>Table</th><th class="n">Rows inserted</th><th class="n">Source rows</th><th class="n">Retention</th><th>One row per key</th><th>Visit links</th><th class="n">Time</th><th>Error</th></tr></thead>
+    <thead><tr><th>Step</th><th>Table</th><th class="n">Rows inserted</th><th class="n">Source rows</th><th class="n">Retention</th><th>Statistics</th><th>Visit links</th><th class="n">Time</th><th>Error</th></tr></thead>
     <tbody>
     {% for s in etl.steps %}
-      <tr{% if s.error %} class="blocking"{% endif %}><td>{{ s.step }}</td><td>{{ s.table }}</td><td class="n">{{ s.rows|num }}</td><td class="n">{{ s.source_rows|num }}</td><td class="n">{{ s.retention|pct }}</td><td class="wrap">{{ s.one_row_per_key }}</td><td class="wrap">{{ s.visit_links }}</td><td class="n">{{ s.seconds|secs }}</td><td class="err">{% if s.error %}{{ badge('error', 'fail') }} {{ s.error }}{% endif %}</td></tr>
+      <tr{% if s.error %} class="blocking"{% endif %}><td>{{ s.step }}</td><td>{{ s.table }}</td><td class="n">{{ s.rows|num }}</td><td class="n">{{ s.source_rows|num }}</td><td class="n">{{ s.retention|pct }}</td><td class="wrap">{{ s.one_row_per_key or s.periods }}</td><td class="wrap">{{ s.visit_links }}</td><td class="n">{{ s.seconds|secs }}</td><td class="err">{% if s.error %}{{ badge('error', 'fail') }} {{ s.error }}{% endif %}</td></tr>
     {% endfor %}
     </tbody>
   </table></div>
-  <p class="muted">Retention: rows inserted per source row; for steps that keep one row per key, source rows kept (rows that lost to another row of their key are not lost). One row per key: source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays. Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.</p>
+  <p class="muted">Retention: rows inserted per source row; for steps that keep one row per key, source rows kept (rows that lost to another row of their key are not lost). Statistics: for steps that keep one row per key, source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays; for the observation-period merge, the episodes loaded and the periods they became (episodes that end before they start are dropped; open episodes end at the source release date, configured or derived from the exit dates, or at death; overlapping and back-to-back episodes merge; the persons with overlapping episodes, or with an open episode followed by a later one, are counted for review), and the persons without a period that the fill gave one from their events. Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.</p>
   {% else %}{{ empty('Not run: no etl_run.json in the workspace.') }}{% endif %}
 </section>
 
@@ -460,6 +461,9 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     <div class="stat"><div class="v">{{ op.p90_days|num }} d</div><div class="k">90th percentile</div></div>
     {% endif %}
   </div>
+  {% if op.multi_period_persons %}
+  <p class="muted">Persons with more than one period: {{ op.multi_period_persons }} · source release date {{ op.release_date or 'none' }}{% if op.release_basis %} ({{ op.release_basis }}){% endif %} · periods ending on it: {{ op.ending_at_release }}</p>
+  {% endif %}
   {% endif %}
   {% for t in cdm.top_concepts %}
   <h3>Top concepts: {{ t.table }} <span class="muted">({{ t.field }})</span></h3>

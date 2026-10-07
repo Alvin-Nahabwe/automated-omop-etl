@@ -182,6 +182,9 @@ cdm_source:
   cdm_source_abbreviation: {q(name[:25])}
   cdm_holder: ""
   source_description: ""
+  # The date of the data extract: observation periods still open (no exit date) end on it.
+  # Unset, the build derives it from the exit dates and reports it (etlSourceReleaseDate).
+  # source_release_date: 2024-06-30
 """
     )
     load_config(path)  # fail now, not on the first command, if the file is not valid

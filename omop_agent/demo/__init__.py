@@ -79,6 +79,7 @@ cdm_source:
   cdm_source_abbreviation: DEMO
   cdm_holder: omop-agent
   source_description: Synthetic HDSS registry linked to clinic records (no real people).
+  source_release_date: 2023-12-31   # the end of the synthetic data: open residency episodes end on it
 """
     )
     return cfg

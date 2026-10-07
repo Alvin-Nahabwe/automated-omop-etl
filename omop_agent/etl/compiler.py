@@ -18,7 +18,8 @@ the planner neither merges them nor evaluates a value twice:
    read (``invalid``, ``imputed``, ``partial_null``, offsets) at the field's site, the WHERE at
    site ``where``;
 2. the required-field policies (``etl.policies``): a NULL required concept becomes 0, a NULL
-   visit / visit_detail / drug_exposure end date the start date, and a row with another NULL
+   visit / visit_detail / drug_exposure end date the start date, a NULL observation_period end
+   date is open (9999-12-31, ended by the merge, see below), and a row with another NULL
    required value is dropped; each counted per field in transaction-local settings that the
    runner reads into ``value_counts`` (``CompiledStep.count_sites``);
 3. the vocabulary lookups, ``auto_id`` and NULL fields, in the outer SELECT, so a code with several
@@ -40,7 +41,15 @@ table by table in CDM load order (``cdm.spec.LOAD_ORDER``), the table's writers 
 mappings in spec order, then its custom SQL; custom SQL of a table without a mapping runs at
 that table's place too, not after everything) and the steps generated for it (band 1); the
 derived observation period follows every spec writer of observation_period, and the
-``cdm_source`` row comes last. After the person (and visit_occurrence) writers an id-map pruning
+``cdm_source`` row comes last. After the last writer of observation_period (and so after death)
+the ``observation_period_merge`` step replaces the loaded periods (residency episodes, or the
+periods derived from events) by each person's merged periods: open episodes end at the source
+release date (``cdm_source.source_release_date``, or one derived robustly from the exit dates and
+stored in ``{etl}.build_facts`` for the cdm_source row) or at death, real exits are never clipped,
+episodes that end before they start are dropped, and overlapping or back-to-back episodes become
+one period (periods derived from the events are never open). With ``observation_period: table_mapping`` the ``observation_period_fill`` step then
+gives every person without a period one from their first to their last event. After the person
+(and visit_occurrence) writers an id-map pruning
 step retires the keys that did not become a row, so events of people or visits that a mapping
 filtered out are dropped (or get a NULL visit) instead of pointing at rows that do not exist.
 The id maps are never truncated, and ids are never reused or lost: they are kept across runs so
@@ -56,6 +65,7 @@ a trailing comment.
 from __future__ import annotations
 
 import re
+import textwrap
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -65,6 +75,9 @@ from ..db import Schemas, qi, ql
 from ..models import CustomSQL, ETLSpec, FieldMapping, KeySpec, TableMapping
 from .policies import (
     END_FROM_START,
+    OPEN_END,
+    OPEN_ENDS,
+    OPEN_FROM,
     POLICY_KINDS,
     ROW_SITE,
     WHERE_SITE,
@@ -508,8 +521,8 @@ def _select_list(items: list[tuple[str, str]]) -> list[str]:
 
 def _required_policies(table: CdmTable, values: list[tuple[CdmField, FieldMapping, str]]) -> dict[str, Policy]:
     """The NULL policy (``etl.policies``) applied to each required field whose value layer 1 computes
-    from the source. 'open' (observation_period_end_date) is left as written until the build merges
-    observation periods, so a NULL end still fails that load."""
+    from the source. 'open' (observation_period_end_date) loads a NULL end as ``OPEN_END``, which
+    the observation_period_merge step ends at the release date or at death."""
     in_layer_1 = {f.name for f, fm, _ in values if fm.kind in _LAYER_1_KINDS}
     out: dict[str, Policy] = {}
     for f, fm, _ in values:
@@ -518,7 +531,7 @@ def _required_policies(table: CdmTable, values: list[tuple[CdmField, FieldMappin
         policy = required_null_policy(table.name, f.name)
         if policy == "start" and END_FROM_START[(table.name, f.name)] not in in_layer_1:
             policy = "drop"  # no start date to take
-        if policy in ("zero", "start", "drop"):
+        if policy is not None:
             out[f.name] = policy
     return out
 
@@ -565,6 +578,9 @@ def _required_values(
             derived = "omop_derived_ts" if _is_datetime(f) else "omop_derived_date"
             items.append((f"COALESCE({col(name)}, {{etl}}.{derived}({ql(name)}, {col(start)})) AS {qi(name)}",
                           f"NULL -> {start} (counted)"))
+        elif policy == "open":  # the merge counts the open episodes and ends them
+            items.append((f"COALESCE({col(name)}, {OPEN_END}) AS {qi(name)}",
+                          "NULL = still open (ended by the observation_period_merge step)"))
         else:
             items.append((col(name), "NULL: the row is dropped (counted)" if policy == "drop" else ""))
     items += [(f"{_VALUES}.{k}", "") for k, _ in joins.key_exprs]
@@ -636,7 +652,8 @@ def _compile(tm: TableMapping, spec: ETLSpec, etl: EtlConfig | None = None) -> _
         out += [")", *select]
     # the counter sites in field order (required-field policies, tolerant conversions), then the
     # WHERE's and the dropped rows'
-    sites = tuple(f.name for f, _, _ in values if f.name in required or f.name in joins.sites)
+    sites = tuple(f.name for f, _, _ in values
+                  if (f.name in required and required[f.name] != "open") or f.name in joins.sites)
     if where is not None and where != tm.where:
         sites += (WHERE_SITE,)
     if "drop" in required.values():
@@ -1012,8 +1029,9 @@ class NullingCount:
     new_totals: str  # COUNT(*) AS n, COUNT(<new value>) AS v over the new mapping's rows
     old_totals: str | None  # the same for the old value over the old mapping's rows (None: it does not compile)
     # 'drop': a required field whose NULL drops the row; 'visit_key': the visit key of a record's
-    # optional visit link, whose NULL takes the record out of the link checks
-    what: Literal["drop", "visit_key"] = "drop"
+    # optional visit link, whose NULL takes the record out of the link checks; 'open': an end
+    # whose NULL means the episode is still open (``rows`` gives n, v and m, see nulling_count_sql)
+    what: Literal["drop", "visit_key", "open"] = "drop"
 
 
 def _totals(tm: TableMapping, id_lines: list[str], value: str, etl: EtlConfig | None) -> str:
@@ -1037,7 +1055,13 @@ def nulling_count_sql(
     same for an optional visit_id field (a record's visit link): a record whose visit key becomes
     NULL leaves the link checks without a visit, so an edit that does that hides lost links; an
     old key that is blank or one of the source's ``na_values`` (compared without case) is no key,
-    and may become NULL. Raises ``CompileError`` when the new mapping does not compile."""
+    and may become NULL. For an end whose NULL means "still open" (policy 'open',
+    observation_period_end_date) one count gives ``n``, the episodes the edit opens (the new end is
+    NULL or a placeholder on or after ``OPEN_FROM`` where the old one was a real exit, other than
+    the start date an old fallback gave), ``v``, the distinct old exits among them (one value is a
+    placeholder exit that may become NULL), and ``m``, the open episodes it closes on their start
+    date (a new fallback onto the start). Raises ``CompileError`` when the new mapping does not
+    compile."""
     table = _check_mapping(new)
     c = _compile(new, spec, etl)
     try:
@@ -1045,14 +1069,20 @@ def nulling_count_sql(
     except CompileError:
         old_lines = None
     before = {fm.target_field: fm for fm in old.fields}
+    after = {fm.target_field: fm for fm in new.fields}
     out: dict[str, NullingCount] = {}
     for fm in new.fields:
         f = table.field(fm.target_field)
         was = before.get(fm.target_field)
         visit_key = f is not None and was is not None and was.kind == "visit_id" and not f.required
-        if f is None or (c.required.get(f.name) != "drop" and not visit_key):
+        if f is None or (c.required.get(f.name) not in ("drop", "open") and not visit_key):
             continue
         if was is not None and (was.kind, _norm(was.expression or "")) == (fm.kind, _norm(fm.expression or "")):
+            continue
+        if c.required.get(f.name) == "open":
+            counts = _open_end_count(new, before, after, f, table, c.id_lines, etl)
+            if counts is not None:
+                out[f.name] = NullingCount(schemas.render(counts), schemas.render(counts), None, what="open")
             continue
         new_value = _key_value(fm) if fm.kind == "visit_id" else _uncounted_value(fm, f, table, etl)
         if visit_key:
@@ -1072,6 +1102,38 @@ def nulling_count_sql(
             what="visit_key" if visit_key else "drop",
         )
     return out
+
+
+def _open_end_count(
+    new: TableMapping, before: dict[str, FieldMapping], after: dict[str, FieldMapping], f: CdmField,
+    table: CdmTable, id_lines: list[str], etl: EtlConfig | None,
+) -> str | None:
+    """The count of ``nulling_count_sql`` for an open end ``f`` (n, v, m) over the new mapping's
+    rows, with the old (``before``) and new (``after``) field mappings; None when an end is not
+    computed from the source."""
+    was = before.get(f.name)
+    new_end = _uncounted_value(after[f.name], f, table, etl)
+    old_end = _uncounted_value(was, f, table, etl) if was is not None else "NULL"
+    if new_end is None or old_end is None:
+        return None
+    new_end, old_end = _p(new_end), _p(old_end)
+    start = table.field(OPEN_ENDS[(table.name, f.name)])
+
+    def start_value(fields: dict[str, FieldMapping]) -> str | None:
+        sm = fields.get(start.name) if start is not None else None
+        value = _uncounted_value(sm, start, table, etl) if sm is not None and start is not None else None
+        return _p(value) if value is not None else None
+
+    old_start, new_start = start_value(before), start_value(after)
+    opened = f"({new_end} IS NULL OR {new_end} >= {OPEN_FROM}) AND {old_end} < {OPEN_FROM}"
+    if old_start is not None:
+        opened += f" AND {old_end} IS DISTINCT FROM {old_start}"  # an old fallback onto the start date
+    closed = (f"({old_end} IS NULL OR {old_end} >= {OPEN_FROM}) AND {new_end} < {OPEN_FROM} AND {new_end} = {new_start}"
+              if new_start is not None else "false")
+    what = (f"COUNT(*) FILTER (WHERE {opened}) AS n,\n"
+            f"       COUNT(DISTINCT ({old_end})::date) FILTER (WHERE {opened}) AS v,\n"
+            f"       COUNT(*) FILTER (WHERE {closed}) AS m")
+    return _source_count(new, id_lines, etl, what=what)
 
 
 def compile_table(tm: TableMapping, spec: ETLSpec, schemas: Schemas, *, etl: EtlConfig | None = None) -> str:
@@ -1385,7 +1447,12 @@ def _visit_map_prune_sql() -> list[str]:
     return ["\n".join(refresh), "\n".join(retire)]
 
 
-def _observation_period_sql(spec: ETLSpec, loaded: list[str]) -> str | None:
+def _observation_period_sql(spec: ETLSpec, loaded: list[str], fill: bool = False) -> str | None:
+    """One period per person from the first to the last date of their records in the ``loaded``
+    tables: the from_events periods, or with ``fill`` the observation_period_fill step, which gives
+    them only to the persons the merge left without a period (no valid episode) and returns one row:
+    the periods ``inserted`` and the ``persons_without_period`` before it (with person loaded).
+    Neither is clipped at the release date."""
     selects = []
     for t in loaded:
         if t not in EVENT_DATE_FIELDS:
@@ -1397,7 +1464,6 @@ def _observation_period_sql(spec: ETLSpec, loaded: list[str]) -> str | None:
         return None
     union = "\n    UNION ALL\n".join(selects)
     lines = [
-        _comment("observation_period derived from events: one period per person, first to last event date"),
         "INSERT INTO {cdm}.observation_period (",
         "    observation_period_id,",
         "    person_id,",
@@ -1419,8 +1485,179 @@ def _observation_period_sql(spec: ETLSpec, loaded: list[str]) -> str | None:
     ]
     if "person" in loaded:
         lines.append("  AND ev.person_id IN (SELECT person_id FROM {cdm}.person)")
-    lines.append("GROUP BY ev.person_id;")
-    return "\n".join(lines)
+    if not fill:
+        title = "observation_period derived from events: one period per person, first to last event date"
+        return "\n".join([_comment(title), *lines, "GROUP BY ev.person_id;"])
+    lines += ["  AND NOT EXISTS (SELECT 1 FROM {cdm}.observation_period op WHERE op.person_id = ev.person_id)",
+              "GROUP BY ev.person_id", "RETURNING 1"]
+    # the persons without a period are counted in the snapshot before the insert
+    without = ("(SELECT COUNT(*) FROM {cdm}.person p WHERE NOT EXISTS (SELECT 1 FROM {cdm}.observation_period op"
+               " WHERE op.person_id = p.person_id))" if "person" in loaded else "NULL::bigint")
+    return "\n".join([
+        _comment("observation_period_fill: persons without a valid episode get one period, first to last event "
+                 "date; returns\nthe periods inserted and the persons without a period before them"),
+        "WITH ins AS (", *_indent("\n".join(lines).splitlines()), ")",
+        "SELECT (SELECT COUNT(*) FROM ins) AS inserted,",
+        f"       {without} AS persons_without_period;",
+    ])
+
+
+# The release date the merge derives when none is configured: the k-th latest exit of the valid,
+# closed episodes, k = max(RELEASE_RANK_MIN, ceil(n / RELEASE_RANK_PER)), so that a few mistyped
+# future exits (or junk rows) do not move it; it is independent of the build date.
+RELEASE_RANK_MIN = 5
+RELEASE_RANK_PER = 10_000
+RELEASE_FACT = "source_release_date"
+
+
+def release_rank(n: int) -> int:
+    """k: the derived release date is the k-th latest exit of ``n`` valid, closed episodes."""
+    return max(RELEASE_RANK_MIN, -(-n // RELEASE_RANK_PER))
+
+
+def _release_rank(rows: str | None) -> str:
+    """k - 1, the OFFSET of the k-th latest date of the episodes ``rows`` selects (``release_rank``)."""
+    return (f"(SELECT GREATEST({RELEASE_RANK_MIN}, CEIL(COUNT(*) / {RELEASE_RANK_PER:.1f}))::int - 1 "
+            f"FROM moved{f' WHERE {rows}' if rows else ''})")
+
+
+def _observation_period_merge_sql(
+    cdm_source: CdmSourceConfig | None, with_death: bool, from_events: bool = False
+) -> list[str]:
+    """The observation_period_merge step, two statements: forget the release date of an earlier
+    run, then one statement that replaces the loaded episodes by each person's merged periods and
+    returns its statistics (one row). The release date (``bounds``) is the configured
+    ``cdm_source.source_release_date``, else derived (``RELEASE_RANK_MIN``); it is stored in
+    ``{etl}.build_facts`` for cdm_source. An episode is open when its end is NULL (loaded as
+    ``OPEN_END``) or a placeholder on or after ``OPEN_FROM``; it ends at the release date, or at
+    the person's death before it; one that starts after the release date, or after the person's
+    death, keeps one day. Real exits are never clipped. Episodes that end before they start are
+    dropped (counted). The rest merge when they overlap or are back to back (DQD
+    measureObservationPeriodOverlap: an end + 1 day = the next start), keeping the type of the
+    first episode. With ``with_death`` (death is loaded before this step) the earliest death date
+    of each person ends their open episodes. With ``from_events`` the periods were derived from
+    the records and are never open (a far-future record date is a typo that plausibleValueHigh
+    reports, not an open end): the merge only renumbers them and derives the release date."""
+    release = cdm_source.source_release_date if cdm_source is not None else None
+    if release is not None:
+        bounds = [f"    SELECT DATE {ql(release.isoformat())} AS release_date, true AS configured"]
+    else:
+        valid_closed = "NOT is_open AND s <= e"
+        bounds = [
+            "    SELECT COALESCE(",
+            f"             (SELECT e FROM moved WHERE {valid_closed} ORDER BY e DESC",
+            f"              OFFSET {_release_rank(valid_closed)} LIMIT 1),",
+            "             (SELECT s FROM moved ORDER BY s DESC",
+            f"              OFFSET {_release_rank(None)} LIMIT 1),",
+            "             (SELECT MIN(s) FROM moved)) AS release_date,",
+            "           false AS configured",
+        ]
+    with_death = with_death and not from_events
+    is_open = ("false AS is_open  -- periods derived from records are never open" if from_events else
+               f"observation_period_end_date >= {OPEN_FROM} AS is_open  -- a NULL end was loaded as {OPEN_END}")
+    at_death = "de.death_date >= m.s AND de.death_date < b.release_date"
+    closed = [
+        "    SELECT m.person_id, m.id, m.s, m.t, m.is_open,",
+        "           CASE WHEN NOT m.is_open THEN m.e  -- a real exit is never clipped",
+        *(["                WHEN de.death_date < m.s THEN m.s  -- open, but it starts after death: one day",
+           f"                WHEN {at_death} THEN de.death_date"] if with_death else []),
+        "                ELSE GREATEST(b.release_date, m.s) END AS e,  -- never dropped for the release date",
+        f"           {f'm.is_open AND {at_death}' if with_death else 'false'} AS at_death,",
+        f"           {'m.is_open AND de.death_date < m.s' if with_death else 'false'} AS starts_after_death,",
+        "           m.is_open AND m.s > b.release_date AS starts_after_release,",
+        "           NOT m.is_open AND m.s <= m.e AND m.e > b.release_date AS ends_after_release",
+        "    FROM moved m",
+        "    CROSS JOIN bounds b",
+    ]
+    if with_death:
+        closed.append("    LEFT JOIN (SELECT person_id, MIN(death_date) AS death_date FROM {cdm}.death GROUP BY person_id) de"
+                      " ON de.person_id = m.person_id")
+    order = "ORDER BY c.s, c.e, c.id"
+    if from_events:
+        what = ("observation_period_merge: renumbers the periods derived from the records (they are never open) and "
+                "derives the source release date ")
+    else:
+        what = ("observation_period_merge: each person's episodes become periods that neither overlap nor touch. "
+                "Open episodes (no exit date) end at the source release date ")
+    header = (
+        what
+        + ("(configured)" if release is not None else
+           f"(derived: the k-th latest exit date of the valid episodes, k = max({RELEASE_RANK_MIN}, "
+           f"n / {RELEASE_RANK_PER}))")
+        + (", or at death before it (one day when they start after death)" if with_death else "")
+        + "; real exit dates are kept. Episodes that end before they start are dropped. Overlapping and "
+        "back-to-back episodes (DQD: an end + 1 day = the next start) merge into one period with the type of "
+        "the first. Returns the statistics of the merge."
+    )
+    merge = [
+        _comment(textwrap.fill(header, 100)),
+        "WITH moved AS (",
+        "    DELETE FROM {cdm}.observation_period",
+        "    RETURNING person_id, observation_period_id AS id, observation_period_start_date AS s,",
+        "              observation_period_end_date AS e, period_type_concept_id AS t,",
+        f"              {is_open}",
+        "),",
+        "bounds AS (  -- the release date, computed once",
+        *bounds,
+        "),",
+        "fact AS (",
+        "    INSERT INTO {etl}.build_facts (name, value)",
+        f"    SELECT {ql(RELEASE_FACT)}, release_date::text FROM bounds WHERE release_date IS NOT NULL",
+        "    RETURNING 1",
+        "),",
+        "closed AS (",
+        *closed,
+        "),",
+        "flagged AS (",
+        "    SELECT c.*,",
+        "           CASE WHEN c.s <= MAX(c.e) OVER w + 1 THEN 0 ELSE 1 END AS starts_island,  -- overlap or adjacent",
+        "           COALESCE(c.s <= MAX(c.e) OVER w, false) AS overlaps_earlier,  -- a true overlap",
+        f"           c.is_open AND LEAD(c.s) OVER (PARTITION BY c.person_id {order}) IS NOT NULL AS stale_open",
+        "    FROM closed c",
+        "    WHERE c.s <= c.e",
+        f"    WINDOW w AS (PARTITION BY c.person_id {order} ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)",
+        "),",
+        "islands AS (",
+        "    SELECT f.*, SUM(f.starts_island) OVER (PARTITION BY f.person_id ORDER BY f.s, f.e, f.id"
+        " ROWS UNBOUNDED PRECEDING) AS island",
+        "    FROM flagged f",
+        "),",
+        "ins AS (",
+        "    INSERT INTO {cdm}.observation_period (",
+        "        observation_period_id,",
+        "        person_id,",
+        "        observation_period_start_date,",
+        "        observation_period_end_date,",
+        "        period_type_concept_id",
+        "    )",
+        "    SELECT (ROW_NUMBER() OVER (ORDER BY i.person_id, MIN(i.s)))::integer,",
+        "           i.person_id, MIN(i.s), MAX(i.e), (ARRAY_AGG(i.t ORDER BY i.s, i.e, i.id))[1]",
+        "    FROM islands i",
+        "    GROUP BY i.person_id, i.island",
+        "    RETURNING person_id",
+        "),",
+        "persons AS (SELECT COUNT(DISTINCT person_id) AS n FROM moved)  -- once: it sorts every episode",
+        "SELECT (SELECT COUNT(*) FROM ins) AS inserted,",
+        "       (SELECT COUNT(*) FROM moved) AS episodes,",
+        "       (SELECT COUNT(*) FROM closed WHERE s > e) AS dropped_inverted,",
+        "       (SELECT COUNT(*) FROM moved WHERE is_open) AS open_episodes,",
+        "       (SELECT COUNT(*) FROM closed WHERE at_death) AS open_closed_at_death,",
+        "       (SELECT COUNT(*) FROM closed WHERE starts_after_death) AS open_starting_after_death,",
+        "       (SELECT COUNT(*) FROM closed WHERE starts_after_release) AS open_starting_after_release,",
+        "       (SELECT COUNT(*) FROM closed WHERE ends_after_release) AS exits_after_release,",
+        "       (SELECT COUNT(*) FROM closed c, bounds b WHERE c.s <= c.e AND c.e >= b.release_date)"
+        " AS ending_from_release,",
+        "       (SELECT COUNT(DISTINCT person_id) FROM flagged WHERE overlaps_earlier) AS persons_overlapping,",
+        "       (SELECT COUNT(DISTINCT person_id) FROM flagged WHERE stale_open) AS persons_stale_open,",
+        "       (SELECT n FROM persons) AS persons,",
+        "       (SELECT n FROM persons) - (SELECT COUNT(DISTINCT person_id) FROM ins) AS persons_without_period,",
+        "       (SELECT release_date FROM bounds)::text AS release_date,",
+        "       (SELECT configured FROM bounds) AS configured,",
+        "       (SELECT COUNT(*) FROM moved WHERE NOT is_open AND s <= e) AS closed_episodes,",
+        "       (SELECT COUNT(*) FROM fact) AS fact_rows;",
+    ]
+    forget = f"DELETE FROM {{etl}}.build_facts WHERE name = {ql(RELEASE_FACT)};"
+    return [forget, "\n".join(merge)]
 
 
 def _cdm_source_sql(cdm_source: CdmSourceConfig | None) -> str:
@@ -1446,8 +1683,11 @@ def _cdm_source_sql(cdm_source: CdmSourceConfig | None) -> str:
             f"    LEFT({ql(cs.cdm_holder)}, 255),",
             f"    {ql(cs.source_description)},",
             "    'omop-agent',",
-            # the configured extract date, else the build date
-            f"    {'DATE ' + ql(cs.source_release_date.isoformat()) if cs.source_release_date else 'CURRENT_DATE'},",
+            # the configured extract date, else the date the observation_period_merge step derived,
+            # else (no observation periods) the build date
+            f"    DATE {ql(cs.source_release_date.isoformat())}," if cs.source_release_date else
+            f"    COALESCE((SELECT MAX(value::date) FROM {{etl}}.build_facts WHERE name = {ql(RELEASE_FACT)}),"
+            " CURRENT_DATE),",
             "    CURRENT_DATE,",
             "    '5.4',",
             "    COALESCE((SELECT concept_id FROM {vocab}.concept"
@@ -1558,12 +1798,26 @@ def compile_spec(
         steps.append(CompiledStep("visit_map_prune", None, "prune", "\n".join(vp), statements=tuple(vp),
                                   slot=(_load_index("visit_occurrence"), 1, 0)))
 
+    # observation periods: from the events (after every spec writer of observation_period), then the
+    # merge of each person's periods after the last writer (and after death, which ends open
+    # episodes); with 'table_mapping' the fill for persons left without a period
+    op_index = _load_index("observation_period")
+    loaded = [t for t in target_tables(spec) if t != "observation_period"]
     if spec.observation_period == "from_events":
-        loaded = [t for t in target_tables(spec) if t != "observation_period"]
         op = _observation_period_sql(spec, loaded)
         if op is not None:
             steps.append(CompiledStep("observation_period", "observation_period", "derived", op,
-                                      slot=(_load_index("observation_period"), 0, _AFTER_SPEC_WRITERS)))
+                                      slot=(op_index, 0, _AFTER_SPEC_WRITERS)))
+    if any(s.target_table == "observation_period" for s in steps):
+        # periods derived from the records only (from_events without a spec writer) are never open
+        derived_only = all(s.kind == "derived" for s in steps if s.target_table == "observation_period")
+        merge = _observation_period_merge_sql(cdm_source, with_death="death" in loaded, from_events=derived_only)
+        steps.append(CompiledStep("observation_period_merge", "observation_period", "merge", "\n".join(merge),
+                                  statements=tuple(merge), returns="row", slot=(op_index, 1, 0)))
+        fill = _observation_period_sql(spec, loaded, fill=True) if spec.observation_period == "table_mapping" else None
+        if fill is not None:
+            steps.append(CompiledStep("observation_period_fill", "observation_period", "derived", fill,
+                                      returns="row", slot=(op_index, 1, 1)))
 
     steps.append(CompiledStep("cdm_source", "cdm_source", "metadata", _cdm_source_sql(cdm_source),
                               slot=(len(LOAD_ORDER) + 1, 0, 0)))  # last, after custom SQL of unknown tables

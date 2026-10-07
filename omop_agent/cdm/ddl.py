@@ -87,8 +87,8 @@ def add_primary_keys(conn: psycopg.Connection, schemas: Schemas, tables: list[st
 # The id maps give each source key its CDM id. A key that did not become a row is moved to the
 # matching *_retired table with its id, and gets that id back when it returns, so ids are never
 # reused or lost. id_high_water keeps the largest id a table had before records were moved out of
-# it, and build_facts holds values that one build step derives for later steps (both emptied or
-# rewritten by the steps that use them).
+# it (rewritten by the step that uses it), and build_facts holds values that one build step derives
+# for later steps (emptied at the start of every build, like the CDM tables).
 ETL_TABLES = {
     "person_map": """
         CREATE TABLE IF NOT EXISTS {etl}.person_map (

@@ -101,7 +101,13 @@ def render_spec_md(spec: ETLSpec) -> str:
             f"type concept {spec.observation_period_type_concept_id}"
         )
     else:
-        out.append("- **Observation period:** loaded by a table mapping")
+        out.append(
+            "- **Observation period:** loaded by a table mapping, one row per episode. The build merges each "
+            "person's overlapping and back-to-back episodes, ends open ones (no end date) at "
+            "`cdm_source.source_release_date` (configured, or derived from the exit dates) or at death, drops "
+            "episodes that end before they start, and gives persons without a valid episode a period from their "
+            "first to their last event"
+        )
     out += ["", "| # | source table | → | CDM table | fields |", "|---|---|---|---|---|"]
     for k, (_, tm) in enumerate(mappings, start=1):
         src = tm.source.table + "".join(f" + {j.table}" for j in tm.joins)

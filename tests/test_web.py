@@ -323,6 +323,8 @@ def test_spec_page_shows_key_sources_and_dedup_order(site):
     page = client.get("/p/demo/spec").text
     assert "also <code>emr_patients</code> keyed by <code>&#39;EMR:&#39; || e.patient_no</code>" in page
     assert "one row per key, the best row first by <code>x.dod::date DESC</code>" in page
+    # the build's merge of observation periods
+    assert "ends open ones at the source release date (configured, or derived from the exit dates) or at death" in page
 
 
 def test_report_is_served_with_a_strict_policy(site):

@@ -95,10 +95,17 @@ CDM convention and counts it: a required concept becomes 0; visit_end_date, \
 visit_detail_end_date and drug_exposure_end_date fall back to the start date; rows without a \
 required start date, birth year or death date are dropped. Write an explicit fallback when the \
 source offers a better one (for example start + days_supply - 1 for drug_exposure_end_date) \
-and say so in the rationale.
-- Observation periods are the spans during which a person's events would be recorded. Use a \
-source table of enrollment, residency or follow-up episodes when one exists; otherwise derive \
-them from the events.
+and say so in the rationale. Never give observation_period_end_date a fallback (see observation \
+periods).
+- Observation periods are the spans during which a person's events would be recorded. When a \
+source table records enrollment, residency or follow-up episodes, map it to observation_period \
+one row per episode: start = entry date, end = exit date, end NULL when the episode is still \
+open (never CURRENT_DATE, never the start date, never a placeholder date). The build merges each \
+person's overlapping and back-to-back periods, ends open ones at cdm_source.source_release_date \
+or at death, drops episodes that end before they start, and gives persons without a valid \
+episode a period from their first to their last event. So do not merge, de-duplicate or filter \
+episodes yourself and do not write correlated subqueries for it. Without such a table use \
+'from_events'.
 - Records go to the table of their content's domain: diagnoses to condition_occurrence, \
 prescriptions and dispensings to drug_exposure, lab results and vital signs to measurement, \
 other facts to observation.
@@ -152,6 +159,9 @@ follow row order and attach every event to the wrong person. Other tables' own p
 (condition_occurrence_id, drug_exposure_id, measurement_id, ...) use kind auto_id.
 - Use where to keep only the rows that belong in this table when one source table feeds \
 several CDM tables.
+- A correlated subquery ({src}.<table> inside an expression) runs once per source row, which is \
+slow on large tables; prefer a join. Observation period episodes never need one: the build merges \
+them.
 - Every person and visit_occurrence mapping adds the keys of the rows it loads to the person or \
 visit id map, so people and visits can come from several source tables (the HDSS register and a \
 clinic register; outpatient visits and admissions). A key found in two sources is one person \
@@ -385,7 +395,9 @@ Plan one visit_occurrence mapping per source of visits (outpatient visits, admis
 stays): each adds its visits to the visit id map. If visit numbers restart for each person, \
 include the person key in the visit key.
 3. observation_period: 'table_mapping' if a source table records enrollment, residency or \
-follow-up periods (then plan an observation_period table from it), otherwise 'from_events'.
+follow-up episodes (then plan an observation_period table from it, one row per episode: the build \
+merges each person's episodes, ends open ones and gives persons without an episode a period from \
+their events), otherwise 'from_events'.
 4. tables: one entry per table mapping, in load order (person first). For each, the CDM \
 target table and its source tables (the first one provides the rows; any others are joined). \
 A CDM table may appear more than once when several source tables feed it. Only plan tables \
@@ -485,10 +497,18 @@ def _normalise_plan(plan: TablePlan) -> TablePlan:
             ),
         )
     update: dict = {"tables": tables, "open_questions": plan.open_questions + notes}
-    if plan.observation_period == "table_mapping" and not any(t.target_table == "observation_period" for t in tables):
+    planned_op = any(t.target_table == "observation_period" for t in tables)
+    if plan.observation_period == "table_mapping" and not planned_op:
         update["observation_period"] = "from_events"
         update["assumptions"] = plan.assumptions + [
             "No observation_period mapping was planned, so observation periods are derived from events."
+        ]
+    elif plan.observation_period == "from_events" and planned_op:
+        # the planned episodes are the periods; persons without one get a period from their events
+        update["observation_period"] = "table_mapping"
+        update["assumptions"] = plan.assumptions + [
+            "An observation_period mapping was planned, so observation periods come from it ('table_mapping'); "
+            "persons without a valid episode get a period from their first to their last event."
         ]
     return plan.model_copy(update=update)
 

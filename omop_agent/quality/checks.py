@@ -32,11 +32,21 @@ corresponding DQD SQL file, so results line up with the official R package:
   repairable); for records that link to a visit, ``etlVisitLinkage`` (records whose visit key
   gives no visit of their own person; convention, 5%) and the fatal ``etlVisitLinkLoss`` (more
   than 100 - ``quality.min_record_retention_pct`` percent name a visit key that no visit mapping
-  reads). Each carries the step's label (``step``): a second mapping into
-  one table gets its own key, e.g. ``etlRecordRetention.measurement.measurement_2``;
+  reads); for the observation-period merge, ``etlObservationPeriodMerge`` (episodes dropped
+  because they end before they start, and those loaded as open because their exit date could not
+  be read; convention, 5%, with the fatal ``etlRecordLoss`` copy when more than 100 -
+  ``quality.min_record_retention_pct`` percent are dropped; the description gives the open,
+  overlapping and stale open episodes, the persons without a valid episode and the release date)
+  and ``etlSourceReleaseDate`` (convention, threshold 0, not repairable: open episodes ended on
+  a release date the build derived, or episodes after a configured one, a stale date; fatal when
+  the derived date is after the day of the build). Each
+  carries the step's label (``step``): a second mapping into one table gets its own key, e.g.
+  ``etlRecordRetention.measurement.measurement_2``;
 * integrity (ours, re-checked after the load because custom SQL bypasses the build's INSERTs;
   fatal, threshold 0, not repairable): ``measureDuplicateDeaths`` (persons with more than one
-  death record) and ``fkVisitPerson`` (records whose visit belongs to another person).
+  death record) and ``fkVisitPerson`` (records whose visit belongs to another person);
+* ``withinObservationPeriod`` (FIELD, ours; characterization, 5%): records of an event or era
+  table whose start date lies in no observation period of their person (OMOP allows them).
 
 The other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``, ``plausibleTemporalAfter``,
 ``measureConditionEraCompleteness`` and the concept-level checks) are reported once per
@@ -58,15 +68,16 @@ import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import resources
+from datetime import date
 from typing import Any
 
 import psycopg
 
 from ..cdm.ddl import schema_for
-from ..cdm.spec import RESOURCE_PKG, load_cdm_spec
+from ..cdm.spec import EVENT_DATE_FIELDS, RESOURCE_PKG, load_cdm_spec
 from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, fetch_one, qi, ql, short_error
-from ..etl.compiler import ONE_ROW_PER, SPEC_KINDS, step_label, target_tables
+from ..etl.compiler import ONE_ROW_PER, SPEC_KINDS, release_rank, step_label, target_tables
 from ..etl.policies import END_FROM_START, THEMIS_PARTIAL, WHERE_SITE, partial_policy, required_null_policy
 from ..models import CheckResult, DQReport, ETLRunResult, ETLSpec, TableLoadResult
 from ..workspace import utcnow
@@ -652,6 +663,39 @@ def _integrity_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
     return out
 
 
+# The start date of each table's records that withinObservationPeriod places in an observation period.
+WITHIN_OBSERVATION_PERIOD = {t: start for t, (start, _) in EVENT_DATE_FIELDS.items()} | {
+    "condition_era": "condition_era_start_date", "drug_era": "drug_era_start_date"}
+
+
+def _within_observation_period_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
+    """``withinObservationPeriod`` (FIELD, ours; characterization, 5%): records of a populated event
+    or era table whose start date lies in no observation period of their person. OMOP allows
+    events outside observation periods, so it is reported for review: many such records mean
+    periods that end too early (an open episode ended at a wrong release date) or start too late."""
+    fld = WITHIN_OBSERVATION_PERIOD.get(table)
+    if fld is None or table not in ctx.populated or not ctx.n_rows.get(table):
+        return []  # covered by the table's field-level summary
+    res = CheckResult(
+        check_name="withinObservationPeriod", check_level="FIELD", table=table, field=fld,
+        description=f"The number and percent of {table} records whose {fld} lies in no observation period of their "
+        "person. OMOP allows records outside observation periods; many of them mean periods that end too early "
+        "(open episodes ended at a wrong cdm_source.source_release_date) or start too late. Reported for review.",
+        category="Plausibility", subcategory="Temporal", severity="characterization", threshold_pct=5.0,
+    )
+    if "observation_period" not in ctx.existing or not ctx.n_rows.get("observation_period") or fld not in ctx.columns.get(
+            table, set()):
+        return [res.model_copy(update={"not_applicable": True})]
+    T, OP = ctx.t(table), ctx.t("observation_period")
+    F = f"t.{qi(fld)}"
+    return [_evaluate(ctx, res, _q(
+        f"SELECT COUNT(*) FROM {T} t WHERE {F} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {OP} op "
+        f"WHERE op.person_id = t.person_id AND {F} BETWEEN op.observation_period_start_date AND "
+        "op.observation_period_end_date)",
+        f"SELECT COUNT(*) FROM {T} t WHERE {F} IS NOT NULL",
+    ))]
+
+
 def _not_implemented_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
     """One not-applicable result per DQD check that applies to a populated table but is not built in."""
     if table not in ctx.populated or not ctx.n_rows.get(table):
@@ -711,6 +755,10 @@ def etl_checks(
         return any(s.error and s.target_table == table and s.kind in (None, "insert", "custom") for s in etl_result.steps)
 
     person_failed, visit_failed = load_failed("person"), load_failed("visit_occurrence")
+    fill = next((s for s in etl_result.steps if step_label(s.step) == "observation_period_fill" and not s.error), None)
+    # observation_period ends the mappings could not read: loaded as open, so the merge ran them to the release date
+    unreadable_ends = sum(int((s.value_counts.get("invalid") or {}).get("observation_period_end_date") or 0)
+                          for s in etl_result.steps if s.target_table == "observation_period" and not s.error)
     for s in etl_result.steps:
         label = step_label(s.step)
         if s.error:
@@ -751,6 +799,9 @@ def etl_checks(
                     )
                 )
         out += _key_checks(s, label)
+        if s.kind == "merge" and "episodes" in s.stats:
+            out += _merge_checks(s, label, min_retention_pct, fill, unreadable_ends,
+                                 etl_result.started_at.date() if etl_result.started_at else None)
         # a failed person or visit load is the cause of the records left without their visit
         if s.stats.get("visit_links") and not person_failed and not visit_failed:
             out += _visit_link_checks(s, label, min_retention_pct)
@@ -1064,6 +1115,146 @@ def _key_checks(s: TableLoadResult, label: str) -> list[CheckResult]:
     return out
 
 
+def _ordinal(n: int) -> str:
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def release_date_text(st: dict[str, Any]) -> str:
+    """How the merge step's statistics ``st`` got the release date, e.g. '2023-12-31 (configured)'."""
+    release = st.get("release_date")
+    if release is None:
+        return "none (no episodes)"
+    if st.get("configured"):
+        return f"{release} (configured: cdm_source.source_release_date)"
+    closed = int(st.get("closed_episodes") or 0)
+    k = release_rank(closed)
+    if closed >= k:
+        return f"{release} (derived: the {_ordinal(k)} latest exit date of the valid closed episodes)"
+    return f"{release} (derived: too few closed episodes for a robust exit date, so a late start date)"
+
+
+def _merge_checks(
+    s: TableLoadResult, label: str, min_retention_pct: float, fill: TableLoadResult | None, unreadable: int = 0,
+    built: date | None = None,
+) -> list[CheckResult]:
+    """For the observation_period_merge step (its statistics, ``etl.compiler._observation_period_merge_sql``)
+    and the fill step after it:
+
+    * ``etlObservationPeriodMerge``: episodes whose dates the merge could not use as written
+      (convention, 5%; the agent can fix the date expressions of the observation_period mapping):
+      those dropped because they end before they start (usually an exit date read in another
+      layout, or start and end swapped), and those treated as open because their exit date could
+      not be read (``unreadable``: the observation_period writers' invalid end dates, which run to
+      the release date). The fatal ``etlRecordLoss`` copy follows when more than
+      100 - ``min_retention_pct`` percent are dropped. The description gives the open episodes,
+      the persons with overlapping or stale open episodes, the persons left without a valid episode
+      and those the fill step gave a period from their events, and the release date;
+    * ``etlSourceReleaseDate`` (convention, threshold 0, not repairable: the date is for people to
+      set): fails when open episodes were ended on a release date the build derived, or when a
+      configured date is earlier than episodes that start (open) or end after it (a stale date).
+      A derived date after the day of the build (``built``: placeholder or mistyped exit dates) is
+      fatal: open periods would run into the future, and cdm_source.source_release_date would be
+      later than cdm_release_date, which a configured date may not be either.
+
+    The descriptions give counts only as "<n> of <m>", which the repair prompt can suppress."""
+    st = s.stats
+
+    def n(key: str, of: dict[str, Any] = st) -> int:
+        return int(of.get(key) or 0)
+
+    episodes, dropped, open_, persons = n("episodes"), n("dropped_inverted"), n("open_episodes"), n("persons")
+    unread = min(unreadable, open_)  # an end that could not be read was loaded as open
+    at_death, after_death = n("open_closed_at_death"), n("open_starting_after_death")
+    when = release_date_text(st)
+    text = [
+        f"Observation period episodes of ETL step '{s.step}' dropped because they end before they start (an exit date "
+        f"read in another layout, start and end swapped in the mapping, or junk rows in the source): {dropped} of "
+        f"{episodes} episodes"
+        + (f"; treated as still open because their exit date could not be read (etlInvalidValue), so that they run to "
+           f"the release date: {unread} of {episodes} episodes" if unread else "")
+        + ". Each person's other episodes were merged where they overlap or are back to back.",
+        f"Open episodes (no exit date): {open_} of {episodes}, ended at the release date {when}"
+        + (f" or at death ({at_death} of {open_})" if at_death else "")
+        + (f"; those that start after it keep one day ({n('open_starting_after_release')} of {open_})"
+           if n("open_starting_after_release") else "")
+        + (f"; those that start after the person's death keep one day ({after_death} of {open_})"
+           if after_death else "") + ".",
+        f"Persons with overlapping episodes: {n('persons_overlapping')} of {persons}; with an open episode followed "
+        f"by a later one: {n('persons_stale_open')} of {persons} (merged; for review). Persons without a valid "
+        f"episode: {n('persons_without_period')} of {persons}.",
+    ]
+    if fill is not None and fill.stats.get("persons_without_period") is not None:
+        without, filled = n("persons_without_period", fill.stats), n("inserted", fill.stats)
+        text.append(
+            f"The fill step gave the persons without a period one from their first to their last event: {filled} of "
+            f"{without} persons; the others have no event either, so they have no observation period "
+            "(measurePersonCompleteness)."
+        )
+    text.append("Fix the date expressions of the observation_period mapping if the source has the dates in another "
+                "form; never filter episodes or merge them yourself, and leave the end NULL for open episodes.")
+    bad = dropped + unread
+    merged = CheckResult(
+        check_name="etlObservationPeriodMerge", check_level="ETL", table=s.target_table, description=" ".join(text),
+        category="Plausibility", subcategory="Temporal", severity="convention",
+        num_violated_rows=bad, num_denominator_rows=episodes,
+        pct_violated_rows=min(bad / episodes, 1.0) if episodes else 0.0, threshold_pct=ETL_RETENTION_THRESHOLD,
+        failed=bad * 100 > ETL_RETENTION_THRESHOLD * episodes, sql=s.sql, step=label,
+    )
+    out = [merged]
+    loss = 100 - min_retention_pct
+    if episodes and dropped * 100 > loss * episodes:
+        out.append(merged.model_copy(update={
+            "check_name": "etlRecordLoss",
+            "description": (
+                f"ETL step '{s.step}' dropped more than {loss:g}% of the observation period episodes because they end "
+                f"before they start: {dropped} of {episodes} episodes. The exit or entry date is almost certainly read "
+                "wrongly (another layout, or the columns swapped)."
+            ),
+            "num_violated_rows": dropped, "pct_violated_rows": dropped / episodes,
+            "severity": "fatal", "threshold_pct": loss, "failed": True,
+        }))
+    severity = "convention"
+    release = st.get("release_date")
+    if st.get("configured"):
+        late = n("open_starting_after_release") + n("exits_after_release")
+        what = (
+            f"Episodes of ETL step '{s.step}' that start (open episodes) or end after the configured release date "
+            f"{release}: {late} of {episodes} episodes."
+            + (" Real exits are kept and open episodes that start later keep one day, but the data is newer than "
+               "cdm_source.source_release_date: is the date stale? Set it to the date of the data extract."
+               if late else " The data is not newer than the extract date.")
+        )
+    elif release is None:
+        late, what = 0, (f"ETL step '{s.step}' had no observation period episodes, so it derived no release date "
+                         "(cdm_source.source_release_date is the build date unless it is configured).")
+    elif built is not None and str(release) > built.isoformat():
+        severity = "fatal"
+        late = n("ending_from_release") or max(open_ - at_death - after_death, 1)
+        what = (
+            f"The release date the build derived for ETL step '{s.step}', {when}, is after the day of the build "
+            f"({built.isoformat()}): {late} of {episodes} episodes end on it or later. Exit dates after the build are "
+            "placeholders for 'still resident' (map them to NULL in the observation_period mapping) or typos; open "
+            "periods would run into the future, and cdm_source.source_release_date would be later than "
+            "cdm_release_date. Set cdm_source.source_release_date (omop_agent.yaml) to the date of the data extract."
+        )
+    else:
+        late = open_ - at_death - after_death  # those ended at death do not depend on it
+        what = (
+            f"Open episodes (no exit date) of ETL step '{s.step}' ended on a release date the build derived, {when}: "
+            f"{late} of {episodes} episodes."
+            + (" Set cdm_source.source_release_date (omop_agent.yaml) to the date of the data extract, so that open "
+               "periods end on it." if late else " No period depends on it; cdm_source.source_release_date has it.")
+        )
+    out.append(CheckResult(
+        check_name="etlSourceReleaseDate", check_level="ETL", table=s.target_table, description=what,
+        category="Plausibility", subcategory="Temporal", severity=severity,
+        num_violated_rows=late, num_denominator_rows=episodes,
+        pct_violated_rows=min(late / episodes, 1.0) if episodes else 0.0, threshold_pct=0.0,
+        failed=late > 0 or severity == "fatal", sql=s.sql, step=label, repairable=False,
+    ))
+    return out
+
+
 def _visit_link_checks(s: TableLoadResult, label: str, min_retention_pct: float) -> list[CheckResult]:
     """``etlVisitLinkage``: the step's source rows with a visit key that got no visit of their own
     person (``stats['visit_links']``, counted with the retained rows), out of the rows with a key
@@ -1114,6 +1305,27 @@ def _visit_link_checks(s: TableLoadResult, label: str, min_retention_pct: float)
             "threshold_pct": loss, "failed": True,
         }))
     return out
+
+
+def _period_completeness_note(r: CheckResult, etl_result: ETLRunResult) -> CheckResult:
+    """measurePersonCompleteness of observation_period, when the build gave every person with a
+    record a period (from_events, or the fill step after the merge): says what the persons it
+    counts lack, and is not repairable. No spec change can give a period to a person without a
+    valid episode and without a record; the causes the agent can fix are reported by their own
+    checks (etlObservationPeriodMerge, the observation_period mapping's retention and step error).
+    It still blocks when it is a blocking check: whether such persons belong in the CDM is for
+    people to decide."""
+    if (r.check_name, r.table) != ("measurePersonCompleteness", "observation_period"):
+        return r
+    if not any(s.kind == "derived" and s.target_table == "observation_period" and not s.error
+               for s in etl_result.steps):
+        return r
+    return r.model_copy(update={
+        "description": r.description + " The build gives every person with a record a period from their first to "
+        "their last record (when they have no valid episode), so the persons counted here have no valid episode and "
+        "no record: a person decides whether they belong in the CDM (the repair agent cannot give them a period).",
+        "repairable": False,
+    })
 
 
 def summarize(r: CheckResult) -> str:
@@ -1216,8 +1428,10 @@ def run_builtin_checks(
             if t in existing:
                 results.extend(_field_checks(ctx, t))
                 results.extend(_integrity_checks(ctx, t))
+                results.extend(_within_observation_period_checks(ctx, t))
                 results.extend(_not_implemented_checks(ctx, t))
     if etl_result is not None:
+        results = [_period_completeness_note(r, etl_result) for r in results]
         results.extend(etl_checks(etl_result, cfg.quality.min_record_retention_pct, cfg.etl))
     passed, blocking = gate(results, cfg, etl_result)
     return DQReport(run_at=utcnow(), engine="builtin", results=results, passed=passed, blocking_failures=blocking)

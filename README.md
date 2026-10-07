@@ -127,6 +127,10 @@ example WHO `ICD10` when only `ICD10CM` was selected).
 * `llm`: `provider` (`anthropic` | `replay` | `none`), `model` (default `claude-opus-5-5`), `effort`, `record_dir`/`replay_dir`.
 * `privacy`: `min_cell_count` (default 5), `send_values_to_llm`, extra `pii_columns`.
 * `mapping.auto_approve_confidence`, `quality.max_repair_iterations`, `quality.blocking_severities`, `quality.use_r_dqd`.
+* `cdm_source`: the `cdm_source` row; `source_release_date` is the date of the data extract.
+  Observation periods still open there (no exit date) end on it. Unset, the build derives it from
+  the exit dates and reports it (`etlSourceReleaseDate`); a derived date after the day of the build
+  (placeholder or mistyped exit dates) fails the gate until it is set.
 
 `${VAR}` references are read from the environment, so credentials stay out of the file.
 
@@ -190,10 +194,14 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   from SQL.
 * **A PASS means the data is there.** Besides fatal DQD failures, the gate blocks when a table
   mapping loads less than half of its source rows (`etlRecordLoss`) and when persons have no
-  observation period (`quality.blocking_checks`). A required value that comes out NULL follows
-  the CDM convention and is counted, never hidden: a concept becomes 0 and a visit or drug end
-  date the start date (`etlDefaultedValue`), and a row without a start date, birth year or death
-  date is dropped (`etlRequiredFieldNull`, and a loss for the retention checks). A CDM built
+  observation period (`quality.blocking_checks`). Observation periods are merged by the build:
+  open episodes end at the source release date or at death, real exits are kept, episodes that
+  end before they start are dropped and counted (`etlObservationPeriodMerge`), and persons
+  without a valid episode get a period from their records. A required value that comes out
+  NULL follows the CDM convention and is counted, never hidden: a concept becomes 0, a visit or
+  drug end date the start date (`etlDefaultedValue`), an observation period end means the
+  episode is still open, and a row without a start date, birth year or death date is dropped
+  (`etlRequiredFieldNull`, and a loss for the retention checks). A CDM built
   from a design or mappings that nobody approved, or that automatic repairs changed after
   approval, is reported as "PASSED, not fully reviewed".
 * **Source files are staged exactly or not at all.** CSVs are decoded strictly: set
