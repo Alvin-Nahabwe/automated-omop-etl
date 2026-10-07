@@ -68,6 +68,10 @@ TABLE_DOMAIN = {
     "specimen": "Specimen",
 }
 
+# The era tables the build derives (``ETLSpec.derive_eras``, ``etl.compiler.derived_era_tables``)
+# and the event table each is derived from.
+DERIVED_ERAS = {"condition_era": "condition_occurrence", "drug_era": "drug_exposure"}
+
 # Routing by domain (etl.routing): the event tables whose records the build moves to the table of
 # their standard concept's domain, and every table a record can be moved to. observation is a
 # destination only: DQD has no fkDomain check on observation_concept_id.

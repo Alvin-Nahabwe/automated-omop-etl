@@ -105,7 +105,7 @@ _None._
 ## 4. ETL design
 
 {% if design %}
-{{ design.n_mappings }} table mappings, {{ design.n_fields }} field mappings, CDM {{ design.cdm_version|md }}. Person key: {{ design.person_key|md }}{% if design.person_key_also %} (also from: {{ design.person_key_also|md }}){% endif %}. Visit key: {{ design.visit_key|md if design.visit_key else 'none' }}{% if design.visit_key_also %} (also from: {{ design.visit_key_also|md }}){% endif %}. Observation period: {{ design.observation_period }}. Records moved to the table of their concept's domain: {{ 'yes' if design.route_by_domain else 'no (route_by_domain: false)' }}.
+{{ design.n_mappings }} table mappings, {{ design.n_fields }} field mappings, CDM {{ design.cdm_version|md }}. Person key: {{ design.person_key|md }}{% if design.person_key_also %} (also from: {{ design.person_key_also|md }}){% endif %}. Visit key: {{ design.visit_key|md if design.visit_key else 'none' }}{% if design.visit_key_also %} (also from: {{ design.visit_key_also|md }}){% endif %}. Observation period: {{ design.observation_period }}. Records moved to the table of their concept's domain: {{ 'yes' if design.route_by_domain else 'no (route_by_domain: false)' }}. Eras: {{ design.eras|md }}.
 
 Fields by kind: {% for k in design.kinds_total %}{{ k.kind }} {{ k.n }}{{ ', ' if not loop.last else '' }}{% endfor %}.
 
@@ -219,7 +219,7 @@ _Not run: no mappings/decisions.json in the workspace._
 ## 7. ETL run
 
 {% if etl %}
-Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }} ({{ etl.duration|secs }}){% endif %}. {{ etl.steps|length }} steps, {{ etl.total_rows|num }} rows loaded{% if etl.derived_rows %} ({{ etl.derived_rows|num }} derived by the build: observation periods){% endif %}{% if etl.moved_rows %}, {{ etl.moved_rows }} records moved to the table of their concept's domain{% endif %}, {{ etl.n_errors }} error(s).
+Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }} ({{ etl.duration|secs }}){% endif %}. {{ etl.steps|length }} steps, {{ etl.total_rows|num }} rows loaded{% if etl.derived_rows %}, {{ etl.derived_rows|num }} rows derived by the build (observation periods, eras){% endif %}{% if etl.moved_rows %}, {{ etl.moved_rows }} records moved to the table of their concept's domain{% endif %}, {{ etl.n_errors }} error(s).
 
 | Step | Table | Rows inserted | Source rows | Retention | Statistics | Visit links | Time | Error |
 |---|---|--:|--:|--:|---|---|--:|---|
@@ -247,7 +247,7 @@ _Not run: no etl_run.json in the workspace._
 ## 8. Data quality
 
 {% if dq %}
-{{ dq.n_checks|num }} checks ({{ dq.engine }} engine) run {{ dq.run_at }}: **{{ 'PASSED' if dq.passed else 'FAILED' }}**, {{ dq.failed|length }} failed, {{ dq.n_blocking }} blocking, {{ dq.errors|length }} errored.
+{{ dq.n_checks|num }} checks ({{ dq.engine }} engine) run {{ dq.run_at }}: **{{ 'PASSED' if dq.passed else 'FAILED' }}**, {{ dq.n_failed }} failed, {{ dq.n_blocking }} blocking, {{ dq.errors|length }} errored.
 {% if dq.blocking_failures %}
 
 > **Blocking failures ({{ dq.blocking_failures|length }})**
@@ -269,7 +269,8 @@ _Not run: no etl_run.json in the workspace._
 | {{ '**total**' if loop.last else r.name|md }} | {{ r.passed|num }} | {{ r.failed|num }} | {{ r.error|num }} | {{ r.not_applicable|num }} | {{ r.total|num }} |
 {% endfor %}
 
-**Failed checks**
+{% if dq.failed or not dq.derived_failed %}
+**Failed checks{% if dq.derived_failed %} of the loaded tables{% endif %}**
 {% if dq.failed %}
 
 | Blocking | Check | Severity | Category | Violated rows | % violated | Threshold | Description |
@@ -280,6 +281,21 @@ _Not run: no etl_run.json in the workspace._
 {% else %}
 
 _None._
+{% endif %}
+{% endif %}
+{% for g in dq.derived_failed %}
+
+**Failed checks of {{ g.table }} (derived by the build from {{ g.source }})**
+
+| Blocking | Check | Severity | Category | Violated rows | % violated | Threshold | Description |
+|---|---|---|---|--:|--:|--:|---|
+{% for f in g.failed %}
+| {{ '**BLOCKING**' if f.blocking else '' }} | {{ f.key|md }} | {{ f.severity }} | {{ f.category|md }} | {{ f.violated|num }} / {{ f.denominator|num }} | {{ f.pct|pct(2) }} | {{ f.threshold }} | {{ f.description|md }} |
+{% endfor %}
+{% endfor %}
+{% if dq.derived_failed %}
+
+The eras follow the {{ dq.derived_failed|map(attribute='source')|join(' and ') }} records: a failure here comes from those records{% if 'drug_era' in dq.derived_failed|map(attribute='table') %}, or is expected (drugs without a standard ingredient, such as vaccines, get no drug era){% endif %}. These checks are never sent to the repair agent.
 {% endif %}
 {% if dq.errors %}
 

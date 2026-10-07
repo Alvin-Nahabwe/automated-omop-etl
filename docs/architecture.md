@@ -228,6 +228,32 @@ tables, and the repair agent may not add either. Not
 routed (by design): records out of `observation`, concept-0 records by their source concept,
 and the value of a 'Maps to value' relationship.
 
+**Eras.** With `derive_eras: true` (the default) the build derives `condition_era` and
+`drug_era` with the OHDSI era logic (the CommonDataModel / ETL-Synthea scripts), in one generated
+step each at its table's place: after routing (the condition and drug records where they end up)
+and after the observation periods. The records of one person and concept (for drugs: each
+standard Ingredient of RxNorm or RxNorm Extension the drug rolls up to in `concept_ancestor`)
+that start at most 30 days after the earlier ones ended form one era, from the earliest start to
+the latest end; `drug_era.gap_days` counts the days of the era no exposure covers. Records with
+concept 0, and drug exposures with a negative `days_supply`, get no era. Where the published
+scripts are undefined the build deviates: a condition that ends before it starts ends the day
+after it starts; a drug exposure that ends before it starts ends after its `days_supply`
+(start + days_supply - 1) when that is 1 to 365 days, else on its start; ties are broken by the
+record id in both windows. On valid data the eras equal the published scripts (a test compares
+them, `tests/fixtures/era_reference.sql`). Spec SQL that loads an era table (a mapping or custom
+SQL with that target, or custom SQL with `INSERT INTO {cdm}.condition_era` / `drug_era`, also
+under the schema's own name or unqualified) replaces the built-in step for that table, runs at
+that table's place, and gets a validator warning. The era steps are not blocking (an error, such as a
+vocabulary without `concept_ancestor`, is reported as `etlStepError`, convention, and the build
+goes on without that table) and are skipped when a load of their event table failed. Their rows
+are counted apart from the loaded rows (derived rows). `measureConditionEraCompleteness` (DQD),
+`measureDrugEraCompleteness` (persons with an exposure that gets an era but no drug era) and
+`measureDrugEraCoverage` (exposures that get no era: no ingredient, or a negative `days_supply`;
+most are vaccines) check them; no check of an era table the build derived is sent to the repair
+agent, and the repair agent may not add a new mapping into an era table (fix the condition and
+drug records instead). `dose_era` is not built: OHDSI publishes no
+script for it.
+
 Concept lookups yield `0` when the source value exists but has no mapping. When the source
 value is NULL they yield NULL, or 0 if the CDM field is required. `varchar(n)` targets are
 truncated to `n` characters. The `cdm_source` row is generated from `cdm_source` in the config;
@@ -378,7 +404,13 @@ its person). `etlDomainRouting` (characterization) reports the records each rout
 the table of their concept's domain, and those that lost a value on the way. A route destination
 that no mapping loads (its records were all moved there) usually fails
 `measurePersonCompleteness`; that result is not sent to the repair agent, and a repair after which
-such a table receives no records is not treated as data loss. DQD checks the
+such a table receives no records is not treated as data loss. `measureConditionEraCompleteness`
+(DQD, convention, threshold 0), `measureDrugEraCompleteness` (ours, the same for drug eras:
+persons with an exposure that gets an era, i.e. a drug with a standard ingredient and a
+`days_supply` that is not negative, but no drug era; threshold 0; not applicable when `drug_era`
+is not built) and `measureDrugEraCoverage` (ours, convention, 5%: drug exposures that get no era)
+check the eras; none of them, and no check of an era table the build derived, is sent to the
+repair agent, and an era table that empties is not treated as data loss. DQD checks the
 built-in engine doesn't implement are listed as not applicable, and so is each empty table, as a
 single summary row. The run passes when no check with a
 blocking severity (default `fatal`) fails, no check listed in `quality.blocking_checks` fails
@@ -406,11 +438,13 @@ repair agent gets the failures and a set of tools:
   makes a record's visit key NULL where it was not (a blank or NA-marker key aside) is refused
   too: it would hide records that lost their visit from `etlVisitLinkage`.
 
-Errors of steps the build generates (id-map pruning, routing, ...) and errors a spec change cannot
+Errors of steps the build generates (id-map pruning, routing, eras, ...) and errors a spec change cannot
 fix (a missing privilege of the ETL role: the error names the GRANT to run) are never sent to the
 repair agent. Neither is an edit that routes records by hand while the build routes them (a filter
 or join on the domain of `vocab.concept`, or a second mapping of the same codes into another
-event table): it is refused, because it would load those records twice.
+event table): it is refused, because it would load those records twice. Nor is a new mapping into
+an era table while `derive_eras` is on (it would replace the OHDSI era step, or load the eras of
+one the spec's own SQL loads twice).
 
 The ETL is rebuilt and re-checked, up to `quality.max_repair_iterations` times. Each build is
 scored: losing data (a CDM table keeping under 95% of the rows an earlier build loaded, or of

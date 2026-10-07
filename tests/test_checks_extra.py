@@ -130,7 +130,10 @@ def test_tables_without_rows_get_one_summary(built):
     assert [r.key for r in report.results if r.table == "location"] == [f"{FIELD_SUMMARY}.location"]
     assert not [r for r in report.results if r.check_level == "FIELD" and r.not_applicable
                 and r.table not in {"person", "observation_period", "visit_occurrence", "condition_occurrence",
-                                    "drug_exposure", "measurement", "death", "cdm_source"}]
+                                    "drug_exposure", "measurement", "death", "condition_era", "cdm_source"}]
+    # drug_era is derived, but no drug of the fixture is mapped: summarised like a table without rows
+    assert [r.key for r in report.results if r.table == "drug_era" and r.check_level == "FIELD"] == []
+    assert "it has no rows" in results[f"{FIELD_SUMMARY}.drug_era"].description
     # a table the spec loads but that ended up empty is summarised too
     execute(conn, f"TRUNCATE {schemas.cdm}.death")
     empty = by_key(run_builtin_checks(conn, schemas, cfg, spec, etl).results)
@@ -138,9 +141,10 @@ def test_tables_without_rows_get_one_summary(built):
     assert not [k for k in empty if k.startswith("isRequired.death.")]
     conn.rollback()
 
-    # the result list stays small: a few hundred checks, not thousands of not-applicable rows
+    # the result list stays small: a few hundred checks, not thousands of not-applicable rows. Measured:
+    # 550 here (518 before the build derived eras; 585 when the drugs are mapped and drug_era has rows)
     n_na = sum(r.not_applicable for r in report.results)
-    assert len(report.results) < 600 and n_na < len(report.results) / 2
+    assert len(report.results) < 650 and n_na < len(report.results) / 2
 
 
 @pytest.mark.postgres
@@ -163,7 +167,10 @@ def test_checks_left_to_the_r_package(built):
         assert r.severity == check_catalog()[r.check_name].severity
     assert "fields of measurement" in results["cdmField.measurement"].description
     assert "plausibleGender.death" not in results  # no concept-level rows for death
-    assert "measureConditionEraCompleteness.condition_era" not in results  # condition_era is not populated
+    # the build derives condition_era, and the built-in engine checks its completeness (DQD 2.8.9)
+    era = results["measureConditionEraCompleteness.condition_era"]
+    assert not (era.not_applicable or era.error or era.failed) and era.num_denominator_rows > 0
+    assert era.check_level == "TABLE" and era.severity == check_catalog()[era.check_name].severity == "convention"
     assert "cdmTable.procedure_occurrence" not in results  # covered by the table's summary
 
 

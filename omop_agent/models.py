@@ -509,12 +509,14 @@ class ETLRunResult(BaseModel):
         return [s for s in self.steps if s.error and s.blocking]
 
     def rows_loaded(self) -> int:
-        """Rows the steps without an error wrote to the CDM. The id-map and pruning steps write only
-        the id maps (new and retired keys) and are left out, and so is the observation-period merge,
-        whose periods replace the episodes its table's writers loaded, and so are the route steps,
-        which only move records already loaded (``rows_moved``) and keep their bookkeeping."""
+        """Rows the steps without an error loaded into the CDM from the source. The id-map and pruning
+        steps write only the id maps (new and retired keys) and are left out, and so is the
+        observation-period merge, whose periods replace the episodes its table's writers loaded, and
+        so are the route steps, which only move records already loaded (``rows_moved``) and keep
+        their bookkeeping. The rows the build derived from other CDM tables are counted apart
+        (``rows_derived``)."""
         return sum(s.rows_inserted for s in self.steps
-                   if s.error is None and s.kind not in ("id_map", "prune", "merge", "route"))
+                   if s.error is None and s.kind not in ("id_map", "prune", "merge", "route", "derived"))
 
     def rows_moved(self) -> int:
         """Records the route steps moved to the table of their concept's domain (they are counted in
@@ -522,8 +524,8 @@ class ETLRunResult(BaseModel):
         return sum(m.moved_rows for s in self.steps if s.error is None for m in s.moved)
 
     def rows_derived(self) -> int:
-        """Of ``rows_loaded``, the rows the build derived from other CDM tables (observation periods
-        from events, the fill of persons without a period)."""
+        """The rows the build derived from other CDM tables (observation periods from events, the fill
+        of persons without a period, the eras), apart from ``rows_loaded``."""
         return sum(s.rows_inserted for s in self.steps if s.error is None and s.kind == "derived")
 
 

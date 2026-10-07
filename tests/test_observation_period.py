@@ -222,12 +222,12 @@ def test_merge_placement():
     assert labels[labels.index("custom_deaths"):] == [
         "custom_deaths", "custom_specimens", "route_prepare", "route_condition_occurrence", "route_drug_exposure",
         "route_measurement", "observation_period", "custom_more_periods", "observation_period_merge",
-        "observation_period_fill", "cdm_source"]
+        "observation_period_fill", "condition_era", "drug_era", "cdm_source"]
     assert "cdm.death" in step(steps, "observation_period_merge").sql
     # from_events: the derived periods, then the merge (it renumbers them and derives the release
     # date); no fill, every person with a record has a period already
     labels = [s.label for s in compile_spec(from_events(), S)]
-    assert labels[-3:] == ["observation_period", "observation_period_merge", "cdm_source"]
+    assert labels[-5:] == ["observation_period", "observation_period_merge", "condition_era", "drug_era", "cdm_source"]
     # the fill reads every loaded event table, only for persons without a period, and returns its row
     fill = step(compile_spec(load_ref(), S), "observation_period_fill")
     assert (fill.kind, fill.returns, fill.blocking, fill.requires) == ("derived", "row", True, None)
@@ -604,7 +604,7 @@ def test_within_observation_period_check(staged):
     assert set(within) == {f"withinObservationPeriod.{t}.{f}" for t, f in [
         ("visit_occurrence", "visit_start_date"), ("condition_occurrence", "condition_start_date"),
         ("drug_exposure", "drug_exposure_start_date"), ("measurement", "measurement_date"),
-        ("death", "death_date")]}
+        ("death", "death_date"), ("condition_era", "condition_era_start_date")]}  # drug_era: no drug is mapped
     for key, r in within.items():
         _, table, fld = key.split(".")
         outside = scalar(conn, f"""SELECT COUNT(*) FROM {cdm}.{table} t WHERE NOT EXISTS (
@@ -776,7 +776,8 @@ def test_build_history_counts_the_final_periods():
     run = ETLRunResult(started_at=NOW, steps=steps)
     # the valid episodes the merge took (100 - 2 dropped) and the fill's periods
     assert _BuildHistory._rows(run) == {"person": 80, "observation_period": 105, "cdm_source": 1}
-    assert run.rows_loaded() == 80 + 100 + 7 + 1 and run.rows_derived() == 7  # the merge replaces counted rows
+    # the merge replaces counted rows; the fill's periods are derived rows, counted apart
+    assert run.rows_loaded() == 80 + 100 + 1 and run.rows_derived() == 7
     # from_events: the derived periods are what the merge took
     ev = [TableLoadResult(target_table="observation_period", step="11_observation_period", kind="derived",
                           rows_inserted=80), merge_result(inserted=80, episodes=80, dropped_inverted=0)]
@@ -813,7 +814,7 @@ def test_report_shows_the_merge():
     assert shared[0]["periods"].startswith("100 episodes → 90 periods (<5 dropped")
     assert shared[0]["periods"].endswith("or at death (<5); persons with overlapping episodes: <5, with an open "
                                          "episode followed by a later one: <5)")
-    assert _etl_section(run)["total_rows"] == 7 and _etl_section(run)["derived_rows"] == 7
+    assert _etl_section(run)["total_rows"] == 0 and _etl_section(run)["derived_rows"] == 7
 
 
 def test_prompts_and_texts(tmp_path):

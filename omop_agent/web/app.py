@@ -42,6 +42,7 @@ from ..approvals import (
     record_approval,
 )
 from ..db import Schemas, connect
+from ..design.render import eras_text
 from ..etl.compiler import key_sources
 from ..models import ConceptCandidate, DQReport, ETLSpec, MappingDecision
 from ..runlock import RunInProgress, run_lock
@@ -425,7 +426,7 @@ def create_app(
         proj = configured(project_or_404(pid))
         ws = proj.ws
         ctx: dict[str, Any] = {"project": proj, "gate": gate_state(ws, "design"), "spec": None, "spec_error": None,
-                               "key_sources": {"person": [], "visit": []}}
+                               "key_sources": {"person": [], "visit": []}, "eras": ""}
         if ws.spec_yaml.exists():
             text = ws.spec_yaml.read_text()
             ctx["spec_text"] = text
@@ -438,6 +439,7 @@ def create_app(
                     what: [{"table": tm.source.table, "expression": expr} for tm, expr, _ in key_sources(ctx["spec"], t)]
                     for what, t in (("person", "person"), ("visit", "visit_occurrence"))
                 }
+                ctx["eras"] = eras_text(ctx["spec"])
             approved = approved_snapshot(ws, "design")
             if approved is not None and not ctx["gate"].current:
                 ctx["diff"] = list(

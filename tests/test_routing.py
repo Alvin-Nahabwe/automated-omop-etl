@@ -83,7 +83,7 @@ def test_route_steps_follow_event_loads():
     # the observation periods and the eras
     assert names[:i][-2:] == ["death", "custom_specimens"]
     assert names[i + 4:] == ["custom_plans", "custom_costs", "observation_period", "observation_period_merge",
-                             "observation_period_fill", "custom_eras", "custom_links", "cdm_source"]
+                             "observation_period_fill", "condition_era", "custom_eras", "custom_links", "cdm_source"]
     by = {s.label: s for s in steps}
     # non-blocking route steps; the per-table steps require route_prepare and return the moves
     assert all(by[n].kind == "route" and not by[n].blocking for n in route)

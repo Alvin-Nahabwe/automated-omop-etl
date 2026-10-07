@@ -2,9 +2,31 @@
 
 from __future__ import annotations
 
-from ..cdm.spec import LOAD_ORDER
-from ..etl.compiler import key_sources
+from ..cdm.spec import DERIVED_ERAS, LOAD_ORDER
+from ..etl.compiler import ERA_PAD_DAYS, era_status, key_sources
 from ..models import ETLSpec, FieldMapping, TableMapping
+
+# How each era table is built (``etl.compiler.era_status``), for the review views.
+_ERA_HOW = {
+    "derived": "derived by the build from {source} (OHDSI era logic)",
+    "spec": "loaded by the spec's own SQL",
+    "off": "not built (derive_eras: false)",
+    "no_records": "not built (no {source} records are loaded)",
+}
+
+
+def eras_text(spec: ETLSpec) -> str:
+    """One line on how the spec's era tables are built, e.g. 'condition_era derived by the build
+    from condition_occurrence (OHDSI era logic); drug_era ...', for the spec page, the spec
+    document and the report."""
+    status = era_status(spec)
+    parts = [f"{era} {_ERA_HOW[how].format(source=DERIVED_ERAS[era])}"
+             + (" (it replaces the build's era step)" if how == "spec" and spec.derive_eras else "")
+             for era, how in status.items()]
+    derived = [era for era, how in status.items() if how == "derived"]
+    rule = (f". An era joins the records of one person and concept (for drug eras: ingredient of RxNorm or RxNorm "
+            f"Extension) that start at most {ERA_PAD_DAYS} days after the earlier ones ended" if derived else "")
+    return "; ".join(parts) + rule
 
 
 def _cell(text: str | None) -> str:
@@ -116,6 +138,7 @@ def render_spec_md(spec: ETLSpec) -> str:
         )
     else:
         out.append("- **Routing by domain:** off (`route_by_domain: false`): records stay in the table that loads them")
+    out.append(f"- **Eras:** {eras_text(spec)}")
     out += ["", "| # | source table | → | CDM table | fields |", "|---|---|---|---|---|"]
     for k, (_, tm) in enumerate(mappings, start=1):
         src = tm.source.table + "".join(f" + {j.table}" for j in tm.joins)

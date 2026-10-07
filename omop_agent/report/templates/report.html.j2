@@ -235,7 +235,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     <div class="stat"><div class="v">{{ design.n_fields }}</div><div class="k">field mappings</div></div>
     <div class="stat"><div class="v">{{ design.open_questions|length }}</div><div class="k">open questions</div></div>
   </div>
-  <p>CDM {{ design.cdm_version }} · person key <code>{{ design.person_key }}</code>{% if design.person_key_also %} (also from <code>{{ design.person_key_also }}</code>){% endif %} · visit key {% if design.visit_key %}<code>{{ design.visit_key }}</code>{% if design.visit_key_also %} (also from <code>{{ design.visit_key_also }}</code>){% endif %}{% else %}none{% endif %} · observation period: {{ design.observation_period }} · records moved to the table of their concept's domain: {{ 'yes' if design.route_by_domain else 'no' }}</p>
+  <p>CDM {{ design.cdm_version }} · person key <code>{{ design.person_key }}</code>{% if design.person_key_also %} (also from <code>{{ design.person_key_also }}</code>){% endif %} · visit key {% if design.visit_key %}<code>{{ design.visit_key }}</code>{% if design.visit_key_also %} (also from <code>{{ design.visit_key_also }}</code>){% endif %}{% else %}none{% endif %} · observation period: {{ design.observation_period }} · records moved to the table of their concept's domain: {{ 'yes' if design.route_by_domain else 'no' }} · eras: {{ design.eras }}</p>
   <p class="muted">Fields by kind: {% for k in design.kinds_total %}{{ k.kind }} {{ k.n }}{{ ' · ' if not loop.last else '' }}{% endfor %}</p>
   <div class="tw"><table>
     <thead><tr><th>Target</th><th>Source</th><th>Joins / filter</th><th class="n">Fields</th><th>Kinds</th><th>Rationale</th></tr></thead>
@@ -325,7 +325,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
   <div class="stats">
     <div class="stat"><div class="v">{{ etl.steps|length }}</div><div class="k">steps</div></div>
     <div class="stat"><div class="v">{{ etl.total_rows|num }}</div><div class="k">rows loaded</div></div>
-    {% if etl.derived_rows %}<div class="stat"><div class="v">{{ etl.derived_rows|num }}</div><div class="k">derived by the build (observation periods)</div></div>{% endif %}
+    {% if etl.derived_rows %}<div class="stat"><div class="v">{{ etl.derived_rows|num }}</div><div class="k">rows derived by the build (observation periods, eras)</div></div>{% endif %}
     {% if etl.moved_rows %}<div class="stat"><div class="v">{{ etl.moved_rows }}</div><div class="k">moved to the table of their concept's domain</div></div>{% endif %}
     <div class="stat"><div class="v">{{ etl.n_errors }}</div><div class="k">errors</div></div>
     <div class="stat"><div class="v">{{ etl.duration|secs }}</div><div class="k">duration</div></div>
@@ -362,7 +362,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
   <div class="stats">
     <div class="stat"><div class="v">{{ badge('passed', 'ok') if dq.passed else badge('failed', 'fail') }}</div><div class="k">gate</div></div>
     <div class="stat"><div class="v">{{ dq.n_checks|num }}</div><div class="k">checks</div></div>
-    <div class="stat"><div class="v">{{ dq.failed|length }}</div><div class="k">failed</div></div>
+    <div class="stat"><div class="v">{{ dq.n_failed }}</div><div class="k">failed</div></div>
     <div class="stat"><div class="v">{{ dq.n_blocking }}</div><div class="k">blocking</div></div>
     <div class="stat"><div class="v">{{ dq.errors|length }}</div><div class="k">errored</div></div>
   </div>
@@ -382,7 +382,8 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     </tbody>
   </table></div>
   {% endfor %}
-  <h3>Failed checks</h3>
+  {% if dq.failed or not dq.derived_failed %}
+  <h3>Failed checks{% if dq.derived_failed %} of the loaded tables{% endif %}</h3>
   {% if dq.failed %}
   <div class="tw"><table>
     <thead><tr><th>Check</th><th>Severity</th><th>Category</th><th class="n">Violated rows</th><th class="n">% violated</th><th class="n">Threshold</th><th>Description</th></tr></thead>
@@ -398,6 +399,24 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     </tbody>
   </table></div>
   {% else %}{{ empty('None.') }}{% endif %}
+  {% endif %}
+  {% for g in dq.derived_failed %}
+  <h3>Failed checks of {{ g.table }} <span class="muted">(derived by the build from {{ g.source }})</span></h3>
+  <div class="tw"><table>
+    <thead><tr><th>Check</th><th>Severity</th><th>Category</th><th class="n">Violated rows</th><th class="n">% violated</th><th class="n">Threshold</th><th>Description</th></tr></thead>
+    <tbody>
+    {% for f in g.failed %}
+      <tr{% if f.blocking %} class="blocking"{% endif %}>
+        <td class="wrap">{% if f.blocking %}{{ badge('blocking', 'fail') }}<br>{% endif %}<code>{{ f.key }}</code></td>
+        <td>{{ f.severity }}</td><td>{{ f.category }}</td>
+        <td class="n">{{ f.violated|num }} / {{ f.denominator|num }}</td><td class="n">{{ f.pct|pct(2) }}</td><td class="n">{{ f.threshold }}</td>
+        <td class="wrap">{{ f.description }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endfor %}
+  {% if dq.derived_failed %}<p class="muted">The eras follow the {{ dq.derived_failed|map(attribute='source')|join(' and ') }} records: a failure here comes from those records{% if 'drug_era' in dq.derived_failed|map(attribute='table') %}, or is expected (drugs without a standard ingredient, such as vaccines, get no drug era){% endif %}. These checks are never sent to the repair agent.</p>{% endif %}
   {% if dq.errors %}
   <h3>Checks that errored</h3>
   <div class="tw"><table>

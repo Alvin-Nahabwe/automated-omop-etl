@@ -29,6 +29,9 @@ which the build does), or whose end date has a fallback (the build date, the sta
 literal, a constant: an open episode must stay NULL so that the build ends it at the release date
 or at death), gets a warning.
 
+Eras: with ``derive_eras`` a mapping or custom SQL that loads condition_era or drug_era
+(``compiler.spec_era_tables``) replaces the build's OHDSI era step, and gets a warning.
+
 Routing by domain (``ETLSpec.route_by_domain``): the build moves each event record to the table
 of its concept's domain, so a mapping into an event table that routes by hand (a filter or inner
 join on the domain of {vocab}.concept / concept_relationship), and two mappings of one source table
@@ -65,7 +68,7 @@ import psycopg
 from pydantic import BaseModel
 
 from ..cdm.ddl import create_cdm_tables, create_etl_tables
-from ..cdm.spec import CdmTable, load_cdm_spec
+from ..cdm.spec import DERIVED_ERAS, CdmTable, load_cdm_spec
 from ..config import PrivacyConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, list_columns, qi, rollback_only, short_error
 from ..etl.compiler import (
@@ -77,6 +80,7 @@ from ..etl.compiler import (
     compile_table,
     key_sources,
     source_ref,
+    spec_era_tables,
 )
 from ..etl.policies import OPEN_ENDS
 from ..etl.routing import hand_routing_issue, route_sources, shared_codes, vocab_indexed, vocabulary_domains
@@ -779,6 +783,12 @@ def _static_spec(spec: ETLSpec, cat: _SourceCatalog) -> list[SpecIssue]:
                 "'table_mapping'; persons without an episode get a period from their events automatically",
             )
         )
+    if spec.derive_eras:
+        # spec SQL for an era table (the README's advice before the build derived eras) replaces the step
+        issues += [SpecIssue(severity="warning", target_table=era, message=(
+            f"the spec loads {era} itself, which replaces the build's OHDSI era step (derive_eras): remove that "
+            f"mapping or custom SQL to let the build derive {era} from the {DERIVED_ERAS[era]} records"))
+            for era in sorted(spec_era_tables(spec))]
     issues += _key_source_issues(spec)
     issues += shared_code_issues(spec)
     for vd in vocabulary_domains(spec).values():

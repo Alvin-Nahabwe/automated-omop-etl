@@ -26,7 +26,7 @@ from .config import ProjectConfig
 from .db import Schemas, connect
 from .fsutil import atomic_write_text
 from .llm import LLMClient, make_llm
-from .models import DQReport, ETLRunResult, ETLSpec, MappingDecision, SourceAnnotations, SourceProfile
+from .models import DQReport, ETLRunResult, ETLSpec, MappingDecision, SourceAnnotations, SourceProfile, TableLoadResult
 from .workspace import Workspace
 
 # Called at review gates with (stage, message, artifact paths); returns True to continue. An
@@ -395,7 +395,7 @@ class Pipeline:
             result = run_etl(self.conn, self.schemas, spec or self.validated_spec(), self.cfg, self.ws)
             derived, moved = result.rows_derived(), result.rows_moved()
             self.log(f"  {len(result.steps)} steps, {result.rows_loaded()} rows loaded"
-                     + (f" ({derived} derived by the build: observation periods)" if derived else "")
+                     + (f", {derived} derived by the build (observation periods, eras)" if derived else "")
                      + (f", {moved} records moved to the table of their concept's domain" if moved else "")
                      + f", {len(result.errors())} errors")
             for s in result.errors():
@@ -507,7 +507,7 @@ class Pipeline:
             if best is None or score >= best[0]:
                 best = (score, spec, iteration)
             seen.add(etl, report)
-            if report is not None and report.passed and not self._repairable(report):
+            if report is not None and report.passed and not self._repairable(report, etl):
                 break
             if iteration >= max_iter:
                 self.log(f"  stopping after {max_iter} repair iterations")
@@ -550,20 +550,24 @@ class Pipeline:
         """Higher is better: no records or data lost compared with earlier builds, then gate passed,
         fewer blocking ETL errors, fewer blocking and repairable failures. Losing data ranks below
         any failing check, so a repair that drops records or blanks fields to pass is rolled back."""
-        from .quality.checks import repairable
+        from .quality.checks import derived_tables, repairable
 
         no_loss = not losses
         if report is None:
             return (no_loss, False, -len(etl.blocking_errors()), -10**9, -10**9)
         sev = set(self.cfg.quality.repair_severities)
-        n_repairable = sum(repairable(r, sev) for r in report.results)
+        derived = derived_tables(etl)
+        n_repairable = sum(repairable(r, sev, derived=derived) for r in report.results)
         return (no_loss, report.passed, -len(etl.blocking_errors()), -len(report.blocking_failures), -n_repairable)
 
-    def _repairable(self, report: DQReport) -> bool:
-        from .quality.checks import repairable
+    def _repairable(self, report: DQReport, etl: ETLRunResult | None = None) -> bool:
+        """True when ``report`` has a failure the repair agent should be given (``checks.repairable``;
+        not the checks of the era tables the build of ``etl`` derived)."""
+        from .quality.checks import derived_tables, repairable
 
         sev = set(self.cfg.quality.repair_severities)
-        return any(repairable(r, sev) for r in report.results)
+        derived = derived_tables(etl)
+        return any(repairable(r, sev, derived=derived) for r in report.results)
 
     def report(self, shareable: bool = True) -> None:
         """Write the inspection report, and (by default) the shareable copy beside it, so the two
@@ -638,7 +642,8 @@ class _BuildHistory:
         fill's periods. Not the merged periods: a repair that fixes an episode's dates can join two
         periods into one, and must not count as a loss; this number grows whenever more episodes are
         valid (a person the fill covered who now has a valid episode adds at least as many). The route
-        steps move records between tables after they were counted here, so moves change no total."""
+        steps move records between tables after they were counted here, so moves change no total. The
+        eras the build derives are left out: they follow the condition and drug records counted here."""
         from .cdm.spec import load_cdm_spec
         from .etl.compiler import step_label
 
@@ -646,7 +651,7 @@ class _BuildHistory:
         out: dict[str, int] = {}
         merge = next((s for s in etl.steps if s.kind == "merge" and not s.error and "episodes" in s.stats), None)
         for s in etl.steps:
-            if s.error or not s.target_table or not cdm.has_table(s.target_table):
+            if s.error or not s.target_table or not cdm.has_table(s.target_table) or _is_era_step(s):
                 continue
             n = int(s.rows_inserted or 0)
             if merge is not None and s.target_table == "observation_period":
@@ -702,14 +707,23 @@ class _BuildHistory:
                 out.append(f"{table} has {now_linked} records linked to their visit, {linked} before")
         if report is not None:
             # a table that only received records moved by domain empties when a repair maps their codes
-            # to concepts of the loaded tables' domains: that is not data lost
+            # to concepts of the loaded tables' domains: that is not data lost; nor is an era table the
+            # build derives that empties (its condition or drug records are tracked themselves)
             written = {s.target_table for s in etl.steps if s.kind in (None, "insert", "custom")}
-            exempt = (self.route_only | self._route_only(etl)) - written
+            exempt = ((self.route_only | self._route_only(etl)) - written) | {
+                s.target_table for s in etl.steps if _is_era_step(s)}
             blanked = sorted(r.key for r in report.results
                              if r.not_applicable and r.key in self.applicable and r.table not in exempt)
             if blanked:
                 out.append(f"{len(blanked)} check(s) no longer apply, e.g. {blanked[0]} (a field or table emptied)")
         return out
+
+
+def _is_era_step(s: TableLoadResult) -> bool:
+    """A step that derived an era table (``cdm.spec.DERIVED_ERAS``) from the loaded records."""
+    from .cdm.spec import DERIVED_ERAS
+
+    return s.kind == "derived" and s.target_table in DERIVED_ERAS
 
 
 def _mark_reverted(ws: Workspace, after_iteration: int) -> None:

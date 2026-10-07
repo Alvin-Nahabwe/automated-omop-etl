@@ -85,26 +85,31 @@ def test_step_order_and_targets():
         "15_observation_period",
         "16_observation_period_merge",
         "17_observation_period_fill",
-        "18_cdm_source",
+        "18_condition_era",
+        "19_drug_era",
+        "20_cdm_source",
     ]
     assert [s.kind for s in steps] == ["id_map", "id_map", "insert", "prune", "insert", "prune"] + ["insert"] * 4 + [
-        "route"] * 4 + ["insert", "merge", "derived", "metadata"]
-    # pruning, the merge and the fill run after a failed load too; the route steps need route_prepare
+        "route"] * 4 + ["insert", "merge", "derived", "derived", "derived", "metadata"]
+    # pruning, the merge and the fill run after a failed load too; the route steps need route_prepare,
+    # the eras their event table
     assert [(s.label, s.requires) for s in steps if s.requires] == [
         ("route_condition_occurrence", "route_prepare"), ("route_drug_exposure", "route_prepare"),
-        ("route_measurement", "route_prepare")]
+        ("route_measurement", "route_prepare"), ("condition_era", "condition_occurrence"),
+        ("drug_era", "drug_exposure")]
     # sort keys: (load index of the table, band, sequence); id maps first, cdm_source last
     assert [s.slot for s in steps] == sorted(s.slot for s in steps)
     assert steps[0].slot[0] == steps[1].slot[0] == -1 and steps[-1].slot[0] > len(LOAD_ORDER) - 1
     assert step(steps, "person_map_prune").slot == (LOAD_ORDER.index("person"), 1, 0)
     assert [s.label for s in steps][:3] == ["person_map", "visit_map", "person"]
-    # every step but the route steps is blocking and reads a row count, except the tables that keep
+    # every step but the route and era steps is blocking and reads a row count, except the tables that keep
     # one row per key, whose statement returns its statistics, and the route steps, which return
     # the records they moved; its SQL is its statements (two for the id maps, the visit pruning and
     # route_prepare); the spec kinds. The inserts count the required values they complete or drop
     # (per field, and the dropped rows), the generated steps count nothing
     assert [s.label for s in steps if not s.blocking] == [
-        "route_prepare", "route_condition_occurrence", "route_drug_exposure", "route_measurement"]
+        "route_prepare", "route_condition_occurrence", "route_drug_exposure", "route_measurement", "condition_era",
+        "drug_era"]
     assert [s.label for s in steps if s.returns != "rowcount"] == [
         "person", "visit_occurrence", "death", "route_condition_occurrence", "route_drug_exposure",
         "route_measurement", "observation_period_merge", "observation_period_fill"]
@@ -120,7 +125,7 @@ def test_step_order_and_targets():
     assert {s.kind for s in steps if s.kind in SPEC_KINDS} == {"id_map", "insert"}
     assert target_tables(spec) == [
         "person", "visit_occurrence", "condition_occurrence", "drug_exposure",
-        "measurement", "death", "observation_period", "cdm_source",
+        "measurement", "death", "observation_period", "condition_era", "drug_era", "cdm_source",
     ]
     # placeholders are rendered everywhere
     assert all("{" + k + "}" not in s.sql for s in steps for k in ("cdm", "src", "etl", "vocab"))
@@ -348,7 +353,7 @@ def test_where_joins_and_custom_sql():
     assert names[10:12] == ["11_death", "12_custom_note"]  # before the route block, which follows specimen
     assert names[12:] == ["13_route_prepare", "14_route_condition_occurrence", "15_route_drug_exposure",
                           "16_route_measurement", "17_observation_period", "18_observation_period_merge",
-                          "19_observation_period_fill", "20_cdm_source"]
+                          "19_observation_period_fill", "20_condition_era", "21_drug_era", "22_cdm_source"]
     de = step(steps, "drug_exposure")
     # the joins and the filter apply to the source rows (layer 1), before the id-map joins' rows
     # are counted and before the required-field policies
@@ -399,14 +404,15 @@ def test_custom_sql_runs_at_its_tables_load_order_slot():
         "visit_map_prune", "condition_occurrence", "drug_exposure", "measurement", "death", "custom_va_deaths",
         "custom_specimens", "custom_more_specimens", "route_prepare", "route_condition_occurrence",
         "route_drug_exposure", "route_measurement", "observation_period", "custom_dates",
-        "observation_period_merge", "observation_period_fill", "custom_eras", "custom_other", "cdm_source",
+        "observation_period_merge", "observation_period_fill", "condition_era", "custom_eras", "custom_other",
+        "cdm_source",
     ]
     # a derived observation period follows every spec writer of observation_period, the merge follows it
     spec = spec.model_copy(update={"observation_period": "from_events"})
     spec.table_mappings = [tm for tm in spec.table_mappings if tm.target_table != "observation_period"]
     labels = [s.label for s in compile_spec(spec, S)]
     assert labels[labels.index("route_measurement") + 1:labels.index("custom_eras")] == [
-        "custom_dates", "observation_period", "observation_period_merge"]
+        "custom_dates", "observation_period", "observation_period_merge", "condition_era"]
     assert step_label("05_person_2") == "person_2" and step_label("person") == "person"
 
 

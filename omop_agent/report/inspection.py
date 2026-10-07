@@ -31,10 +31,11 @@ import yaml
 from markupsafe import Markup, escape
 from pydantic import BaseModel
 
-from ..cdm.spec import LOAD_ORDER, load_cdm_spec
+from ..cdm.spec import DERIVED_ERAS, LOAD_ORDER, load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, fetch_all, qi, short_error
-from ..etl.compiler import key_sources, step_label
+from ..design.render import eras_text
+from ..etl.compiler import derived_era_tables, era_status, key_sources, step_label
 from ..etl.routing import ROUTE_PREPARE
 from ..privacy import apply_overrides
 from ..models import (
@@ -479,6 +480,9 @@ def _design_section(spec: ETLSpec) -> dict[str, Any]:
         "visit_key_also": also("visit_occurrence") if spec.visit_key else "",
         "observation_period": spec.observation_period,
         "route_by_domain": spec.route_by_domain,
+        # how each era table is built: derived by the build, loaded by the spec's SQL, or not built
+        "eras": eras_text(spec),
+        "era_status": era_status(spec),
         "n_mappings": len(spec.table_mappings),
         "n_fields": sum(total.values()),
         "kinds_total": [{"kind": k, "n": total[k]} for k in order if total[k]],
@@ -711,7 +715,7 @@ def _etl_section(run: ETLRunResult, min_cell_count: int = 5, shareable: bool = F
         "duration": (end - start).total_seconds() if start and end else None,
         "steps": steps,
         "total_rows": run.rows_loaded(),  # the merge's periods replace rows already counted
-        "derived_rows": run.rows_derived(),
+        "derived_rows": run.rows_derived(),  # apart: observation periods and eras the build derived
         "moved": moved,
         "moved_rows": count(run.rows_moved()) if run.rows_moved() else "",
         "n_errors": len(run.errors()),
@@ -744,7 +748,10 @@ def _tally(results: list[CheckResult], key: Callable[[CheckResult], str], order:
     return rows
 
 
-def _dq_section(dq: DQReport, cfg: ProjectConfig) -> dict[str, Any]:
+def _dq_section(dq: DQReport, cfg: ProjectConfig, derived: set[str] | frozenset[str] = frozenset()) -> dict[str, Any]:
+    """The data-quality results. The failures on the era tables the build derived (``derived``) are
+    listed apart, under the event table each derives from: they follow the condition and drug
+    records, whose own checks come first, and are never sent to the repair agent."""
     blocking_sev = set(cfg.quality.blocking_severities)
 
     def is_blocking(r: CheckResult) -> bool:
@@ -753,8 +760,24 @@ def _dq_section(dq: DQReport, cfg: ProjectConfig) -> dict[str, Any]:
         # quality.checks.gate() writes one line per blocking problem, starting with the check key.
         return r.severity in blocking_sev or any(b == r.key or b.startswith(r.key + " (") for b in dq.blocking_failures)
 
+    def row(r: CheckResult) -> dict[str, Any]:
+        return {
+            "key": r.key,
+            "level": r.check_level,
+            "severity": r.severity,
+            "category": r.category,
+            "violated": r.num_violated_rows,
+            "denominator": r.num_denominator_rows,
+            "pct": _violated_pct(r),
+            "threshold": f"{r.threshold_pct:g}%",
+            "description": r.description,
+            "blocking": is_blocking(r),
+        }
+
     failed = [r for r in dq.results if r.failed and not r.error and not r.not_applicable]
     failed.sort(key=lambda r: (not is_blocking(r), SEVERITIES.index(r.severity), -_violated_pct(r), r.key))
+    eras = [{"table": t, "source": DERIVED_ERAS[t], "failed": [row(r) for r in failed if r.table == t]}
+            for t in DERIVED_ERAS if t in derived]
     return {
         "run_at": fmt_dt(dq.run_at),
         "engine": dq.engine,
@@ -762,21 +785,10 @@ def _dq_section(dq: DQReport, cfg: ProjectConfig) -> dict[str, Any]:
         "n_checks": len(dq.results),
         "by_severity": _tally(dq.results, lambda r: r.severity, SEVERITIES),
         "by_category": _tally(dq.results, lambda r: r.category or "(none)", KAHN_CATEGORIES),
-        "failed": [
-            {
-                "key": r.key,
-                "level": r.check_level,
-                "severity": r.severity,
-                "category": r.category,
-                "violated": r.num_violated_rows,
-                "denominator": r.num_denominator_rows,
-                "pct": _violated_pct(r),
-                "threshold": f"{r.threshold_pct:g}%",
-                "description": r.description,
-                "blocking": is_blocking(r),
-            }
-            for r in failed
-        ],
+        "n_failed": len(failed),
+        "failed": [row(r) for r in failed if r.table not in derived],
+        # the failures on each era table the build derived, under its event table
+        "derived_failed": [g for g in eras if g["failed"]],
         "errors": [
             {"key": r.key, "severity": r.severity, "error": _short(r.error, 600), "blocking": is_blocking(r)}
             for r in dq.results
@@ -966,6 +978,13 @@ def _release_basis(run: ETLRunResult | None) -> str | None:
     if merge is None or not merge.stats.get("release_date"):
         return None
     return "configured" if merge.stats.get("configured") else "derived"
+
+
+def _derived_eras(run: ETLRunResult | None, spec: ETLSpec | None) -> set[str]:
+    """The era tables the build derived: from the steps of the last build, else from the spec."""
+    if run is not None:
+        return {s.target_table for s in run.steps if s.kind == "derived" and s.target_table in DERIVED_ERAS}
+    return set(derived_era_tables(spec)) if spec is not None else set()
 
 
 def characterize_cdm(
@@ -1181,7 +1200,7 @@ def collect_report_data(
     vocab = _vocab_section(vocab_eval, mcc, shareable) if vocab_eval is not None else None
     mapping = _mapping_section(decisions, cfg, shareable) if decisions is not None else None
     etl = _etl_section(etl_run, mcc, shareable) if etl_run else None
-    dq_data = _dq_section(dq, cfg) if dq else None
+    dq_data = _dq_section(dq, cfg, _derived_eras(etl_run, spec)) if dq else None
     notes = list(annotations.notes) if annotations else []
     llm = _llm_section(cfg, ws, audit)
     # Done only when the current dq_results.json holds DQD results; an older successful run in the

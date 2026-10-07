@@ -21,7 +21,7 @@ import json
 import psycopg
 import yaml
 
-from ..cdm.spec import LOAD_ORDER, load_cdm_spec
+from ..cdm.spec import DERIVED_ERAS, LOAD_ORDER, load_cdm_spec
 from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, fetch_all, qi, short_error
 from ..llm import LLMClient, LLMUnavailable
@@ -420,7 +420,8 @@ their events), otherwise 'from_events'.
 target table and its source tables (the first one provides the rows; any others are joined). \
 A CDM table may appear more than once when several source tables feed it. Only plan tables \
 the data supports. Do not plan mappings that only split a source table by the domain of its \
-codes: the build moves each record to the table of its concept's domain.
+codes: the build moves each record to the table of its concept's domain. Do not plan \
+condition_era or drug_era: the build derives them from the condition and drug records.
 5. unmapped_source_tables: source tables you leave out, with the reason in open_questions.
 6. assumptions you made and open_questions for the data owner.
 
@@ -493,7 +494,8 @@ def _need_llm(e: Exception) -> RuntimeError:
 
 
 def _normalise_plan(plan: TablePlan) -> TablePlan:
-    """Keep only CDM targets, make sure person is planned, and a consistent period strategy."""
+    """Keep only CDM targets (not the era tables the build derives), make sure person is planned,
+    and a consistent period strategy."""
     cdm = load_cdm_spec()
     tables: list[PlannedTable] = []
     notes: list[str] = []
@@ -501,6 +503,10 @@ def _normalise_plan(plan: TablePlan) -> TablePlan:
         name = pt.target_table.strip().lower()
         if not cdm.has_table(name) or cdm.table(name).schema_class != "CDM":
             notes.append(f"The plan named '{pt.target_table}', which is not a CDM v5.4 table; it was skipped.")
+            continue
+        if name in DERIVED_ERAS:  # a mapping into an era table would replace the build's OHDSI eras
+            notes.append(f"The plan named {name}, which the build derives from {DERIVED_ERAS[name]} with the OHDSI "
+                         "era logic; it was skipped.")
             continue
         if not pt.source_tables:
             notes.append(f"The plan for {name} named no source table; it was skipped.")

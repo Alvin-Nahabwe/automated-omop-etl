@@ -55,6 +55,11 @@ def strip_literals(sql: str) -> str:
     return _STRIP.sub(" ", sql)
 
 
+def code_text(sql: str) -> str:
+    """``sql`` as it runs: without string literals and comments, with quoted identifiers unquoted."""
+    return _unquote_names(sql)
+
+
 def _unquote_names(sql: str) -> str:
     """``sql`` with string literals and comments removed and quoted identifiers unquoted, so a
     quoted name ("pg_catalog"."set_config"(...)) is seen as the schema or function it names."""

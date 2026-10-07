@@ -387,6 +387,7 @@ def run_etl(
             totals={
                 # route steps move rows (moved_rows); route_prepare's count is ETL bookkeeping
                 "rows_inserted": sum(r.rows_inserted for r in result.steps if r.error is None and r.kind != "route"),
+                "derived_rows": result.rows_derived(),  # of rows_inserted: observation periods, eras
                 "moved_rows": result.rows_moved(),
                 "errors": len(result.errors()),
                 "blocking_errors": len(result.blocking_errors()),

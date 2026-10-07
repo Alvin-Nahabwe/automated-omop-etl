@@ -4,7 +4,9 @@ Check names, thresholds, severities and descriptions come from DQD's own v5.4 me
 (``resources/ohdsi/DQD_OMOP_CDMv5.4_*.csv``), and each check follows the logic of the
 corresponding DQD SQL file, so results line up with the official R package:
 
-* TABLE level: ``measurePersonCompleteness``, ``measureObservationPeriodOverlap``;
+* TABLE level: ``measurePersonCompleteness``, ``measureObservationPeriodOverlap``,
+  ``measureConditionEraCompleteness`` (persons with a condition record, concept not 0, but no
+  condition era; not applicable when condition_occurrence is empty, as DQD 2.8.9);
 * FIELD level: ``isRequired``, ``isPrimaryKey``, ``isForeignKey``, ``fkDomain``, ``fkClass``,
   ``isStandardValidConcept``, ``measureValueCompleteness``, ``standardConceptRecordCompleteness``,
   ``sourceConceptRecordCompleteness``, ``sourceValueCompleteness``, ``plausibleValueLow/High``,
@@ -50,11 +52,19 @@ corresponding DQD SQL file, so results line up with the official R package:
   fatal, threshold 0, not repairable): ``measureDuplicateDeaths`` (persons with more than one
   death record) and ``fkVisitPerson`` (records whose visit belongs to another person);
 * ``withinObservationPeriod`` (FIELD, ours; characterization, 5%): records of an event or era
-  table whose start date lies in no observation period of their person (OMOP allows them).
+  table whose start date lies in no observation period of their person (OMOP allows them);
+* drug eras (TABLE drug_era, ours; convention; not applicable when drug_era is not built):
+  ``measureDrugEraCompleteness`` (persons with a drug exposure that gets an era, i.e. a standard
+  RxNorm / RxNorm Extension ingredient and a days_supply that is not negative, but no drug era:
+  the era build is incomplete; threshold 0) and ``measureDrugEraCoverage`` (drug exposures that
+  get no era: no such ingredient, as vaccines, or a negative days_supply; 5%, counted per
+  distinct drug concept).
 
-The other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``, ``plausibleTemporalAfter``,
-``measureConditionEraCompleteness`` and the concept-level checks) are reported once per
-populated table as not applicable, pointing to the R package (``quality.use_r_dqd``).
+The era checks are never sent to the repair agent, and neither are the checks of the era tables
+the build derived itself (``derived_tables``): the eras follow the condition and drug records,
+whose own checks are. The other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``,
+``plausibleTemporalAfter`` and the concept-level checks) are reported once per populated table as
+not applicable, pointing to the R package (``quality.use_r_dqd``).
 
 A check fails when ``pct_violated_rows * 100 > threshold``. measurePersonCompleteness of a table
 that only receives records moved there by domain (no mapping loads it), and fkDomain of the main
@@ -80,10 +90,27 @@ from typing import Any
 import psycopg
 
 from ..cdm.ddl import schema_for
-from ..cdm.spec import EVENT_DATE_FIELDS, EVENT_FIELD_ROLES, RESOURCE_PKG, ROUTE_SOURCES, load_cdm_spec
+from ..cdm.spec import (
+    DERIVED_ERAS,
+    EVENT_DATE_FIELDS,
+    EVENT_FIELD_ROLES,
+    RESOURCE_PKG,
+    ROUTE_SOURCES,
+    load_cdm_spec,
+)
 from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, fetch_one, qi, ql, short_error
-from ..etl.compiler import ONE_ROW_PER, SPEC_KINDS, mapping_labels, release_rank, step_label, target_tables
+from ..etl.compiler import (
+    ERA_INGREDIENT_VOCABULARIES,
+    ONE_ROW_PER,
+    SPEC_KINDS,
+    derived_era_tables,
+    mapping_labels,
+    release_rank,
+    spec_era_tables,
+    step_label,
+    target_tables,
+)
 from ..etl.policies import END_FROM_START, THEMIS_PARTIAL, WHERE_SITE, partial_policy, required_null_policy
 from ..etl.routing import ROUTE_PREPARE, hand_routed, route_only_tables, route_targets
 from ..models import CheckResult, DQReport, ETLRunResult, ETLSpec, TableLoadResult
@@ -146,7 +173,7 @@ FIELD_CHECKS: list[tuple[str, Any]] = [
     ("plausibleDuringLife", lambda r: r.get("plausibleDuringLife") == _YES),
     ("withinVisitDates", lambda r: r.get("withinVisitDates") == _YES),
 ]
-TABLE_CHECKS = ["measurePersonCompleteness", "measureObservationPeriodOverlap"]
+TABLE_CHECKS = ["measurePersonCompleteness", "measureObservationPeriodOverlap", "measureConditionEraCompleteness"]
 IMPLEMENTED = {name for name, _ in FIELD_CHECKS} | set(TABLE_CHECKS)
 NOT_IMPLEMENTED = "not implemented by the built-in engine; use the R DataQualityDashboard (quality.use_r_dqd)"
 FIELD_SUMMARY = "fieldLevelChecks"
@@ -306,6 +333,7 @@ class _Ctx:
     existing: set[str]
     populated: set[str]
     n_rows: dict[str, int] = field(default_factory=dict)
+    spec: ETLSpec | None = None
     columns: dict[str, set[str]] = field(default_factory=dict)
     non_null: dict[str, dict[str, int]] = field(default_factory=dict)
 
@@ -520,11 +548,15 @@ def _has_rows(conn: psycopg.Connection, schemas: Schemas, table: str) -> bool:
 
 def _populated_tables(conn: psycopg.Connection, schemas: Schemas, existing: set[str], spec: ETLSpec | None) -> set[str]:
     if spec is not None:
-        # every table the compiled spec writes, incl. the derived observation_period and cdm_source,
-        # and the route destinations that received records (one that received none is not checked)
+        # every table the compiled spec writes, incl. the derived observation_period, eras and
+        # cdm_source, and the route destinations that received records (one that received none is not
+        # checked); an era the build derives is populated when its event table is (also when the
+        # era has no rows: its event records got none, or its step failed)
         names = {m.target_table for m in spec.table_mappings} | {c.target_table for c in spec.custom_sql}
-        out = {n.lower() for n in names} | set(target_tables(spec)) | {"person", "observation_period", "cdm_source"}
-        return out | {t for t in route_targets(spec) if t not in out and t in existing and _has_rows(conn, schemas, t)}
+        out = set(target_tables(spec)) | {n.lower() for n in names} | spec_era_tables(spec)
+        out |= {"person", "observation_period", "cdm_source"}
+        out |= {t for t in route_targets(spec) if t not in out and t in existing and _has_rows(conn, schemas, t)}
+        return out - {era for era in derived_era_tables(spec) if DERIVED_ERAS[era] not in out}
     return {t for t in existing if _has_rows(conn, schemas, t)}
 
 
@@ -546,6 +578,10 @@ def _table_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
     meta = dqd_table_level().get(table, {})
     out: list[CheckResult] = []
     catalog = check_catalog()
+    if meta.get("measureConditionEraCompleteness") == _YES and "measureConditionEraCompleteness" in catalog:
+        res = _new("measureConditionEraCompleteness", "TABLE", table, None,
+                   _threshold(meta, "measureConditionEraCompleteness"))
+        out.append(_era_completeness(ctx, res))
     if meta.get("measurePersonCompleteness") == _YES and "measurePersonCompleteness" in catalog:
         res = _new("measurePersonCompleteness", "TABLE", table, None, _threshold(meta, "measurePersonCompleteness"))
         if table not in ctx.populated or "person" not in ctx.existing:
@@ -560,7 +596,114 @@ def _table_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
             out.append(res.model_copy(update={"not_applicable": True}))
         else:
             out.append(_evaluate(ctx, res, _observation_period_overlap_sql(ctx)))
+    if table == "drug_era":
+        out += _drug_era_checks(ctx)
     return out
+
+
+def _era_not_built(ctx: _Ctx, table: str) -> str:
+    """Why the era table ``table`` is not among the populated tables, for a check's description."""
+    if ctx.spec is not None and not ctx.spec.derive_eras:
+        return f" {table} is not built: derive_eras is false and no spec SQL loads it."
+    return f" {table} has no rows."
+
+
+def _era_completeness(ctx: _Ctx, res: CheckResult) -> CheckResult:
+    """``measureConditionEraCompleteness`` (DQD 2.8.9): the persons with a condition record
+    (concept not 0) that have no condition era. Not applicable when condition_occurrence is missing
+    or empty, as DQD; evaluated (and failed) when condition_era is not built, as DQD, but then a
+    person decides (``derive_eras``), not the repair agent. Never sent to the repair agent: the eras
+    derive from the records, which their own checks cover."""
+    if "condition_occurrence" not in ctx.existing or "condition_occurrence" not in ctx.populated \
+            or not ctx.n_rows.get("condition_occurrence"):
+        return res.model_copy(update={"not_applicable": True, "repairable": False})
+    res = res.model_copy(update={"repairable": False})
+    if "condition_era" not in ctx.populated:
+        res = res.model_copy(update={"description": res.description + _era_not_built(ctx, "condition_era")})
+    with_record = f"FROM {ctx.t('condition_occurrence')} s WHERE s.condition_concept_id <> 0"
+    return _evaluate(ctx, res, _q(
+        f"SELECT COUNT(DISTINCT s.person_id) {with_record} AND NOT EXISTS (SELECT 1 FROM {ctx.t('condition_era')} e "
+        "WHERE e.person_id = s.person_id)",
+        f"SELECT COUNT(DISTINCT s.person_id) {with_record}",
+    ))
+
+
+def _drugs_with_ingredient(ctx: _Ctx, more: bool = False) -> list[str]:
+    """The CTE ``ok`` over a CTE ``c`` of drug concepts: those that roll up to a standard Ingredient
+    of ``ERA_INGREDIENT_VOCABULARIES`` in concept_ancestor, as in the drug_era step (``more``: another
+    CTE follows)."""
+    vocab, vocabularies = qi(ctx.schemas.vocab), ", ".join(ql(v) for v in ERA_INGREDIENT_VOCABULARIES)
+    return [
+        "ok AS (",
+        "    SELECT DISTINCT ca.descendant_concept_id AS drug_concept_id",
+        f"    FROM {vocab}.concept_ancestor ca JOIN {vocab}.concept i ON i.concept_id = ca.ancestor_concept_id",
+        "    WHERE ca.descendant_concept_id IN (SELECT drug_concept_id FROM c)",
+        f"      AND i.concept_class_id = 'Ingredient' AND i.vocabulary_id IN ({vocabularies}) AND i.standard_concept = 'S'",
+        ")," if more else ")",
+    ]
+
+
+def _drug_era_checks(ctx: _Ctx) -> list[CheckResult]:
+    """Ours, on drug_era (convention, never sent to the repair agent; not applicable when
+    drug_exposure is empty or drug_era is not built):
+
+    * ``measureDrugEraCompleteness`` (threshold 0): the persons with a drug exposure that gets an
+      era (its drug has a standard RxNorm / RxNorm Extension ingredient in concept_ancestor and its
+      days_supply is not negative, as the drug_era step reads them) who have no drug era: the era
+      build is incomplete. The analogue of measureConditionEraCompleteness, where every record with
+      a concept gets an era;
+    * ``measureDrugEraCoverage`` (5%): the drug exposures that get no era because their drug has no
+      such ingredient (vaccines, most of them), or because their days_supply is negative; one
+      lookup per distinct drug concept."""
+    names = " or ".join(ERA_INGREDIENT_VOCABULARIES)
+    complete = CheckResult(
+        check_name="measureDrugEraCompleteness", check_level="TABLE", table="drug_era",
+        description="The number and percent of persons with a drug_exposure record that gets a drug era (its drug has "
+        f"a standard Ingredient of {names} in concept_ancestor, and its days_supply is not negative) who have no "
+        "drug_era record: the drug_era build is incomplete. Exposures that get no era (vaccines, other drugs without "
+        "such an ingredient, a negative days_supply) are counted by measureDrugEraCoverage.",
+        category="Completeness", severity="convention", threshold_pct=0.0, repairable=False,
+    )
+    coverage = CheckResult(
+        check_name="measureDrugEraCoverage", check_level="TABLE", table="drug_era",
+        description="The number and percent of drug_exposure records (drug_concept_id not 0) that get no drug_era: "
+        f"their drug has no standard Ingredient of {names} in concept_ancestor, or their days_supply is negative. "
+        "Most are vaccines (a CVX vaccine, or an RxNorm Extension vaccine whose ingredient is deprecated, such as BCG "
+        "36882756); a drug that should have an ingredient means a wrong concept mapping, a negative days_supply a "
+        "source error.",
+        category="Completeness", severity="convention", threshold_pct=5.0, repairable=False,
+    )
+    if "drug_exposure" not in ctx.populated or not ctx.n_rows.get("drug_exposure"):
+        return [r.model_copy(update={"not_applicable": True}) for r in (complete, coverage)]
+    if "drug_era" not in ctx.populated:
+        return [r.model_copy(update={"not_applicable": True, "description": r.description
+                                     + _era_not_built(ctx, "drug_era")}) for r in (complete, coverage)]
+    D = ctx.t("drug_exposure")
+    return [
+        _evaluate(ctx, complete, "\n".join([
+            "WITH c AS (",
+            f"    SELECT DISTINCT d.drug_concept_id FROM {D} d WHERE d.drug_concept_id <> 0",
+            "),",
+            *_drugs_with_ingredient(ctx, more=True),
+            "p AS (  -- the persons with an exposure that gets an era",
+            f"    SELECT DISTINCT d.person_id FROM {D} d JOIN ok USING (drug_concept_id)",
+            "    WHERE COALESCE(d.days_supply, 0) >= 0",
+            ")",
+            f"SELECT (SELECT COUNT(*) FROM p WHERE NOT EXISTS (SELECT 1 FROM {ctx.t('drug_era')} e "
+            "WHERE e.person_id = p.person_id)) AS num_violated_rows,",
+            "       (SELECT COUNT(*) FROM p) AS num_denominator_rows",
+        ])),
+        _evaluate(ctx, coverage, "\n".join([
+            "WITH c AS (",
+            "    SELECT d.drug_concept_id, COUNT(*) AS n, COUNT(*) FILTER (WHERE d.days_supply < 0) AS neg",
+            f"    FROM {D} d WHERE d.drug_concept_id <> 0 GROUP BY d.drug_concept_id",
+            "),",
+            *_drugs_with_ingredient(ctx),
+            "SELECT COALESCE(SUM(CASE WHEN ok.drug_concept_id IS NULL THEN c.n ELSE c.neg END), 0) AS num_violated_rows,",
+            "       COALESCE(SUM(c.n), 0) AS num_denominator_rows",
+            "FROM c LEFT JOIN ok USING (drug_concept_id)",
+        ])),
+    ]
 
 
 def _field_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
@@ -828,13 +971,16 @@ def etl_checks(
 
 def _step_error_text(s: TableLoadResult) -> str:
     """The description of a step's etlStepError. A route step loads nothing: when it fails, the
-    records of its table stay where they were loaded."""
+    records of its table stay where they were loaded; an era step that fails leaves its table empty."""
     if s.kind == "route" and step_label(s.step) == ROUTE_PREPARE:
         return (f"ETL step '{s.step}' (preparing the moves of records to the table of their concept's domain) failed, "
                 f"so no record was moved: {s.error}")
     if s.kind == "route":
         return (f"ETL step '{s.step}' moving {s.target_table} records to the table of their concept's domain failed; "
                 f"they stay in {s.target_table}, where they were loaded: {s.error}")
+    if s.kind == "derived" and s.target_table in DERIVED_ERAS:
+        return (f"ETL step '{s.step}' deriving {s.target_table} from {DERIVED_ERAS[s.target_table]} failed, so "
+                f"{s.target_table} is empty; the build goes on without it: {s.error}")
     return f"ETL step '{s.step}' loading {s.target_table} failed: {s.error}"
 
 
@@ -1478,6 +1624,14 @@ def is_listed_check(r: CheckResult, entries: list[str]) -> bool:
     return any(e == r.check_name or e == r.key or r.key.startswith(e + ".") for e in entries)
 
 
+def derived_tables(etl_result: ETLRunResult | None) -> set[str]:
+    """The era tables the build derived in ``etl_result`` (its condition_era / drug_era steps, also
+    when they failed or were skipped): the ``derived`` tables of ``repairable``."""
+    if etl_result is None:
+        return set()
+    return {s.target_table for s in etl_result.steps if s.kind == "derived" and s.target_table in DERIVED_ERAS}
+
+
 def repairable(
     r: CheckResult,
     severities: set[str] | list[str],
@@ -1488,9 +1642,9 @@ def repairable(
     """True when ``r`` is a failure the repair agent should be given: failed or errored, applicable,
     with a severity in ``severities``, and caused by something the spec tools can change. Never:
     results marked ``repairable=False`` (e.g. errors of generated steps), checks on the tables this
-    build derived from other tables rather than from the spec (``derived``, e.g. eras built by the
-    build's own steps; an era table the spec loads stays repairable), and person completeness of
-    tables that only receive records moved there by domain (``route_only``)."""
+    build derived from other tables rather than from the spec (``derived``: the eras built by the
+    build's own steps, ``derived_tables``; an era table the spec loads stays repairable), and person
+    completeness of tables that only receive records moved there by domain (``route_only``)."""
     if r.repairable is False or r.not_applicable or not (r.failed or r.error) or r.severity not in severities:
         return False
     if r.table in derived:
@@ -1553,7 +1707,7 @@ def run_builtin_checks(
             columns.setdefault(r["table_name"], set()).add(r["column_name"])
         cdm_tables = [t.name for t in cdm.cdm_tables]
         existing = {t for t in cdm_tables if t in columns}
-        ctx = _Ctx(conn, schemas, existing, _populated_tables(conn, schemas, existing, spec), columns=columns)
+        ctx = _Ctx(conn, schemas, existing, _populated_tables(conn, schemas, existing, spec), columns=columns, spec=spec)
         for t in cdm_tables:
             if t in existing and t in ctx.populated:
                 _table_facts(ctx, t)

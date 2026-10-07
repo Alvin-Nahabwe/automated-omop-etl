@@ -293,9 +293,15 @@ runs the demo inside it.
   warns, and every build reports such a mapping as a failed `etlHandRouting` check (convention,
   not sent to the repair agent); remove the hand-made routing, or set `route_by_domain: false`.
   Approvals of such specs stay valid, so look at the warning before the next build.
-* The eras (`condition_era`, `drug_era`), `visit_detail`, `note`/NLP and `cost` tables are not
-  generated automatically; add them as table mappings or `custom_sql` in the spec.
-* The built-in checks cover most of DQD's table and field checks (19 of 27 check types, and
+* `condition_era` and `drug_era` are derived by the build with the OHDSI era logic
+  (`derive_eras`, on by default; drug eras per standard RxNorm or RxNorm Extension ingredient, so
+  vaccines without an ingredient get none, see `measureDrugEraCoverage`). Spec SQL that loads an
+  era table replaces the build's step for that table and runs at its place (the validator warns:
+  remove such SQL, written when eras had to be added by hand, to get the OHDSI eras), and
+  post-processing the built eras is not supported. `dose_era` is not built (OHDSI publishes no script for it). `visit_detail`,
+  `note`/NLP and `cost` are not generated automatically; add them as table mappings or
+  `custom_sql` in the spec.
+* The built-in checks cover most of DQD's table and field checks (20 of 27 check types, and
   they agree with DQD wherever both run). Concept-level checks (plausible gender, plausible
   units), the schema checks and Achilles need the official R route: the R image
   (`Dockerfile.r`, see docs/deploy.md), or R installed with `deploy/r/install_r_dqd.sh`, and
@@ -313,4 +319,6 @@ runs the demo inside it.
 The OMOP CDM v5.4 DDL and field metadata, and the Data Quality Dashboard check metadata, come
 from [OHDSI/CommonDataModel](https://github.com/OHDSI/CommonDataModel) and
 [OHDSI/DataQualityDashboard](https://github.com/OHDSI/DataQualityDashboard) (Apache License
-2.0). See `omop_agent/resources/ohdsi/NOTICE`.
+2.0). See `omop_agent/resources/ohdsi/NOTICE`. The tests compare the eras with the OHDSI era
+scripts of [OHDSI/ETL-Synthea](https://github.com/OHDSI/ETL-Synthea) (Apache License 2.0),
+translated to PostgreSQL; see `tests/fixtures/NOTICE`.

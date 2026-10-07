@@ -39,7 +39,8 @@ A full compile yields ordered steps. Each step has a sort key ``slot`` = (load i
 table, band, sequence), and the steps are stably sorted on it: the id maps come first; then,
 table by table in CDM load order (``cdm.spec.LOAD_ORDER``), the table's writers (band 0: its
 mappings in spec order, then its custom SQL; custom SQL of a table without a mapping runs at
-that table's place too, not after everything) and the steps generated for it (band 1); after
+that table's place too, not after everything, and custom SQL that inserts into an era table at
+that era table's place) and the steps generated for it (band 1); after
 the last writer of the event tables (specimen, band 2) the route block moves records to the table
 of their concept's domain (``etl.routing``: ``route_prepare``, then one non-blocking
 ``route_<table>`` step per routed table), before payer_plan_period, cost, the observation periods
@@ -52,7 +53,11 @@ release date (``cdm_source.source_release_date``, or one derived robustly from t
 stored in ``{etl}.build_facts`` for the cdm_source row) or at death, real exits are never clipped,
 episodes that end before they start are dropped, and overlapping or back-to-back episodes become
 one period (periods derived from the events are never open). With ``observation_period: table_mapping`` the ``observation_period_fill`` step then
-gives every person without a period one from their first to their last event. After the person
+gives every person without a period one from their first to their last event. With
+``derive_eras`` the ``condition_era`` and ``drug_era`` steps then build the OHDSI eras from the
+condition and drug records as routed (``derived_era_tables``: not when spec SQL loads the era
+table, which replaces the step); they are not blocking and are skipped when a load of their event
+table failed. After the person
 (and visit_occurrence) writers an id-map pruning
 step retires the keys that did not become a row, so events of people or visits that a mapping
 filtered out are dropped (or get a NULL visit) instead of pointing at rows that do not exist.
@@ -73,10 +78,11 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
-from ..cdm.spec import EVENT_DATE_FIELDS, LOAD_ORDER, CdmField, CdmTable, load_cdm_spec
+from ..cdm.spec import DERIVED_ERAS, EVENT_DATE_FIELDS, LOAD_ORDER, CdmField, CdmTable, load_cdm_spec
 from ..config import CdmSourceConfig, EtlConfig
 from ..db import Schemas, qi, ql
 from ..models import CustomSQL, ETLSpec, FieldMapping, KeySpec, TableMapping
+from ..sqlguard import code_text
 from .policies import (
     END_FROM_START,
     OPEN_END,
@@ -1718,6 +1724,204 @@ def _cdm_source_sql(cdm_source: CdmSourceConfig | None) -> str:
 
 
 # --------------------------------------------------------------------------------------
+# eras
+# --------------------------------------------------------------------------------------
+
+# Records of one person and concept that start at most this many days after the earlier ones
+# ended form one era (the OHDSI persistence window).
+ERA_PAD_DAYS = 30
+# The ingredients a drug exposure rolls up to (concept_ancestor): the standard Ingredient concepts
+# of these vocabularies. The published script reads RxNorm only, which leaves the drugs that exist
+# only in RxNorm Extension (many products marketed outside the US) without an era.
+ERA_INGREDIENT_VOCABULARIES = ("RxNorm", "RxNorm Extension")
+# A drug exposure that ends before it starts ends after its days_supply when that is plausible.
+ERA_MAX_DAYS_SUPPLY = 365
+# Spec SQL that loads an era table whatever its target_table says: an INSERT INTO the era table in
+# {cdm}, in a schema named as written, or unqualified (not in {src}, {vocab}, {etl} or {results}).
+_ERA_INSERT = re.compile(r"\binsert\s+into\s+(?:(?:\{cdm\}|\w+)\s*\.\s*)?(condition_era|drug_era)\b", re.I)
+
+
+def era_inserts(sql: str) -> set[str]:
+    """The era tables that custom SQL ``sql`` inserts into (``INSERT INTO {cdm}.drug_era``, also
+    as ``cdm.drug_era`` or ``drug_era``), not counting text in string literals or comments."""
+    return {m.group(1).lower() for m in _ERA_INSERT.finditer(code_text(sql))}
+
+
+def spec_era_tables(spec: ETLSpec) -> set[str]:
+    """The era tables the spec loads itself: the target of a mapping or custom SQL, or a table that
+    custom SQL inserts into (``era_inserts``). Its SQL replaces the built-in step for that table
+    and runs at that table's place (``compile_spec``)."""
+    out = {t for t in (*(tm.target_table.lower() for tm in spec.table_mappings),
+                       *(cs.target_table.lower() for cs in spec.custom_sql)) if t in DERIVED_ERAS}
+    for cs in spec.custom_sql:
+        out |= era_inserts(cs.sql)
+    return out
+
+
+def derived_era_tables(spec: ETLSpec, loaded: set[str] | list[str] | None = None) -> list[str]:
+    """The era tables the build derives (``DERIVED_ERAS``), with ``derive_eras``: those whose event
+    table is in ``loaded`` (default: the tables the spec writes and the route destinations) and that
+    no spec SQL loads (``spec_era_tables``)."""
+    if not spec.derive_eras:
+        return []
+    if loaded is None:
+        written = {tm.target_table.lower() for tm in spec.table_mappings} | {cs.target_table.lower()
+                                                                            for cs in spec.custom_sql}
+        loaded = written | set(route_targets(spec))
+    built = spec_era_tables(spec)
+    return [era for era, source in DERIVED_ERAS.items() if source in loaded and era not in built]
+
+
+def era_status(spec: ETLSpec) -> dict[str, str]:
+    """How each era table of ``DERIVED_ERAS`` is built: 'derived' (the build's OHDSI era step),
+    'spec' (the spec's own SQL), 'off' (``derive_eras: false``) or 'no_records' (its event table
+    is not loaded)."""
+    derived, own = derived_era_tables(spec), spec_era_tables(spec)
+    return {era: "derived" if era in derived else "spec" if era in own else "off" if not spec.derive_eras
+            else "no_records" for era in DERIVED_ERAS}
+
+
+def _era_islands(gap_days: bool) -> list[str]:
+    """The CTEs ``marked``, ``numbered`` and ``eras`` over a CTE ``target`` (rid, person_id,
+    concept_id, start_date, end_date): the records of a person and concept, in order of start, end
+    and a unique record id (so both windows see one order, also among ties), start a new era when
+    they begin more than ``ERA_PAD_DAYS`` days after every earlier record ended; an era runs from
+    its earliest start to its latest end. With ``gap_days`` the days between those records that no
+    record covers are summed."""
+    lines = [
+        "marked AS (",
+        "    -- the latest end of the earlier records of the person and concept",
+        "    SELECT t.*,",
+        "           MAX(t.end_date) OVER (PARTITION BY t.person_id, t.concept_id ORDER BY t.start_date, t.end_date, t.rid",
+        "                                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_end",
+        "    FROM target t",
+        "),",
+        "numbered AS (",
+        f"    -- a record starts a new era when it begins more than {ERA_PAD_DAYS} days after every earlier one ended",
+        "    SELECT m.*,",
+        f"           SUM(CASE WHEN m.start_date <= m.prev_end + {ERA_PAD_DAYS} THEN 0 ELSE 1 END)",
+        "               OVER (PARTITION BY m.person_id, m.concept_id ORDER BY m.start_date, m.end_date, m.rid",
+        "                     ROWS UNBOUNDED PRECEDING) AS era_no",
+        "    FROM marked m",
+        "),",
+        "eras AS (",
+        "    SELECT person_id, concept_id, MIN(start_date) AS start_date, MAX(end_date) AS end_date, COUNT(*) AS n"
+        + ("," if gap_days else ""),
+    ]
+    if gap_days:
+        lines.append(f"           SUM(CASE WHEN start_date <= prev_end + {ERA_PAD_DAYS} THEN GREATEST(start_date - prev_end, 0)"
+                     " ELSE 0 END) AS gap_days  -- days no record covers")
+    return lines + ["    FROM numbered", "    GROUP BY person_id, concept_id, era_no", ")"]
+
+
+def _condition_era_sql() -> str:
+    """The condition_era step: the OHDSI condition eras."""
+    header = (
+        "condition_era: the OHDSI condition eras (CommonDataModel / ETL-Synthea condition era script): the condition "
+        f"records of one person and condition_concept_id that start at most {ERA_PAD_DAYS} days after the earlier "
+        "ones ended form one era, from the earliest start to the latest end. A record without an end date, or "
+        "with an end before its start, ends the day after it starts. Records with condition_concept_id 0 get no "
+        "era. Ties are broken by condition_occurrence_id."
+    )
+    return "\n".join([
+        _comment(textwrap.fill(header, 100)),
+        "INSERT INTO {cdm}.condition_era (",
+        "    condition_era_id,",
+        "    person_id,",
+        "    condition_concept_id,",
+        "    condition_era_start_date,",
+        "    condition_era_end_date,",
+        "    condition_occurrence_count",
+        ")",
+        "WITH target AS (",
+        "    SELECT co.condition_occurrence_id AS rid,",
+        "           co.person_id,",
+        "           co.condition_concept_id AS concept_id,",
+        "           co.condition_start_date AS start_date,",
+        "           CASE WHEN co.condition_end_date >= co.condition_start_date THEN co.condition_end_date",
+        "                ELSE co.condition_start_date + 1 END AS end_date",
+        "    FROM {cdm}.condition_occurrence co",
+        "    WHERE co.condition_concept_id <> 0",
+        "),",
+        *_era_islands(gap_days=False),
+        "SELECT",
+        "    ((SELECT COALESCE(MAX(condition_era_id), 0) FROM {cdm}.condition_era)",
+        "        + ROW_NUMBER() OVER (ORDER BY e.person_id, e.concept_id, e.start_date))::integer,",
+        "    e.person_id,",
+        "    e.concept_id,",
+        "    e.start_date,",
+        "    e.end_date,",
+        "    e.n::integer",
+        "FROM eras e;",
+    ])
+
+
+def _drug_era_sql() -> str:
+    """The drug_era step: the OHDSI drug eras (non-stockpiling) per ingredient."""
+    vocabularies = ", ".join(ql(v) for v in ERA_INGREDIENT_VOCABULARIES)
+    header = (
+        "drug_era: the OHDSI drug eras (CommonDataModel / ETL-Synthea drug era script, non-stockpiling). Each drug "
+        "exposure rolls up to its ingredients (concept_ancestor: the standard Ingredient concepts of "
+        f"{' and '.join(ERA_INGREDIENT_VOCABULARIES)}); the exposures of one person and ingredient that start at "
+        f"most {ERA_PAD_DAYS} days after the earlier ones ended form one era, from the earliest start to the latest "
+        "end, and gap_days counts the days of the era no exposure covers. An exposure that ends before it starts "
+        f"ends after its days_supply (start + days_supply - 1, THEMIS) when that is 1 to {ERA_MAX_DAYS_SUPPLY} days, "
+        "else on its start. Exposures with drug_concept_id 0 or a negative days_supply, and drugs without such an "
+        "ingredient, get no era. Ties are broken by drug_exposure_id."
+    )
+    return "\n".join([
+        _comment(textwrap.fill(header, 100)),
+        "INSERT INTO {cdm}.drug_era (",
+        "    drug_era_id,",
+        "    person_id,",
+        "    drug_concept_id,",
+        "    drug_era_start_date,",
+        "    drug_era_end_date,",
+        "    drug_exposure_count,",
+        "    gap_days",
+        ")",
+        "WITH ingredient AS (",
+        "    SELECT ca.descendant_concept_id AS drug_concept_id, ca.ancestor_concept_id AS ingredient_concept_id",
+        "    FROM {vocab}.concept_ancestor ca",
+        "    JOIN {vocab}.concept c ON c.concept_id = ca.ancestor_concept_id",
+        "    WHERE c.concept_class_id = 'Ingredient'",
+        f"      AND c.vocabulary_id IN ({vocabularies})",
+        "      AND c.standard_concept = 'S'",
+        "      AND ca.descendant_concept_id IN (SELECT de.drug_concept_id FROM {cdm}.drug_exposure de"
+        " WHERE de.drug_concept_id <> 0)",
+        "),",
+        "target AS (",
+        "    SELECT d.drug_exposure_id AS rid,",
+        "           d.person_id,",
+        "           i.ingredient_concept_id AS concept_id,",
+        "           d.drug_exposure_start_date AS start_date,",
+        "           CASE WHEN d.drug_exposure_end_date >= d.drug_exposure_start_date THEN d.drug_exposure_end_date",
+        f"                WHEN d.days_supply BETWEEN 1 AND {ERA_MAX_DAYS_SUPPLY}"
+        " THEN d.drug_exposure_start_date + d.days_supply - 1",
+        "                ELSE d.drug_exposure_start_date END AS end_date",
+        "    FROM {cdm}.drug_exposure d",
+        "    JOIN ingredient i ON i.drug_concept_id = d.drug_concept_id",
+        "    WHERE d.drug_concept_id <> 0",
+        "      AND COALESCE(d.days_supply, 0) >= 0",
+        "),",
+        *_era_islands(gap_days=True),
+        "SELECT",
+        "    ((SELECT COALESCE(MAX(drug_era_id), 0) FROM {cdm}.drug_era)",
+        "        + ROW_NUMBER() OVER (ORDER BY e.person_id, e.concept_id, e.start_date))::integer,",
+        "    e.person_id,",
+        "    e.concept_id,",
+        "    e.start_date,",
+        "    e.end_date,",
+        "    e.n::integer,",
+        "    e.gap_days::integer",
+        "FROM eras e;",
+    ])
+
+
+_ERA_SQL: dict[str, Callable[[], str]] = {"condition_era": _condition_era_sql, "drug_era": _drug_era_sql}
+
+
+# --------------------------------------------------------------------------------------
 # whole spec
 # --------------------------------------------------------------------------------------
 
@@ -1737,14 +1941,16 @@ def _in_load_order(names: set[str] | list[str]) -> list[str]:
 
 
 def target_tables(spec: ETLSpec) -> list[str]:
-    """Every CDM table the compiled spec writes (incl. observation_period, cdm_source), in load
-    order. The tables only the route steps write are not in it (``etl.routing.route_targets``): a
-    route destination that received no record is not a populated table."""
+    """Every CDM table the compiled spec writes (incl. observation_period, the era tables the build
+    derives or the spec's SQL loads, and cdm_source), in load order. The tables only the route
+    steps write are not in it (``etl.routing.route_targets``): a route destination that received no
+    record is not a populated table."""
     names = {tm.target_table.lower() for tm in spec.table_mappings}
-    names |= {cs.target_table.lower() for cs in spec.custom_sql}
+    names |= {cs.target_table.lower() for cs in spec.custom_sql} | spec_era_tables(spec)
     if spec.observation_period == "from_events":
         names.add("observation_period")
     names.add("cdm_source")
+    names |= set(derived_era_tables(spec, names | set(route_targets(spec))))
     return _in_load_order(names)
 
 
@@ -1808,7 +2014,9 @@ def compile_spec(
                                 error=f"compile error: {e}", slot=slot)
         steps.append(step)
     for j, cs in enumerate(spec.custom_sql):
-        t = cs.target_table.lower()
+        # custom SQL that loads an era table runs at that table's place, after routing and the
+        # observation periods (it replaces the era step), also when its target_table comes earlier
+        t = max([cs.target_table.lower(), *sorted(era_inserts(cs.sql))], key=_load_index)
         seq = _CUSTOM_AFTER_MAPPINGS + j if t in seen_count else j
         steps.append(_custom_step(cs, slot=(_load_index(t), 0, seq)))
 
@@ -1859,6 +2067,13 @@ def compile_spec(
         if fill is not None:
             steps.append(CompiledStep("observation_period_fill", "observation_period", "derived", fill,
                                       returns="row", slot=(op_index, 1, 1)))
+
+    # the eras, at their tables' places: after routing (the records where they end up, deduplicated)
+    # and after the observation periods. Each needs its event table loaded; not blocking: an error
+    # (e.g. no concept_ancestor) is reported and the build goes on without that era table
+    for era in derived_era_tables(spec, loaded):
+        steps.append(CompiledStep(era, era, "derived", _ERA_SQL[era](), requires=DERIVED_ERAS[era], blocking=False,
+                                  slot=(_load_index(era), 0, 0)))
 
     steps.append(CompiledStep("cdm_source", "cdm_source", "metadata", _cdm_source_sql(cdm_source),
                               slot=(len(LOAD_ORDER) + 1, 0, 0)))  # last, after custom SQL of unknown tables

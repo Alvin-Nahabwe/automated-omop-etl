@@ -324,6 +324,7 @@ def test_spec_page_shows_the_design_and_changes_since_approval(site):
     login(client, "rita")
     page = client.get("/p/demo/spec").text
     assert "Approve the ETL design" in page and "condition_occurrence" in page
+    assert "<dt>Eras</dt><dd>condition_era derived by the build from condition_occurrence (OHDSI era logic)" in page
     record_approval(ws, "design", "rita")
     ws.spec_yaml.write_text(ws.spec_yaml.read_text().replace("Sex code 9", "Sex code 9 (edited)"))
     page = client.get("/p/demo/spec").text

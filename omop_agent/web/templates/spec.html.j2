@@ -56,6 +56,7 @@
     <dt>One row per key</dt><dd>person and death: one per person; visit_occurrence: one per visit and person, from the earliest start to the latest end of its rows</dd>
     <dt>Observation periods</dt><dd>{% if spec.observation_period == 'from_events' %}from the first and last event of each person{% else %}from a table mapping, one row per episode; the build merges each person's overlapping and back-to-back episodes, ends open ones at the source release date (configured, or derived from the exit dates) or at death, drops episodes that end before they start, and gives persons without a valid episode a period from their events{% endif %}</dd>
     <dt>Routing by domain</dt><dd>{% if spec.route_by_domain %}after loading, every condition, procedure, drug, device and measurement record whose standard concept belongs to another event domain moves to that domain's table (a measurement with a result goes to observation); records with concept 0 stay{% else %}off: records stay in the table that loads them{% endif %}</dd>
+    <dt>Eras</dt><dd>{{ eras }}</dd>
     <dt>CDM tables filled</dt><dd>{{ spec.table_mappings|map(attribute='target_table')|join(', ') }}</dd>
   </dl>
   {% if spec.assumptions %}<h3>Assumptions</h3><ul>{% for a in spec.assumptions %}<li>{{ a }}</li>{% endfor %}</ul>{% endif %}
