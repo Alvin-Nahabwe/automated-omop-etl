@@ -48,5 +48,5 @@
       }
     }
   ],
-  "final_text": "The visit_occurrence insert failed because visit_end_date is required but clinic_visits.discharge_date is empty for every OPD and EMERG visit: the counts of visits without a discharge date equal the OPD and EMERG totals, and no IPD visit lacks one (only IPD stays have a discharge date). I changed visit_end_date to COALESCE(v.discharge_date::date, v.visit_date::date), so single-day visits end on their start date. No data-quality results were available yet because the build stopped at this error."
+  "final_text": "etlDefaultedValue flagged visit_end_date: it was NULL for 2870 of 3228 visits, and the build gave those visits their start date. The counts show why: clinic_visits.discharge_date is empty for every OPD and EMERG visit and for no IPD visit (only inpatient stays have a discharge date). Ending a visit without a discharge date on its start date is the OMOP convention, so the loaded dates were right, but the spec should say so rather than rely on the fallback: I changed visit_end_date to COALESCE(v.discharge_date::date, v.visit_date::date). Single-day visits now end on their start date by design, and inpatient stays keep their discharge date."
 }

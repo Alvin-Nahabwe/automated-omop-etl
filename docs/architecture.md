@@ -81,7 +81,7 @@ a Rabbit-in-a-Hat document, and it compiles directly to SQL. Each `TableMapping`
 
 | kind | SQL |
 |---|---|
-| `column`, `expression`, `constant` | the expression, cast to the CDM column type |
+| `column`, `expression`, `constant` | the expression, cast to the CDM column type; a NULL required value follows the CDM convention (see "How a mapping compiles") |
 | `person_id` | `JOIN etl.person_map pm ON pm.source_value = (expr)::text`: unmatched rows are dropped (and counted). Required for every `person_id` field, including `person.person_id` |
 | `visit_id` | `LEFT JOIN etl.visit_map` (INNER when the field is required) |
 | `auto_id` | `max(existing id) + ROW_NUMBER() OVER ()`, so several mappings can feed one table |
@@ -108,12 +108,50 @@ truncated to `n` characters. The `cdm_source` row is generated from `cdm_source`
 0 if that vocabulary isn't loaded. Placeholders `{cdm}`, `{vocab}`, `{src}`, `{etl}`, `{results}` in
 expressions and custom SQL resolve to the configured schemas.
 
+### How a mapping compiles
+
+The `SELECT` of a mapping's `INSERT` has layers. Each one is fenced with `OFFSET 0`, so
+PostgreSQL neither merges them nor evaluates a value twice:
+
+1. **Source rows.** The mapping's `FROM`, joins and `WHERE`, the id-map joins, every
+   `column` / `expression` / `constant` / id value, and the code of every lookup (`_k1`, ...).
+   Each value is computed once per source row.
+2. **Required values.** A required field that comes out NULL follows the CDM convention
+   (`etl/policies.py`, derived from the CDM v5.4 field list) instead of failing the whole table
+   on its NOT NULL constraint:
+
+   | Required field | NULL becomes | Counted as |
+   |---|---|---|
+   | a concept (`*_concept_id`) | 0 | `defaulted` |
+   | `visit_end_date`, `visit_detail_end_date`, `drug_exposure_end_date` | the start date | `defaulted` |
+   | `observation_period_end_date` | left as written (the load fails, as before) | - |
+   | any other: start and event dates, `year_of_birth`, `death_date`, `note_text`, ... | the row is dropped | `required_null` per field, `row.dropped` |
+
+   This layer is left out when no required field is computed from the source.
+3. **Lookups.** The vocabulary and `source_to_concept_map` joins on the layer-1 codes,
+   `auto_id` and `null` fields. A code with several targets inserts several rows, but the counts
+   above are per source row.
+
+The counters are transaction-local settings (`omop_agent.<category>__<field>`) that the
+helper functions in the ETL schema (`etl/functions.sql`: `omop_count`, `omop_drop`,
+`omop_default_int`, `omop_derived_date`, `omop_derived_ts`) increase, only for the rows they count.
+The runner reads them at the end of the step into `TableLoadResult.value_counts`, and
+`retained_rows` is the rows that survived the id-map joins (`id_retained_rows`) minus the
+dropped rows. So `etlRecordRetention` and the fatal `etlRecordLoss` see the drops.
+`create_etl_tables` installs the functions with a version stamp: a version change must be
+installed once by their owner, and a build role needs EXECUTE on them (PUBLIC by default). Spec
+SQL may not call them (`sqlguard.py`).
+
 ## Quality gate and repair loop
 
 The built-in checks re-implement the Data Quality Dashboard field- and table-level checks in
 PostgreSQL. Names, thresholds and severities are read from DQD's own v5.4 metadata (bundled in
 `resources/ohdsi`), so results line up with DQD. An extra `etlRecordRetention` check compares
-source rows with rows kept after the person/visit joins for each table mapping. DQD checks the
+source rows with rows kept after the person/visit joins and the required-field policies for
+each table mapping. `etlRequiredFieldNull` reports, per field, rows dropped for a NULL required
+value (convention; threshold 0 for `person`, because a dropped person takes their records along,
+5% elsewhere), and `etlDefaultedValue` the NULL required values the build completed (convention,
+5%), so the repair agent can write a better fallback where the source has one. DQD checks the
 built-in engine doesn't implement are listed as not applicable, and so is each empty table, as a
 single summary row. The run passes when no check with a
 blocking severity (default `fatal`) fails, no check listed in `quality.blocking_checks` fails

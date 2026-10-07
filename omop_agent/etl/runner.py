@@ -45,14 +45,14 @@ from ..db import Schemas, execute, fetch_all, fetch_one, qi, scalar, short_error
 from ..models import ETLRunResult, ETLSpec, RoutedRows, TableLoadResult
 from ..workspace import Workspace, utcnow
 from .compiler import CompiledStep, compile_spec, target_tables
+from .policies import ROW_SITE
 from .session import apply_session, session_sql
 
-# Value counters a step can report per site (a CDM field or 'where'), and the site whose
-# 'dropped' counter counts rows dropped for a NULL required value: value_counts['row']['dropped'].
+# Value counters a step can report per site (a CDM field or 'where'); the site ROW_SITE has one
+# counter, 'dropped', the rows dropped for a NULL required value: value_counts['row']['dropped'].
 VALUE_COUNT_CATEGORIES = (
     "invalid", "imputed", "partial_null", "offset_ignored", "offset_converted", "defaulted", "required_null",
 )
-ROW_SITE = "row"
 # Steps after which the tables they wrote are ANALYZEd.
 _ANALYZED_KINDS = {"insert", "custom", "route", "merge", "derived"}
 # The id maps and the keys they retired, ANALYZEd after the last id-map step and after pruning.

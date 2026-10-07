@@ -39,6 +39,7 @@ include = ["omop_agent*"]
 [tool.setuptools.package-data]
 omop_agent = [
     "resources/ohdsi/*",
+    "etl/*.sql",
     "report/templates/*",
     "web/templates/*",
     "web/static/*",

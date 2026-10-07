@@ -289,6 +289,41 @@ def test_custom_sql_is_reviewed_and_guarded():
     assert sql_safety_issues(CustomSQL(name="x", target_table="death", sql=ok)) == []
 
 
+def test_sqlguard_denies_internal_counters():
+    from omop_agent.sqlguard import fragment_issues
+
+    # the build's own helper functions keep the counts of values it could not load as written
+    for sql in ("{etl}.omop_count('visit_end_date', 'defaulted')", "etl . omop_drop (ARRAY['x'], ARRAY[true])",
+                'COALESCE(v.d, "etl"."omop_derived_date"(\'visit_end_date\', v.s))', "omop_default_int('x', 0)"):
+        assert any("internal function of the build" in x for x in fragment_issues(sql)), sql
+    # a quoted name is the function or schema it names
+    assert any("set_config()" in x for x in fragment_issues('"set_config"(\'a\', \'b\', true)'))
+    assert any("ETL SQL: pg_catalog" in x for x in fragment_issues('"pg_catalog"."set_config"(\'role\', \'none\', true)'))
+    assert fragment_issues('x."update" + x."pg_catalog"') == []  # quoted columns are fine
+    # a backslash escapes only in E'...' strings (standard_conforming_strings, pinned by the
+    # session settings), so a call between two '\' strings is seen
+    for sql, call in ((r"v.d + (length('\' || {etl}.omop_count('visit_end_date', 'defaulted')::text || '\') * 0)",
+                       "omop_count()"),
+                      (r"v.visit_type || ('\' || set_config('role', 'none', true) || '\')", "set_config()"),
+                      (r"name'\' || omop_count('x', 'defaulted')::text || '\'", "omop_count()")):
+        assert any(call in x for x in fragment_issues(sql)), sql
+    for sql in (r"regexp_replace(d.icd10, '\.', '')", r"E'it\'s ' || x", r"replace(x, '\', '/')"):
+        assert fragment_issues(sql) == [], sql
+    # a Unicode-escaped name can spell any function
+    for sql in (r"""U&"\006Fmop_count"('a', 'b')""", r"x || u&'\0041'"):
+        assert any("Unicode-escaped" in x for x in fragment_issues(sql)), sql
+    assert fragment_issues("x.u & 1") == []
+    # columns, literals and other functions are fine
+    for sql in ("v.omop_count + 1", "'omop_count(1)'", "{etl}.try_date(x.d)", "my_omop_code(x)", '"omop_code"'):
+        assert fragment_issues(sql) == [], sql
+    spec = set_field(load_ref(), "visit_occurrence", "visit_end_date",
+                     expression="COALESCE(v.discharge_date::date, {etl}.omop_derived_date('visit_end_date', v.visit_date::date))")
+    assert has(validate_spec(spec), "visit_occurrence", "visit_end_date", "may not call: omop_derived_date()")
+    spec = load_ref().model_copy(deep=True)
+    spec.custom_sql = [CustomSQL(name="x", target_table="death", sql="SELECT {etl}.omop_drop(ARRAY['a'], ARRAY[true])")]
+    assert "omop_drop()" in sql_safety_issues(spec.custom_sql[0])[0]
+
+
 def test_direct_identifiers_are_not_loaded():
     profile = demo_profile()
     spec = set_field(load_ref(), "person", "person_source_value", expression="i.first_name || ' ' || i.last_name")

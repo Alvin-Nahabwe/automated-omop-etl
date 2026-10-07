@@ -219,6 +219,43 @@ def test_a_failed_person_load_hides_the_retention_it_causes():
     assert "etlRecordLoss.condition_occurrence" in [r.key for r in etl_checks(etl)]
 
 
+def test_required_value_checks():
+    steps = [
+        TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=399, source_rows=400,
+                        id_retained_rows=400, retained_rows=399, value_counts={
+                            "required_null": {"year_of_birth": 1}, "defaulted": {"gender_concept_id": 4},
+                            "row": {"dropped": 1}}),
+        TableLoadResult(target_table="visit_occurrence", step="05_visit_occurrence", kind="insert", rows_inserted=100,
+                        source_rows=100, id_retained_rows=100, retained_rows=100,
+                        value_counts={"defaulted": {"visit_end_date": 70}}),
+        TableLoadResult(target_table="measurement", step="09_measurement_2", kind="insert", rows_inserted=97,
+                        source_rows=110, id_retained_rows=100, retained_rows=95,
+                        value_counts={"required_null": {"measurement_date": 5}, "row": {"dropped": 5}}),
+        # older results: no id_retained_rows, the source rows are the denominator
+        TableLoadResult(target_table="death", step="10_death", rows_inserted=9, source_rows=10, retained_rows=9,
+                        value_counts={"required_null": {"death_date": 1}}),
+    ]
+    results = [r for r in etl_checks(ETLRunResult(started_at=NOW, steps=steps))
+               if r.check_name in ("etlRequiredFieldNull", "etlDefaultedValue")]
+    assert [(r.key, r.num_violated_rows, r.num_denominator_rows, r.threshold_pct, r.failed) for r in results] == [
+        # a person dropped for a missing birth year fails at once: their records go with them
+        ("etlRequiredFieldNull.person.year_of_birth", 1, 400, 0.0, True),
+        ("etlDefaultedValue.person.gender_concept_id", 4, 400, 5.0, False),
+        ("etlDefaultedValue.visit_occurrence.visit_end_date", 70, 100, 5.0, True),
+        ("etlRequiredFieldNull.measurement.measurement_date.measurement_2", 5, 100, 5.0, False),  # exactly 5%
+        ("etlRequiredFieldNull.death.death_date", 1, 10, 5.0, True),
+    ]
+    assert all(r.severity == "convention" and r.check_level == "ETL" and r.repairable is None for r in results)
+    assert "became 0 (no matching concept)" in results[1].description
+    assert "took the start date (visit_start_date)" in results[2].description
+    assert "required field person.year_of_birth was NULL" in results[0].description
+    # a failed step reports its error, not its counts
+    failed = steps[1].model_copy(update={"error": "boom"})
+    assert [r.check_name for r in etl_checks(ETLRunResult(started_at=NOW, steps=[failed]))] == ["etlStepError"]
+    sev = {"fatal", "convention"}
+    assert [repairable(r, sev) for r in results] == [True, False, True, False, True]
+
+
 def test_rows_loaded_leaves_out_the_id_maps():
     etl = ETLRunResult(started_at=NOW, steps=[
         TableLoadResult(target_table="person_map", step="01_person_map", kind="id_map", rows_inserted=400),
@@ -985,6 +1022,27 @@ def test_repair_prompt_suppresses_small_counts(tmp_path):
                            error='invalid input syntax for type date: "31/02/1990"')
     prompt = build_repair_prompt(spec, 1, [step], [], cfg)
     assert "source rows: <5" in prompt and "31/02/1990" not in prompt and '"<value withheld>"' in prompt
+
+
+def test_repair_prompt_shows_a_long_insert_from_its_source_rows(tmp_path):
+    from omop_agent.db import Schemas
+    from omop_agent.etl.compiler import compile_table
+
+    cfg = plain_config(tmp_path)
+    spec = load_ref()
+    sql = compile_table(spec.mapping_for("visit_occurrence"), spec,
+                        Schemas(cdm="cdm", vocab="vocab", src="src", etl="etl", results="results"))
+    assert len(sql) > 1500 and sql.index("discharge_date") > 1500  # the expressions are in the last layer
+    defaulted = CheckResult(check_name="etlDefaultedValue", check_level="ETL", table="visit_occurrence",
+                            field="visit_end_date", description="d", severity="convention", num_violated_rows=70,
+                            num_denominator_rows=100, pct_violated_rows=0.7, threshold_pct=5, failed=True, sql=sql)
+    prompt = build_repair_prompt(spec, 1, [], [defaulted], cfg)
+    shown = prompt.split("check SQL:\n```sql\n", 1)[1].split("```", 1)[0]
+    assert shown.startswith("-- (the INSERT column list and the outer SELECTs are left out)\n-- 1) the source rows")
+    assert "v.discharge_date" in shown and "FROM src.clinic_visits v" in shown
+    # a short statement is shown as it is
+    short = defaulted.model_copy(update={"sql": "SELECT 1"})
+    assert "check SQL:\n```sql\nSELECT 1\n```" in build_repair_prompt(spec, 1, [], [short], cfg)
 
 
 @pytest.mark.postgres

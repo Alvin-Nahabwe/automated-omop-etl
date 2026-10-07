@@ -49,6 +49,10 @@ def test_demo_end_to_end(demo_project):
     repairs = [RepairAction.model_validate(r) for r in json.loads((ws_root / "repairs.json").read_text())]
     fields = {(r.target_table, r.target_field) for r in repairs}
     assert ("visit_occurrence", "visit_end_date") in fields
+    # the missing visit end dates no longer fail the load: the build gives them the start date and
+    # reports it, and that report is what the agent repairs
+    visit_end = next(r for r in repairs if r.target_field == "visit_end_date")
+    assert visit_end.iteration == 1 and visit_end.trigger == "etlDefaultedValue.visit_occurrence.visit_end_date"
     assert ("condition_occurrence", "condition_concept_id") in fields
     spec = ETLSpec.model_validate(__import__("yaml").safe_load((ws_root / "etl_spec.yaml").read_text()))
     assert "COALESCE" in next(f.expression for f in spec.mapping_for("visit_occurrence").fields if f.target_field == "visit_end_date")
@@ -189,17 +193,20 @@ def test_harmful_repair_is_reverted(demo_project, tmp_path):
     shutil.copytree(FIXTURE_REPLAY, replay)
     it3 = replay / "repair" / "iteration_3.json"
     data = json.loads(it3.read_text())
+    # back to the design bug: outpatient visits have no end date again, so the build gives them their
+    # start date and fails etlDefaultedValue, one more repairable failure than the build before
     data["tool_calls"].append({"name": "update_field_mapping", "input": {
         "target_table": "visit_occurrence", "target_field": "visit_end_date", "kind": "expression",
-        "expression": "v.discharge_date::date", "rationale": "a change that compiles but fails at runtime",
+        "expression": "v.discharge_date::date", "rationale": "a change that leaves most visits without an end date",
     }})
     it3.write_text(json.dumps(data))
     cfg = load_config(demo_project)
     cfg.llm.replay_dir = replay
     report = Pipeline(cfg, log=lambda m: None).run_all()
     assert report.passed
-    events = [e["event"] for e in json.loads("[" + ",".join((cfg.workdir / "audit.jsonl").read_text().split("\n")[:-1]) + "]")]
-    assert "repair_reverted" in events
+    events = json.loads("[" + ",".join((cfg.workdir / "audit.jsonl").read_text().split("\n")[:-1]) + "]")
+    assert "repair_reverted" in [e["event"] for e in events]
+    assert not any(e["event"] == "etl_run" and not e["ok"] for e in events)  # every build loaded the visits
     spec = ETLSpec.model_validate(__import__("yaml").safe_load((cfg.workdir / "etl_spec.yaml").read_text()))
     end = next(f for f in spec.mapping_for("visit_occurrence").fields if f.target_field == "visit_end_date")
     assert "COALESCE" in end.expression

@@ -1,11 +1,21 @@
 """Compile an ``ETLSpec`` into PostgreSQL.
 
-Each ``TableMapping`` becomes one ``INSERT INTO {cdm}.<table> (...) SELECT ... FROM
-{src}.<table> <alias> [JOIN ...] [WHERE ...]``. Field kinds compile as described in
-``docs/architecture.md`` ("The ETL spec"): expressions are cast to the CDM column type,
-``person_id`` / ``visit_id`` resolve through the id maps, ``auto_id`` continues after the
+Each ``TableMapping`` becomes one ``INSERT INTO {cdm}.<table> (...) SELECT ...`` over the
+mapping's ``FROM {src}.<table> <alias> [JOIN ...] [WHERE ...]``. Field kinds compile as
+described in ``docs/architecture.md`` ("The ETL spec"): expressions are cast to the CDM column
+type, ``person_id`` / ``visit_id`` resolve through the id maps, ``auto_id`` continues after the
 largest existing key, and concept lookups (``vocab_code``, ``concept_map``) become LEFT JOINs
-whose result is 0 when a source value exists but has no mapping.
+whose result is 0 when a source value exists but has no mapping. The SELECT has layers, each
+fenced with ``OFFSET 0`` so the planner neither merges them nor evaluates a value twice:
+
+1. the source rows (joins, WHERE, id-map joins), with every value computed once per row and the
+   code of every lookup as a column ``_k<n>``;
+2. the required-field policies (``etl.policies``): a NULL required concept becomes 0, a NULL
+   visit / visit_detail / drug_exposure end date the start date, and a row with another NULL
+   required value is dropped; each counted per field in transaction-local settings that the
+   runner reads into ``value_counts`` (``CompiledStep.count_sites``);
+3. the vocabulary lookups, ``auto_id`` and NULL fields, in the outer SELECT, so a code with several
+   targets cannot multiply the counts.
 
 A full compile yields ordered steps. Each step has a sort key ``slot`` = (load index of its
 table, band, sequence), and the steps are stably sorted on it: the id maps come first; then,
@@ -26,13 +36,14 @@ review, so it is laid out one field per line with the field kind as a trailing c
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from ..cdm.spec import EVENT_DATE_FIELDS, LOAD_ORDER, CdmField, CdmTable, load_cdm_spec
 from ..config import CdmSourceConfig
 from ..db import Schemas, qi, ql
 from ..models import CustomSQL, ETLSpec, FieldMapping, KeySpec, TableMapping
+from .policies import END_FROM_START, POLICY_KINDS, ROW_SITE, Policy, required_null_policy
 
 StepKind = Literal["id_map", "insert", "custom", "prune", "route", "merge", "derived", "metadata"]
 # Steps that run the spec's own SQL (keys, mappings, custom SQL): only their errors are sent to
@@ -46,6 +57,17 @@ _AFTER_SPEC_WRITERS = 20_000
 
 # Kinds whose ``expression`` must be given.
 _NEEDS_EXPRESSION = {"column", "expression", "constant", "concept_map", "vocab_code", "person_id", "visit_id"}
+# Kinds whose value layer 1 of the INSERT computes from the source row (the others are computed
+# in layer 3: lookups, generated ids, NULL).
+_LAYER_1_KINDS = frozenset({"column", "expression", "constant", "person_id", "visit_id"})
+# Aliases of the layers inside the INSERT: the rows the outer SELECT reads (layer 2, or layer 1
+# when no required-field policy applies), and layer 1 inside layer 2. The user's aliases are not
+# visible there, so they cannot clash.
+_ROWS = "s"
+_VALUES = "v"
+# The comment that opens layer 1, where the spec's expressions, joins and WHERE are: the repair
+# prompt shows a long INSERT from there (quality.repair).
+LAYER_1_MARKER = "-- 1) the source rows"
 # Keys that other tables link to through an id map: (table, field) -> the kind that fills them.
 ID_MAP_KEYS = {("person", "person_id"): "person_id", ("visit_occurrence", "visit_occurrence_id"): "visit_id"}
 _ALIAS_REF = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)")
@@ -113,6 +135,10 @@ def _norm(expr: str) -> str:
     return " ".join(expr.split())
 
 
+def _is_datetime(f: CdmField) -> bool:
+    return f.datatype.strip().lower() in ("datetime", "timestamp")
+
+
 def cast_to(expr: str, datatype: str) -> str:
     """Cast ``expr`` to the SQL type of a CDM field datatype (``integer``, ``varchar(50)``, ...)."""
     dt = datatype.strip().lower()
@@ -175,13 +201,18 @@ def _comment(text: str) -> str:
 
 
 class _Joins:
-    """Lookup joins generated for one INSERT, with alias allocation that avoids user aliases."""
+    """The joins generated for one INSERT, with alias allocation that avoids user aliases: the
+    id-map joins of layer 1, and the vocabulary lookups of layer 3 with the layer-1 columns
+    (``_k1``, ...) that carry their source expressions."""
 
     def __init__(self, taken: set[str]):
         self.taken = set(taken)
         self.counters: dict[str, int] = {}
-        self.lines: list[str] = []
-        self.id_lines: list[str] = []  # INNER id-map joins: they drop rows (see retained_count_sql)
+        self.id_joins: list[str] = []  # person/visit id-map joins (layer 1)
+        self.id_lines: list[str] = []  # the INNER ones: they drop rows (see retained_count_sql)
+        self.lines: list[str] = []  # lookup joins (layer 3)
+        self.keys: dict[str, str] = {}  # normalised lookup expression -> its layer-1 column
+        self.key_exprs: list[tuple[str, str]] = []  # (layer-1 column, expression)
         self.vocab: dict[tuple[str, str], dict[str, str | None]] = {}
         self.stcm: dict[tuple[str, str], str] = {}
         self._vocab_line_index: dict[tuple[str, str], int] = {}
@@ -197,10 +228,21 @@ class _Joins:
         self.taken.add(name)
         return name
 
+    def key(self, expr: str) -> str:
+        """The source expression of a lookup, as a column of the rows layer 3 reads: it is evaluated
+        once per source row in layer 1, below the lookups that can fan rows out."""
+        k = _norm(expr)
+        name = self.keys.get(k)
+        if name is None:
+            name = f"_k{len(self.keys) + 1}"
+            self.keys[k] = name
+            self.key_exprs.append((name, expr))
+        return f"{_ROWS}.{name}"
+
     def person(self, expr: str) -> str:
         a = self.alias("pm")
         line = f"INNER JOIN {{etl}}.person_map {a} ON {a}.source_value = {_p(expr)}::text"
-        self.lines.append(line)
+        self.id_joins.append(line)
         self.id_lines.append(line)
         return f"{a}.person_id"
 
@@ -208,7 +250,7 @@ class _Joins:
         a = self.alias("vm")
         jt = "INNER" if inner else "LEFT"
         line = f"{jt} JOIN {{etl}}.visit_map {a} ON {a}.source_value = {_p(expr)}::text"
-        self.lines.append(line)
+        self.id_joins.append(line)
         if inner:
             self.id_lines.append(line)  # a LEFT join on the map's unique key neither drops nor adds rows
         return f"{a}.visit_occurrence_id"
@@ -222,7 +264,7 @@ class _Joins:
             self.vocab[key] = g
             self._vocab_line_index[key] = len(self.lines)
             self.lines.append(
-                f"LEFT JOIN {{vocab}}.concept {sc} ON {sc}.concept_code = {_p(expr)}::text"
+                f"LEFT JOIN {{vocab}}.concept {sc} ON {sc}.concept_code = ({self.key(expr)})::text"
                 f" AND {sc}.vocabulary_id = {ql(vocabulary)}"
             )
         if standard and g["tc"] is None:
@@ -248,7 +290,7 @@ class _Joins:
             a = self.alias("m")
             self.stcm[key] = a
             self.lines.append(
-                f"LEFT JOIN {{etl}}.source_to_concept_map {a} ON {a}.source_code = {_p(expr)}::text"
+                f"LEFT JOIN {{etl}}.source_to_concept_map {a} ON {a}.source_code = ({self.key(expr)})::text"
                 f" AND {a}.source_vocabulary_id = {ql(vocabulary)} AND {a}.invalid_reason IS NULL"
             )
         return f"{a}.source_concept_id" if source_role else f"{a}.target_concept_id"
@@ -291,7 +333,8 @@ def _field_value(fm: FieldMapping, f: CdmField, table: CdmTable, tm: TableMappin
         else:
             value = joins.concept_map(expr, vocab, source_role=fm.concept_role == "source")
         when_null = "0" if f.required else "NULL"
-        return cast_to(f"CASE WHEN {_p(expr)} IS NULL THEN {when_null} ELSE COALESCE({value}, 0) END", f.datatype)
+        return cast_to(f"CASE WHEN ({joins.key(expr)}) IS NULL THEN {when_null} ELSE COALESCE({value}, 0) END",
+                       f.datatype)
     raise CompileError(f"{where}: unknown field kind '{kind}'")  # pragma: no cover - pydantic guards kinds
 
 
@@ -318,13 +361,110 @@ def _check_mapping(tm: TableMapping) -> CdmTable:
     return table
 
 
+@dataclass
+class _Compiled:
+    """One table mapping, compiled (placeholders kept)."""
+
+    insert: str  # the INSERT ... SELECT
+    retained: str  # the retained-row COUNT (see retained_count_sql)
+    count_sites: tuple[str, ...] = ()  # the value-counter sites the INSERT can set
+    required: dict[str, Policy] = field(default_factory=dict)  # required field -> the NULL policy applied
+    returns: Literal["rowcount", "row", "rows"] = "rowcount"
+
+
 def _compile_insert(tm: TableMapping, spec: ETLSpec) -> str:
     """Unrendered INSERT (placeholders kept)."""
-    return _compile(tm, spec)[0]
+    return _compile(tm, spec).insert
 
 
-def _compile(tm: TableMapping, spec: ETLSpec) -> tuple[str, str]:
-    """Unrendered (INSERT, retained-row COUNT) of one table mapping."""
+def _select_list(items: list[tuple[str, str]]) -> list[str]:
+    """``SELECT`` lines: one ``value AS name`` (or a bare column) per item, with an optional trailing comment."""
+    lines = []
+    for i, (item, note) in enumerate(items):
+        sep = "," if i < len(items) - 1 else ""
+        lines.append(f"    {item}{sep}" + (f"  -- {note}" if note else ""))
+    return lines
+
+
+def _required_policies(table: CdmTable, values: list[tuple[CdmField, FieldMapping, str]]) -> dict[str, Policy]:
+    """The NULL policy (``etl.policies``) applied to each required field whose value layer 1 computes
+    from the source. 'open' (observation_period_end_date) is left as written until the build merges
+    observation periods, so a NULL end still fails that load."""
+    in_layer_1 = {f.name for f, fm, _ in values if fm.kind in _LAYER_1_KINDS}
+    out: dict[str, Policy] = {}
+    for f, fm, _ in values:
+        if not f.required or fm.kind not in POLICY_KINDS:
+            continue
+        policy = required_null_policy(table.name, f.name)
+        if policy == "start" and END_FROM_START[(table.name, f.name)] not in in_layer_1:
+            policy = "drop"  # no start date to take
+        if policy in ("zero", "start", "drop"):
+            out[f.name] = policy
+    return out
+
+
+def _source_rows(tm: TableMapping, joins: _Joins, layer_1: list[tuple[CdmField, FieldMapping, str]]) -> list[str]:
+    """Layer 1: the source rows after the mapping's joins and WHERE and the id-map joins, with every
+    value computed from the source once, and the source expression of every lookup (``_k1``, ...)."""
+    items: list[tuple[str, str]] = [(f"{v} AS {qi(f.name)}", fm.kind) for f, fm, v in layer_1]
+    items += [(f"{_p(expr)} AS {k}", "lookup source") for k, expr in joins.key_exprs]
+    rows = [
+        f"{LAYER_1_MARKER}: every value computed once per row, below the lookups that can fan out",
+        "SELECT", *_select_list(items), *_from_clause(tm), *joins.id_joins,
+    ]
+    if tm.where and tm.where.strip():
+        rows.append(f"WHERE {_p(tm.where)}")
+    return rows + ["OFFSET 0"]  # a fence: the planner neither merges the layers nor evaluates a value twice
+
+
+def _required_values(
+    table: CdmTable, layer_1: list[tuple[CdmField, FieldMapping, str]], joins: _Joins,
+    required: dict[str, Policy], rows: list[str],
+) -> list[str]:
+    """Layer 2 over the layer-1 ``rows``: required values that are NULL get the CDM convention of
+    their field (``required``), and each one is counted. Rows with a NULL drop-policy field are
+    dropped; the counters are called only on the NULL branches."""
+
+    def col(name: str) -> str:
+        return f"{_VALUES}.{qi(name)}"
+
+    items: list[tuple[str, str]] = []
+    for f, _, _ in layer_1:
+        name, policy = f.name, required.get(f.name)
+        if policy == "zero":
+            items.append((f"CASE WHEN {col(name)} IS NULL THEN {{etl}}.omop_default_int({ql(name)}, 0)"
+                          f" ELSE {col(name)} END AS {qi(name)}", "NULL -> 0 (counted)"))
+        elif policy == "start":
+            start = END_FROM_START[(table.name, name)]
+            derived = "omop_derived_ts" if _is_datetime(f) else "omop_derived_date"
+            items.append((f"COALESCE({col(name)}, {{etl}}.{derived}({ql(name)}, {col(start)})) AS {qi(name)}",
+                          f"NULL -> {start} (counted)"))
+        else:
+            items.append((col(name), "NULL: the row is dropped (counted)" if policy == "drop" else ""))
+    items += [(f"{_VALUES}.{k}", "") for k, _ in joins.key_exprs]
+    out = [
+        "-- 2) required values that are NULL: the CDM convention, counted per field",
+        "SELECT", *_select_list(items), "FROM (", *_indent(rows), f") {_VALUES}",
+    ]
+    drops = [name for name, p in required.items() if p == "drop"]
+    if drops:
+        present = " AND ".join(f"{col(n)} IS NOT NULL" for n in drops)
+        names = ", ".join(ql(n) for n in drops)
+        nulls = ", ".join(f"{col(n)} IS NULL" for n in drops)
+        out += [f"WHERE CASE WHEN {present} THEN true",
+                f"           ELSE {{etl}}.omop_drop(ARRAY[{names}], ARRAY[{nulls}]) END"]
+    return out + ["OFFSET 0"]
+
+
+def _compile(tm: TableMapping, spec: ETLSpec) -> _Compiled:
+    """One table mapping as an INSERT whose SELECT has three layers (see "How a mapping compiles"
+    in docs/architecture.md), and its retained-row COUNT:
+
+    1. the source rows (``_source_rows``), fenced so that each value is computed once per row;
+    2. the required-field policies (``_required_values``), only when one applies;
+    3. the outer SELECT: vocabulary lookups (on the layer-1 ``_k`` columns), ``auto_id`` and NULL
+       fields, and the other values as computed below.
+    """
     table = _check_mapping(tm)
     by_name = {fm.target_field: fm for fm in tm.fields}
     ordered = [(f, by_name[f.name]) for f in table.fields if f.name in by_name]
@@ -332,6 +472,16 @@ def _compile(tm: TableMapping, spec: ETLSpec) -> tuple[str, str]:
         raise CompileError(f"{table.name}: the mapping has no fields")
     joins = _Joins({tm.source.alias.lower()} | {j.alias.lower() for j in tm.joins})
     values = [(f, fm, _field_value(fm, f, table, tm, spec, joins)) for f, fm in ordered]
+    required = _required_policies(table, values)
+    layer_1 = [(f, fm, v) for f, fm, v in values if fm.kind in _LAYER_1_KINDS]
+    rows = _source_rows(tm, joins, layer_1)
+    if required:
+        rows = _required_values(table, layer_1, joins, required, rows)
+    items: list[tuple[str, str]] = [
+        (f"{_ROWS}.{qi(f.name)}", "") if fm.kind in _LAYER_1_KINDS else (f"{v} AS {qi(f.name)}", fm.kind)
+        for f, fm, v in values
+    ]
+    select = ["SELECT", *_select_list(items), "FROM (", *_indent(rows), f") {_ROWS}", *joins.lines]
 
     header = f"{table.name} <- {tm.source.table} ({tm.source.alias})"
     if tm.joins:
@@ -341,16 +491,9 @@ def _compile(tm: TableMapping, spec: ETLSpec) -> tuple[str, str]:
         out.append(_comment(tm.rationale))
     out.append(f"INSERT INTO {{cdm}}.{qi(table.name)} (")
     out += [f"    {qi(f.name)}{',' if i < len(values) - 1 else ''}" for i, (f, _, _) in enumerate(values)]
-    out.append(")")
-    out.append("SELECT")
-    for i, (f, fm, v) in enumerate(values):
-        sep = "," if i < len(values) - 1 else ""
-        out.append(f"    {v} AS {qi(f.name)}{sep}  -- {fm.kind}")
-    out += _from_clause(tm)
-    out += joins.lines
-    if tm.where and tm.where.strip():
-        out.append(f"WHERE {_p(tm.where)}")
-    return "\n".join(out) + ";", _source_count(tm, joins.id_lines)
+    out += [")", *select]
+    sites = tuple(required) + ((ROW_SITE,) if "drop" in required.values() else ())
+    return _Compiled("\n".join(out) + ";", _source_count(tm, joins.id_lines), count_sites=sites, required=required)
 
 
 def _source_count(tm: TableMapping, id_joins: list[str] | None = None) -> str:
@@ -377,7 +520,7 @@ def retained_count_sql(tm: TableMapping, spec: ETLSpec, schemas: Schemas) -> str
     source_to_concept_map rows) inserts several CDM rows, and that fan-out must not hide rows
     that were dropped. Raises ``CompileError``.
     """
-    return schemas.render(_compile(tm, spec)[1])
+    return schemas.render(_compile(tm, spec).retained)
 
 
 # --------------------------------------------------------------------------------------
@@ -699,10 +842,10 @@ def compile_spec(
         label = t if seen_count[t] == 1 else f"{t}_{seen_count[t]}"
         slot = (_load_index(t), 0, i)
         try:
-            sql, retained = _compile(tm, spec)
+            c = _compile(tm, spec)
             step = CompiledStep(
-                label, t, "insert", sql, source_table=tm.source.table,
-                source_count_sql=_source_count(tm), retained_count_sql=retained, origins=(tm,), slot=slot,
+                label, t, "insert", c.insert, source_table=tm.source.table, source_count_sql=_source_count(tm),
+                retained_count_sql=c.retained, origins=(tm,), returns=c.returns, count_sites=c.count_sites, slot=slot,
             )
         except CompileError as e:
             if strict:

@@ -38,9 +38,11 @@ open ./omop-demo/work/report.html
 
 The recorded design contains two realistic bugs. One is an outpatient `visit_end_date` that is
 NULL; the other is ICD-10 codes written without the dot. The demo shows the loop at work: the
-load fails, the repair agent fixes the spec, then a quality check fails and the agent fixes
-the code normalisation, and the rebuilt CDM passes. To run the same demo against Claude live,
-use `--provider anthropic` (it needs an API key, see below).
+build ends those visits on their start date (the CDM convention) and reports it as
+`etlDefaultedValue`, and the repair agent writes that fallback into the spec; then the ICD-10
+codes fail `standardConceptRecordCompleteness`, the agent fixes the code normalisation, and the
+rebuilt CDM passes. To run the same demo against Claude live, use `--provider anthropic` (it
+needs an API key, see below).
 
 ## The review web app and the Docker bundle
 
@@ -175,7 +177,9 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   ```
 
   ETL tables that the build creates later (a new version can add some) are granted to the
-  role automatically.
+  role automatically. The role also needs EXECUTE on the helper functions the build installs in
+  the ETL schema (PUBLIC has it by default). A new version of those functions is installed by
+  the first build that runs as their owner.
 * **Nothing Claude produces is trusted blindly.** Concept ids must exist in your vocabulary
   as valid standard concepts in the right domain. Person and visit ids always come from the id
   maps, so events can't attach to the wrong patient. The repair agent may not filter out
@@ -183,9 +187,12 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   records, is rolled back; and DQ verdicts come from SQL.
 * **A PASS means the data is there.** Besides fatal DQD failures, the gate blocks when a table
   mapping loads less than half of its source rows (`etlRecordLoss`) and when persons have no
-  observation period (`quality.blocking_checks`). A CDM built from a design or mappings that
-  nobody approved, or that automatic repairs changed after approval, is reported as "PASSED,
-  not fully reviewed".
+  observation period (`quality.blocking_checks`). A required value that comes out NULL follows
+  the CDM convention and is counted, never hidden: a concept becomes 0 and a visit or drug end
+  date the start date (`etlDefaultedValue`), and a row without a start date, birth year or death
+  date is dropped (`etlRequiredFieldNull`, and a loss for the retention checks). A CDM built
+  from a design or mappings that nobody approved, or that automatic repairs changed after
+  approval, is reported as "PASSED, not fully reviewed".
 * **Source files are staged exactly or not at all.** CSVs are decoded strictly: set
   `source.encoding` for Latin-1 or cp1252 exports. Rows with the wrong number of fields stop
   the run with their line numbers, unless you set `source.skip_ragged_rows`.

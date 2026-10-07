@@ -2,8 +2,11 @@
 
 Spec SQL is executed by the build, so a fragment must stay a single expression over the staged
 source and vocabulary: no statement separators, no access to server files, other databases or
-session settings, and no catalog snooping. This complements (it does not replace) running the
-build under a least-privilege role (``target.etl_role``).
+session settings, no catalog snooping, and no calls of the build's own helper functions
+(``{etl}.omop_*``, which count the values the build could not load as written). A quoted name
+("set_config", "pg_catalog") is checked as the name it is, and a Unicode-escaped one (U&"...") is
+refused. This complements (it does not replace) running the build under a least-privilege role
+(``target.etl_role``).
 """
 
 from __future__ import annotations
@@ -11,10 +14,14 @@ from __future__ import annotations
 import re
 
 # Literals ('...', E'...', $tag$...$tag$), quoted identifiers ("...") and comments are removed
-# before scanning, so a column called "comment" or a string containing ';' is not a problem.
+# before scanning, so a column called "comment" or a string containing ';' is not a problem. They
+# are lexed as PostgreSQL does with standard_conforming_strings on (the default, and pinned for
+# spec SQL by etl.session): a backslash escapes only inside E'...', so '\' is a whole string.
+# The E must start a token: in name'\' it ends the type name and the string is a plain one.
 _STRIP = re.compile(
     r"(?P<dollar>\$(?P<tag>[A-Za-z_]*)\$.*?\$(?P=tag)\$)"
-    r"|(?:[Ee])?'(?:[^'\\]|\\.|'')*'"
+    r"|(?<![\w$])[Ee]'(?:[^'\\]|\\.|'')*'"
+    r"|'(?:[^']|'')*'"
     r'|"(?:[^"]|"")*"'
     r"|--[^\n]*"
     r"|/\*.*?\*/",
@@ -28,17 +35,38 @@ _DENIED_FUNCTIONS = re.compile(
     r"current_setting|pg_file_\w+|pg_logdir_ls|copy|execute|do)\s*\(",
     re.I,
 )
-# Statement keywords that can never appear in a single expression, and catalog schemas. A word
-# right after a '.' is a column (alias.update), not a keyword.
+# The build's own helper functions in the ETL schema ({etl}.omop_count, omop_drop, ...): they keep
+# the counts of values the build could not load as written, which spec SQL must not change.
+_INTERNAL_FUNCTIONS = re.compile(r"(?<![\w$])(omop_\w+)\s*\(", re.I)
+# Catalog schemas (also when quoted), and statement keywords that can never appear in a single
+# expression. A word right after a '.' is a column (alias.update), not a keyword.
+_DENIED_SCHEMAS = re.compile(r"(?<![.\w])(pg_catalog|information_schema|pg_temp\w*|pg_toast)\b", re.I)
 _DENIED_WORDS = re.compile(
-    r"(?<![.\w])(pg_catalog|information_schema|pg_temp\w*|pg_toast|insert|update|delete|truncate|drop|alter|"
-    r"create|grant|revoke|copy|vacuum)\b",
+    r"(?<![.\w])(insert|update|delete|truncate|drop|alter|create|grant|revoke|copy|vacuum)\b",
     re.I,
 )
+_QUOTED_NAME = re.compile(r'"((?:[^"]|"")*)"')
+# The U& prefix of a Unicode-escaped identifier or string (U&"\006Fmop_count"), whose escapes can
+# spell any name: such names are refused rather than decoded.
+_UNICODE_PREFIX = re.compile(r"(?:^|[^\w$])U&$", re.I)
 
 
 def strip_literals(sql: str) -> str:
     return _STRIP.sub(" ", sql)
+
+
+def _unquote_names(sql: str) -> str:
+    """``sql`` with string literals and comments removed and quoted identifiers unquoted, so a
+    quoted name ("pg_catalog"."set_config"(...)) is seen as the schema or function it names."""
+    kept = _STRIP.sub(lambda m: m.group(0) if m.group(0).startswith('"') else " ", sql)
+    return _QUOTED_NAME.sub(lambda m: m.group(1).replace('""', '"'), kept)
+
+
+def _unicode_escapes(sql: str) -> bool:
+    return any(
+        m.group(0)[0] in "'\"" and _UNICODE_PREFIX.search(sql[max(0, m.start() - 3) : m.start()])
+        for m in _STRIP.finditer(sql)
+    )
 
 
 def fragment_issues(fragment: str | None) -> list[str]:
@@ -46,18 +74,23 @@ def fragment_issues(fragment: str | None) -> list[str]:
     if not fragment:
         return []
     bare = strip_literals(fragment)
+    calls = _unquote_names(fragment)
     issues = []
     if ";" in bare:
         issues.append("contains ';' (only a single expression is allowed)")
-    for pattern, template in (
-        (_DENIED_FUNCTIONS, "calls a function that is not allowed in ETL SQL: {}()"),
-        (_DENIED_WORDS, "uses a keyword or schema that is not allowed in ETL SQL: {}"),
+    for pattern, text, template in (
+        (_DENIED_FUNCTIONS, calls, "calls a function that is not allowed in ETL SQL: {}()"),
+        (_INTERNAL_FUNCTIONS, calls, "calls an internal function of the build, which ETL SQL may not call: {}()"),
+        (_DENIED_SCHEMAS, calls, "uses a keyword or schema that is not allowed in ETL SQL: {}"),
+        (_DENIED_WORDS, bare, "uses a keyword or schema that is not allowed in ETL SQL: {}"),
     ):
         seen: set[str] = set()
-        for m in pattern.finditer(bare):
+        for m in pattern.finditer(text):
             if m.group(1).lower() not in seen:
                 seen.add(m.group(1).lower())
                 issues.append(template.format(m.group(1)))
     if "$" in fragment and re.search(r"\$\w*\$", fragment):
         issues.append("dollar-quoted strings are not allowed")
+    if _unicode_escapes(fragment):
+        issues.append("Unicode-escaped names and strings (U&\"...\", U&'...') are not allowed")
     return issues

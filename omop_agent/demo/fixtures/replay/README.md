@@ -17,8 +17,10 @@ Layout: `<stage>/<key>.json`. `key` is the call name used in the code, with `:` 
 
 The two design bugs are there so the demo exercises the repair loop:
 
-1. `visit_occurrence.visit_end_date` uses the discharge date, which is empty for outpatient
-   visits. The load fails with a NOT NULL error.
+1. `visit_occurrence.visit_end_date` uses the discharge date, which is empty for outpatient and
+   emergency visits. The build gives those visits their start date (the CDM convention for a
+   missing end date) and reports it as `etlDefaultedValue` (convention); the repair agent writes
+   the fallback into the spec.
 2. ICD-10 codes are looked up without normalising codes written without the dot (`J189`), so
    about 13% of conditions get concept 0. This fails DQD's `standardConceptRecordCompleteness`.
 

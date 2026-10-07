@@ -1,17 +1,19 @@
 """Create the CDM, vocabulary and ETL working tables in PostgreSQL.
 
 Uses the official OHDSI v5.4 PostgreSQL DDL. Vocabulary tables go to ``vocab_schema`` and all
-other tables to ``cdm_schema`` (they may be the same schema).
+other tables to ``cdm_schema`` (they may be the same schema). The ETL schema also gets the
+helper functions the compiled ETL SQL calls (``etl/functions.sql``).
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from importlib import resources
 
 import psycopg
 
-from ..db import Schemas, ensure_schema, execute, qi, scalar, table_exists
+from ..db import Schemas, ensure_schema, execute, fetch_all, qi, scalar, short_error, table_exists
 from .spec import RESOURCE_PKG, load_cdm_spec
 
 _CREATE = re.compile(r"CREATE TABLE @cdmDatabaseSchema\.(\w+)\s*\((.*?)\);", re.S | re.I)
@@ -136,8 +138,58 @@ ETL_TABLES = {
 }
 
 
+def _functions_sql() -> str:
+    return resources.files("omop_agent.etl").joinpath("functions.sql").read_text(encoding="utf-8")
+
+
+# The version stamp of etl/functions.sql: its content, so any change to the file installs it again.
+FUNCTIONS_VERSION = hashlib.sha256(_functions_sql().encode()).hexdigest()[:16]
+# The names of the functions etl/functions.sql defines.
+_DEFINED_FUNCTIONS = sorted(set(re.findall(r"CREATE OR REPLACE FUNCTION \{etl\}\.(\w+)\s*\(", _functions_sql())))
+
+
+def installed_functions_version(conn: psycopg.Connection, schemas: Schemas) -> str | None:
+    """The version of the helper functions installed in the ETL schema (None: not installed)."""
+    probe = f"{qi(schemas.etl)}.omop_agent_functions_version()"
+    if scalar(conn, "SELECT to_regprocedure(%s) IS NOT NULL", (probe,)) is not True:
+        return None
+    return scalar(conn, f"SELECT {probe}")
+
+
+def install_etl_functions(conn: psycopg.Connection, schemas: Schemas, role: str | None = None) -> bool:
+    """Install the helper functions the compiled SQL calls (``etl/functions.sql``) into the ETL
+    schema, unless that version is there already. Returns True when they were installed.
+
+    Every installed function of those names is dropped first, because ``CREATE OR REPLACE
+    FUNCTION`` cannot change a parameter name or the return type. Dropping (and replacing) a
+    function needs its ownership, so a version change must be installed once by the role that owns
+    them; a build that only finds them installed needs EXECUTE (PUBLIC has it by default; with
+    ``role`` it is also granted to that role)."""
+    if installed_functions_version(conn, schemas) == FUNCTIONS_VERSION:
+        return False
+    sql = schemas.render(_functions_sql()).replace("{functions_version}", FUNCTIONS_VERSION)
+    try:
+        with conn.transaction():  # a savepoint: the error below is raised with the transaction usable
+            installed = fetch_all(conn, """
+                SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args
+                FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = %s AND p.proname = ANY(%s)""", (schemas.etl, _DEFINED_FUNCTIONS))
+            for f in installed:  # compiled SQL is not stored, so nothing depends on them
+                execute(conn, f"DROP FUNCTION {qi(schemas.etl)}.{qi(f['proname'])}({f['args']})")
+            execute(conn, sql)
+    except psycopg.errors.InsufficientPrivilege as e:
+        raise psycopg.errors.InsufficientPrivilege(
+            f"the ETL helper functions in schema {schemas.etl} belong to another role and must be updated: run "
+            f"`omop-agent build` once as their owner ({short_error(e)})"
+        ) from e
+    if role and scalar(conn, "SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)):
+        execute(conn, f"GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {qi(schemas.etl)} TO {qi(role)}")
+    return True
+
+
 def create_etl_tables(conn: psycopg.Connection, schemas: Schemas, role: str | None = None) -> list[str]:
-    """Create any missing ETL working tables. Returns the tables created.
+    """Create any missing ETL working tables, and install the ETL helper functions
+    (``install_etl_functions``). Returns the tables created.
 
     With ``role`` (``target.etl_role``), the role gets SELECT, INSERT and DELETE on the tables this
     call creates, so a table that a new version adds does not fail the next build run under the
@@ -152,6 +204,7 @@ def create_etl_tables(conn: psycopg.Connection, schemas: Schemas, role: str | No
     if role and created and scalar(conn, "SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)):
         for table in created:
             execute(conn, f"GRANT SELECT, INSERT, DELETE ON {qi(schemas.etl)}.{qi(table)} TO {qi(role)}")
+    install_etl_functions(conn, schemas, role)
     return created
 
 

@@ -15,6 +15,7 @@ from omop_agent.etl.compiler import (
     SPEC_KINDS,
     CompiledStep,
     CompileError,
+    _compile,
     compile_spec,
     compile_table,
     step_label,
@@ -88,9 +89,14 @@ def test_step_order_and_targets():
     assert steps[0].slot[0] == steps[1].slot[0] == -1 and steps[-1].slot[0] > len(LOAD_ORDER) - 1
     assert step(steps, "person_map_prune").slot == (LOAD_ORDER.index("person"), 1, 0)
     assert [s.label for s in steps][:3] == ["person_map", "visit_map", "person"]
-    # every generated step is blocking and reads a row count; its SQL is its statements (two for
-    # the id maps and the visit pruning); the spec kinds
-    assert all(s.blocking and s.returns == "rowcount" and s.count_sites == () for s in steps)
+    # every step is blocking and reads a row count; its SQL is its statements (two for the id maps
+    # and the visit pruning); the spec kinds. The inserts count the required values they complete
+    # or drop (per field, and the dropped rows), the generated steps count nothing
+    assert all(s.blocking and s.returns == "rowcount" for s in steps)
+    assert all(s.count_sites == () for s in steps if s.kind != "insert")
+    assert step(steps, "visit_occurrence").count_sites == (
+        "visit_concept_id", "visit_start_date", "visit_end_date", "visit_type_concept_id", "row")
+    assert step(steps, "death").count_sites == ("death_date", "row")
     assert all("\n".join(s.statements) == s.sql for s in steps)
     assert [s.label for s in steps if len(s.statements) > 1] == ["person_map", "visit_map", "visit_map_prune"]
     assert {s.kind for s in steps if s.kind in SPEC_KINDS} == {"id_map", "insert"}
@@ -211,9 +217,10 @@ def test_visit_joins_and_auto_id():
 def test_vocab_code_lookup_and_null_semantics():
     spec = load_ref()
     sql = compile_table(spec.mapping_for("condition_occurrence"), spec, S)
-    # standard + source roles share one concept join
+    # standard + source roles share one concept join, on the code computed once per source row
     assert sql.count("JOIN vocab.concept sc") == 1
-    assert "LEFT JOIN vocab.concept sc1 ON sc1.concept_code = (d.icd10)::text AND sc1.vocabulary_id = 'ICD10'" in sql
+    assert "            (d.icd10) AS _k1  -- lookup source\n" in sql
+    assert "LEFT JOIN vocab.concept sc1 ON sc1.concept_code = (s._k1)::text AND sc1.vocabulary_id = 'ICD10'" in sql
     assert (
         "LEFT JOIN vocab.concept_relationship cr1 ON cr1.concept_id_1 = sc1.concept_id"
         " AND cr1.relationship_id = 'Maps to' AND cr1.invalid_reason IS NULL" in sql
@@ -223,8 +230,8 @@ def test_vocab_code_lookup_and_null_semantics():
         " AND tc1.standard_concept = 'S' AND tc1.invalid_reason IS NULL" in sql
     )
     # required field: NULL source -> 0; optional field: NULL source -> NULL
-    assert "(CASE WHEN (d.icd10) IS NULL THEN 0 ELSE COALESCE(tc1.concept_id, 0) END)::integer AS condition_concept_id" in sql
-    assert "(CASE WHEN (d.icd10) IS NULL THEN NULL ELSE COALESCE(sc1.concept_id, 0) END)::integer AS condition_source_concept_id" in sql
+    assert "(CASE WHEN (s._k1) IS NULL THEN 0 ELSE COALESCE(tc1.concept_id, 0) END)::integer AS condition_concept_id" in sql
+    assert "(CASE WHEN (s._k1) IS NULL THEN NULL ELSE COALESCE(sc1.concept_id, 0) END)::integer AS condition_source_concept_id" in sql
 
 
 def test_standard_role_added_after_source_role():
@@ -246,10 +253,13 @@ def test_concept_map_joins_are_shared():
                      expression="r.test", vocabulary="SRC_LAB", concept_role="source")
     sql = compile_table(spec.mapping_for("measurement"), spec, S)
     assert (
-        "LEFT JOIN etl.source_to_concept_map m1 ON m1.source_code = (r.test)::text"
+        "LEFT JOIN etl.source_to_concept_map m1 ON m1.source_code = (s._k1)::text"
         " AND m1.source_vocabulary_id = 'SRC_LAB' AND m1.invalid_reason IS NULL" in sql
     )
     assert sql.count("source_to_concept_map m") == 3  # SRC_LAB (shared), SRC_RESULT, SRC_UNIT
+    # one layer-1 column per distinct code expression, shared by the lookups on it
+    assert [ln.strip() for ln in sql.splitlines() if ln.strip().startswith("v._k")] == ["v._k1,", "v._k2,", "v._k3"]
+    assert "(r.test) AS _k1," in sql and "(r.unit) AS _k3  -- lookup source" in sql
     assert "COALESCE(m1.target_concept_id, 0) END)::integer AS measurement_concept_id" in sql
     assert "COALESCE(m1.source_concept_id, 0) END)::integer AS measurement_source_concept_id" in sql
     assert "THEN NULL ELSE COALESCE(m3.target_concept_id, 0) END)::integer AS unit_concept_id" in sql
@@ -290,8 +300,17 @@ def test_where_joins_and_custom_sql():
     # custom SQL of a table without a mapping runs at that table's place in the load order
     assert names[-4:] == ["11_death", "12_custom_note", "13_observation_period", "14_cdm_source"]
     de = step(steps, "drug_exposure")
-    assert "INNER JOIN src.clinic_visits cv ON cv.visit_id = p.visit_id" in de.sql
-    assert de.sql.rstrip().endswith("WHERE (cv.visit_type <> 'EMERG');")
+    # the joins and the filter apply to the source rows (layer 1), before the id-map joins' rows
+    # are counted and before the required-field policies
+    assert (
+        "        FROM src.prescriptions p\n"
+        "        INNER JOIN src.clinic_visits cv ON cv.visit_id = p.visit_id\n"
+        "        INNER JOIN etl.person_map pm1 ON pm1.source_value = (p.individual_id)::text\n"
+        "        LEFT JOIN etl.visit_map vm1 ON vm1.source_value = (p.visit_id)::text\n"
+        "        WHERE (cv.visit_type <> 'EMERG')\n"
+        "        OFFSET 0\n"
+        "    ) v\n"
+    ) in de.sql
     assert de.source_count_sql.endswith("INNER JOIN src.clinic_visits cv ON cv.visit_id = p.visit_id\nWHERE (cv.visit_type <> 'EMERG')")
     assert de.retained_count_sql.endswith(
         "INNER JOIN src.clinic_visits cv ON cv.visit_id = p.visit_id\n"
@@ -395,6 +414,85 @@ def test_trailing_comment_in_expression_is_safe():
     assert "-- day-first dates\n)::integer AS year_of_birth" in sql
 
 
+def test_compiled_insert_shape():
+    spec = load_ref()
+    vo = compile_spec(spec, S)[4]
+    assert vo.label == "visit_occurrence"
+    sql = vo.sql
+    # three layers, each fenced: the source rows, the required-field policies, the outer SELECT
+    one, two = sql.index("-- 1) the source rows"), sql.index("-- 2) required values that are NULL")
+    assert sql.index("INSERT INTO cdm.visit_occurrence (") < sql.index("\nSELECT\n    s.visit_occurrence_id,") < two < one
+    assert sql.count("OFFSET 0") == 2 and sql.rstrip().endswith(") s;")
+    # layer 1 computes every value from the source once, with today's casts
+    assert "            (v.discharge_date::date)::date AS visit_end_date,  -- expression\n" in sql
+    assert "            (32817)::integer AS visit_type_concept_id,  -- constant\n" in sql
+    # layer 2: a NULL required concept becomes 0, a NULL end the start, and a NULL start drops the
+    # row; each counted, and only on the NULL branch
+    assert ("        CASE WHEN v.visit_type_concept_id IS NULL THEN etl.omop_default_int('visit_type_concept_id', 0)"
+            " ELSE v.visit_type_concept_id END AS visit_type_concept_id,  -- NULL -> 0 (counted)\n") in sql
+    assert ("        COALESCE(v.visit_end_date, etl.omop_derived_date('visit_end_date', v.visit_start_date))"
+            " AS visit_end_date,  -- NULL -> visit_start_date (counted)\n") in sql
+    assert ("    WHERE CASE WHEN v.visit_start_date IS NOT NULL THEN true\n"
+            "               ELSE etl.omop_drop(ARRAY['visit_start_date'], ARRAY[v.visit_start_date IS NULL]) END\n"
+            "    OFFSET 0\n) s;") in sql
+    # optional fields, id-map values and the lookups' codes pass through
+    assert "        v.visit_start_datetime,\n" in sql and "        v.person_id,\n" in sql
+    assert vo.count_sites == ("visit_concept_id", "visit_start_date", "visit_end_date", "visit_type_concept_id", "row")
+
+    # an end date without a start date to take is dropped instead
+    tm = set_field(spec, "drug_exposure", "drug_exposure_start_date", kind="null").mapping_for("drug_exposure")
+    assert _compile(tm, spec).required == {"drug_exposure_end_date": "drop", "drug_type_concept_id": "zero"}
+    # several fields that drop a row: each NULL one is counted, the row once
+    note = TableMapping(target_table="note", source={"table": "clinic_visits", "alias": "n"}, fields=[
+        FieldMapping(target_field="note_id", kind="auto_id"),
+        FieldMapping(target_field="person_id", kind="person_id", expression="n.individual_id"),
+        FieldMapping(target_field="note_date", kind="expression", expression="n.visit_date::date"),
+        FieldMapping(target_field="note_type_concept_id", kind="constant", expression="32817"),
+        FieldMapping(target_field="note_class_concept_id", kind="constant", expression="0"),
+        FieldMapping(target_field="note_text", kind="column", expression="n.facility"),
+        FieldMapping(target_field="encoding_concept_id", kind="constant", expression="0"),
+        FieldMapping(target_field="language_concept_id", kind="constant", expression="0")])
+    c = _compile(note, spec)
+    assert [k for k, p in c.required.items() if p == "drop"] == ["note_date", "note_text"]
+    assert c.count_sites[-1] == "row" and len(c.count_sites) == 7
+    assert ("    WHERE CASE WHEN v.note_date IS NOT NULL AND v.note_text IS NOT NULL THEN true\n"
+            "               ELSE {etl}.omop_drop(ARRAY['note_date', 'note_text'],"
+            " ARRAY[v.note_date IS NULL, v.note_text IS NULL]) END\n") in c.insert
+    # the observation period end ('open') is left as written until periods are merged
+    op = _compile(spec.mapping_for("observation_period"), spec)
+    assert "observation_period_end_date" not in op.required and op.count_sites == (
+        "observation_period_start_date", "period_type_concept_id", "row")
+    assert "        v.observation_period_end_date,\n" in op.insert
+
+    # no required field computed from the source: no layer 2
+    loc = TableMapping(target_table="location", source={"table": "clinic_visits", "alias": "v"}, fields=[
+        FieldMapping(target_field="location_id", kind="auto_id"),
+        FieldMapping(target_field="city", kind="column", expression="v.facility")])
+    c = _compile(loc, spec)
+    assert (c.required, c.count_sites) == ({}, ()) and "-- 2)" not in c.insert and c.insert.count("OFFSET 0") == 1
+    assert "    s.city\nFROM (\n    -- 1) the source rows" in c.insert
+
+
+def test_required_null_policy_follows_the_cdm():
+    from omop_agent.etl.policies import REQUIRED_NULL_POLICY, required_null_policy
+
+    assert REQUIRED_NULL_POLICY["person"] == {
+        "person_id": "drop", "gender_concept_id": "zero", "year_of_birth": "drop", "race_concept_id": "zero",
+        "ethnicity_concept_id": "zero"}
+    assert REQUIRED_NULL_POLICY["visit_occurrence"]["visit_end_date"] == "start"
+    assert REQUIRED_NULL_POLICY["visit_detail"]["visit_detail_end_date"] == "start"
+    assert REQUIRED_NULL_POLICY["drug_exposure"]["drug_exposure_end_date"] == "start"
+    assert REQUIRED_NULL_POLICY["observation_period"]["observation_period_end_date"] == "open"
+    assert REQUIRED_NULL_POLICY["death"] == {"person_id": "drop", "death_date": "drop"}
+    assert REQUIRED_NULL_POLICY["fact_relationship"] == {
+        "domain_concept_id_1": "zero", "fact_id_1": "drop", "domain_concept_id_2": "zero", "fact_id_2": "drop",
+        "relationship_concept_id": "zero"}
+    assert required_null_policy("note", "note_text") == required_null_policy("cost", "cost_domain_id") == "drop"
+    assert required_null_policy("metadata", "name") == "drop"
+    assert required_null_policy("person", "birth_datetime") is None  # optional: stays NULL
+    assert required_null_policy("not_a_table", "x") is None
+
+
 @pytest.mark.parametrize(
     "change, message",
     [
@@ -431,38 +529,46 @@ def count(conn, schemas, table: str, where: str = "TRUE") -> int:
 
 @pytest.mark.postgres
 def test_run_reference_spec(staged):
+    from omop_agent.quality.checks import etl_checks
+
     conn, schemas, cfg = staged
     ws = Workspace(cfg.workdir)
     (ws.sql_dir / "99_stale.sql").write_text("-- old\n")
     result = run_etl(conn, schemas, load_ref(), cfg, ws)
 
-    errors = result.errors()
-    assert len(errors) == 1, [(e.step, e.error) for e in errors]
-    assert errors[0].target_table == "visit_occurrence"
-    assert "null value" in errors[0].error and "visit_end_date" in errors[0].error
-    assert errors[0].source_rows == int(scalar(conn, f"SELECT COUNT(*) FROM {schemas.src}.clinic_visits"))
-    assert count(conn, schemas, "person") == 400
-    assert count(conn, schemas, "visit_occurrence") == 0
+    # the design bug (visit_end_date from the discharge date, empty for outpatient visits) no longer
+    # fails the visit load: those visits end on their start date, and the build counts them
+    assert result.ok and result.errors() == [], [(e.step, e.error) for e in result.errors()]
+    src = schemas.src
+    visits = int(scalar(conn, f"SELECT COUNT(*) FROM {src}.clinic_visits"))
+    no_discharge = int(scalar(conn, f"SELECT COUNT(*) FROM {src}.clinic_visits WHERE discharge_date IS NULL"))
+    assert 0 < no_discharge < visits
+    assert count(conn, schemas, "person") == 400 and count(conn, schemas, "visit_occurrence") == visits
     by_table = {s.target_table: s for s in result.steps}
+    vo = by_table["visit_occurrence"]
+    assert vo.value_counts == {"defaulted": {"visit_end_date": no_discharge}}
+    assert (vo.source_rows, vo.id_retained_rows, vo.retained_rows, vo.rows_inserted) == (visits,) * 4
+    assert count(conn, schemas, "visit_occurrence", "visit_end_date = visit_start_date") >= no_discharge
+    assert count(conn, schemas, "visit_occurrence", "visit_end_date < visit_start_date") == 0
+    defaulted = [r for r in etl_checks(result) if r.check_name == "etlDefaultedValue"]
+    assert [(r.key, r.severity, r.failed, r.num_violated_rows, r.num_denominator_rows) for r in defaulted] == [
+        ("etlDefaultedValue.visit_occurrence.visit_end_date", "convention", True, no_discharge, visits)]
+    assert "took the start date (visit_start_date)" in defaulted[0].description
+    assert not any(r.check_name == "etlRequiredFieldNull" for r in etl_checks(result))
     for t in ("condition_occurrence", "drug_exposure", "measurement", "death", "observation_period"):
         assert by_table[t].error is None and by_table[t].rows_inserted > 0, t
         assert by_table[t].rows_inserted == count(conn, schemas, t)
+        assert by_table[t].value_counts == {}, t
     # retention: lab results of people missing from the registry are dropped by the person map
     m = by_table["measurement"]
     assert m.source_rows - m.rows_inserted == 12
-    assert m.source_rows - m.retained_rows == 12 and m.retained_rows == m.rows_inserted
+    assert m.source_rows - m.retained_rows == 12 and m.retained_rows == m.rows_inserted == m.id_retained_rows
     assert by_table["person_map"].rows_inserted == 400
     assert by_table["person_map_prune"].rows_inserted == 0 and by_table["person_map_prune"].error is None
+    assert by_table["visit_map_prune"].rows_inserted == 0
     assert count(conn, schemas, "cdm_source") == 1
-    # the visit load failed: pruning retires every visit key with its id (the ids stay stable for
-    # the next run), and the events get no visit instead of one missing from visit_occurrence
-    prune = next(s for s in result.steps if s.step.endswith("visit_map_prune"))
-    assert prune.error is None and prune.rows_inserted == errors[0].source_rows
-    assert scalar(conn, f"SELECT COUNT(*) FROM {schemas.etl}.visit_map") == 0
-    assert scalar(conn, f"SELECT COUNT(*) FROM {schemas.etl}.visit_map_retired") == errors[0].source_rows
-    assert count(conn, schemas, "condition_occurrence", "visit_occurrence_id IS NOT NULL") == 0
-    audit = [e for e in ws.read_audit() if e["event"] == "etl_step" and e["step"] == prune.step]
-    assert "skipped" not in audit[0] and audit[0]["rows_inserted"] == prune.rows_inserted
+    audit = [e for e in ws.read_audit() if e["event"] == "etl_step" and e["step"] == vo.step]
+    assert audit[0]["value_counts"] == vo.value_counts and audit[0]["retained_rows"] == visits
     assert [e["retained_rows"] for e in ws.read_audit() if e.get("step") == "09_measurement"] == [m.retained_rows]
 
     files = sorted(p.name for p in ws.sql_dir.glob("*.sql"))
@@ -470,8 +576,35 @@ def test_run_reference_spec(staged):
     assert "99_stale.sql" not in files
     saved = json.loads(ws.etl_run_json.read_text())
     assert len(saved["steps"]) == len(result.steps)
+    assert saved["steps"][4]["value_counts"] == {"defaulted": {"visit_end_date": no_discharge}}
     events = [e["event"] for e in ws.read_audit()]
     assert events.count("etl_step") == len(result.steps) and events[-1] == "etl_run"
+    assert ws.read_audit()[-1]["ok"] is True
+
+
+@pytest.mark.postgres
+def test_failed_visit_load_retires_every_visit_key(staged):
+    conn, schemas, cfg = staged
+    ws = Workspace(cfg.workdir)
+    # a runtime error in every row (not a value the build converts or defaults)
+    broken = set_field(fixed_ref(), "visit_occurrence", "visit_concept_id",
+                       expression="9202 / (length(v.visit_id) - length(v.visit_id))")
+    result = run_etl(conn, schemas, broken, cfg, ws)
+    errors = result.errors()
+    assert [e.target_table for e in errors] == ["visit_occurrence"], [(e.step, e.error) for e in errors]
+    assert "division by zero" in errors[0].error and errors[0].value_counts == {}
+    assert errors[0].source_rows == int(scalar(conn, f"SELECT COUNT(*) FROM {schemas.src}.clinic_visits"))
+    assert count(conn, schemas, "visit_occurrence") == 0 and count(conn, schemas, "person") == 400
+    # pruning retires every visit key with its id (the ids stay stable for the next run), and the
+    # events get no visit instead of one missing from visit_occurrence
+    prune = next(s for s in result.steps if s.step.endswith("visit_map_prune"))
+    assert prune.error is None and prune.rows_inserted == errors[0].source_rows
+    assert scalar(conn, f"SELECT COUNT(*) FROM {schemas.etl}.visit_map") == 0
+    assert scalar(conn, f"SELECT COUNT(*) FROM {schemas.etl}.visit_map_retired") == errors[0].source_rows
+    assert count(conn, schemas, "condition_occurrence") > 0
+    assert count(conn, schemas, "condition_occurrence", "visit_occurrence_id IS NOT NULL") == 0
+    audit = [e for e in ws.read_audit() if e["event"] == "etl_step" and e["step"] == prune.step]
+    assert "skipped" not in audit[0] and audit[0]["rows_inserted"] == prune.rows_inserted
     assert ws.read_audit()[-1]["ok"] is False
 
 
@@ -853,6 +986,165 @@ def test_retained_rows_ignore_vocabulary_fan_out(staged):
 
 
 @pytest.mark.postgres
+def test_required_null_policies(staged):
+    from omop_agent.quality.checks import etl_checks, gate
+
+    conn, schemas, cfg = staged
+    src = schemas.src
+    # sex codes other than 1/2 have no branch, so gender is NULL: it becomes 0. One person (with
+    # diagnoses) has no birth year: they are dropped, and so are their events. Prescriptions of
+    # three days or less have no end date: they end on their start date
+    who = scalar(conn, f"""SELECT d.individual_id FROM {src}.diagnoses d JOIN {src}.individuals i
+        ON i.individual_id = d.individual_id GROUP BY 1 ORDER BY COUNT(*) DESC, 1 LIMIT 1""")
+    spec = set_field(fixed_ref(), "person", "gender_concept_id",
+                     expression="CASE i.sex WHEN '1' THEN 8507 WHEN '2' THEN 8532 END")
+    spec = set_field(spec, "person", "year_of_birth", expression=(
+        f"CASE WHEN i.individual_id <> '{who}' THEN EXTRACT(YEAR FROM to_date(i.dob, 'DD/MM/YYYY'))::int END"))
+    spec = set_field(spec, "drug_exposure", "drug_exposure_end_date",
+                     expression="CASE WHEN p.days::int > 3 THEN p.date_prescribed::date + p.days::int - 1 END")
+    result = run_etl(conn, schemas, spec, cfg)
+    assert result.ok, [(e.step, e.error) for e in result.errors()]
+    by = {step_label(r.step): r for r in result.steps}
+
+    unknown_sex = int(scalar(conn, f"SELECT COUNT(*) FROM {src}.individuals WHERE sex NOT IN ('1', '2')"))
+    person = by["person"]
+    assert 0 < unknown_sex and person.value_counts == {
+        "defaulted": {"gender_concept_id": unknown_sex}, "required_null": {"year_of_birth": 1}, "row": {"dropped": 1}}
+    assert (person.source_rows, person.id_retained_rows, person.retained_rows, person.rows_inserted) == (400, 400, 399, 399)
+    assert count(conn, schemas, "person") == 399
+    assert count(conn, schemas, "person", "gender_concept_id = 0") == unknown_sex
+    assert count(conn, schemas, "person", f"person_source_value = '{who}'") == 0
+    # the dropped person is retired from the person map, so their events are dropped too
+    assert by["person_map_prune"].rows_inserted == 1 and who in id_map(conn, schemas, "person_map_retired")
+    assert set(orphans(conn, schemas).values()) == {0}
+    events = int(scalar(conn, f"SELECT COUNT(*) FROM {src}.diagnoses WHERE individual_id = '{who}'"))
+    co = by["condition_occurrence"]
+    assert events > 0 and co.source_rows - co.retained_rows >= events and co.value_counts == {}
+
+    short = int(scalar(conn, f"""SELECT COUNT(*) FROM {src}.prescriptions p
+        JOIN {schemas.etl}.person_map pm ON pm.source_value = p.individual_id WHERE p.days::int <= 3"""))
+    drug = by["drug_exposure"]
+    assert 0 < short < drug.retained_rows
+    assert drug.value_counts == {"defaulted": {"drug_exposure_end_date": short}}
+    assert count(conn, schemas, "drug_exposure", "drug_exposure_end_date = drug_exposure_start_date") >= short
+    assert count(conn, schemas, "drug_exposure", "drug_exposure_end_date IS NULL") == 0
+
+    results = {r.key: r for r in etl_checks(result)}
+    yob = results["etlRequiredFieldNull.person.year_of_birth"]
+    assert (yob.num_violated_rows, yob.num_denominator_rows, yob.threshold_pct, yob.failed) == (1, 400, 0.0, True)
+    assert yob.severity == "convention" and yob.repairable is None and yob.step == "person"
+    gender = results["etlDefaultedValue.person.gender_concept_id"]
+    assert (gender.num_violated_rows, gender.num_denominator_rows) == (unknown_sex, 400)
+    assert "became 0 (no matching concept)" in gender.description
+    assert results["etlDefaultedValue.drug_exposure.drug_exposure_end_date"].num_violated_rows == short
+    retention = results["etlRecordRetention.person"]
+    assert (retention.num_violated_rows, retention.failed) == (1, False)  # the drop is a retention loss
+    assert gate(list(results.values()), cfg, result) == (True, [])  # convention: reported, not blocking
+
+
+@pytest.mark.postgres
+def test_counters_are_per_source_row(staged):
+    conn, schemas, cfg = staged
+    # 'HB' maps to two concepts, so each HB result is inserted twice. Results of some people have
+    # no date and are dropped, and results of others have no type, which becomes 0: both are
+    # counted once per source row, below the fan-out
+    execute(conn, f"""INSERT INTO {schemas.etl}.source_to_concept_map (source_code, source_vocabulary_id, target_concept_id)
+        VALUES ('HB', 'SRC_LAB', 2000004001), ('HB', 'SRC_LAB', 2000004002)""")
+    conn.commit()
+    no_date, no_type = "right(r.individual_id, 1) IN ('1', '2')", "right(r.individual_id, 1) IN ('3', '4')"
+    spec = set_field(fixed_ref(), "measurement", "measurement_date",
+                     expression=f"CASE WHEN NOT ({no_date}) THEN r.test_date::date END")
+    spec = set_field(spec, "measurement", "measurement_type_concept_id", kind="expression",
+                     expression=f"CASE WHEN NOT ({no_type}) THEN 32817 END")
+    result = run_etl(conn, schemas, spec, cfg)
+    assert result.ok
+    m = next(s for s in result.steps if s.target_table == "measurement")
+
+    def source_rows(where: str) -> int:
+        return int(scalar(conn, f"""SELECT COUNT(*) FROM {schemas.src}.lab_results r
+            JOIN {schemas.etl}.person_map pm ON pm.source_value = r.individual_id WHERE {where}"""))
+
+    dropped, hb_dropped = source_rows(no_date), source_rows(f"{no_date} AND r.test = 'HB'")
+    defaulted, hb_defaulted = source_rows(no_type), source_rows(f"{no_type} AND r.test = 'HB'")
+    assert dropped > hb_dropped > 0 and defaulted > hb_defaulted > 0
+    assert m.value_counts == {"required_null": {"measurement_date": dropped}, "row": {"dropped": dropped},
+                              "defaulted": {"measurement_type_concept_id": defaulted}}
+    assert count(conn, schemas, "measurement", "measurement_type_concept_id = 0") == defaulted + hb_defaulted
+    assert m.retained_rows == m.id_retained_rows - dropped and m.source_rows - m.id_retained_rows == 12
+    extra = count(conn, schemas, "measurement", "measurement_concept_id = 2000004002")
+    assert extra > 0 and m.rows_inserted == m.retained_rows + extra == count(conn, schemas, "measurement")
+
+
+@pytest.mark.postgres
+def test_etl_functions_are_installed_once_per_version(staged):
+    from datetime import datetime
+
+    import psycopg
+
+    from omop_agent.cdm.ddl import FUNCTIONS_VERSION, install_etl_functions, installed_functions_version
+
+    conn, schemas, _ = staged
+    etl = schemas.etl
+    assert installed_functions_version(conn, schemas) == FUNCTIONS_VERSION  # by create_etl_tables
+    assert install_etl_functions(conn, schemas) is False  # the same version: nothing to do
+    # the counters: transaction-local settings, set only for the rows they count
+    with conn.transaction(force_rollback=True):
+        assert scalar(conn, f"SELECT {etl}.omop_default_int('f', 0)") == 0
+        assert scalar(conn, f"SELECT {etl}.omop_derived_date('f', NULL)") is None
+        assert scalar(conn, f"SELECT {etl}.omop_derived_ts('g', TIMESTAMP '2020-01-02 03:04')") == datetime(2020, 1, 2, 3, 4)
+        assert scalar(conn, f"SELECT {etl}.omop_drop(ARRAY['a', 'b'], ARRAY[true, false])") is False
+        assert scalar(conn, f"SELECT {etl}.omop_drop(ARRAY['a'], ARRAY[true])") is False
+        names = ["defaulted__f", "defaulted__g", "required_null__a", "required_null__b", "dropped__row"]
+        rows = fetch_all(conn, "SELECT n, current_setting('omop_agent.' || n, true) AS v FROM unnest(%s::text[]) n",
+                         (names,))
+        assert {r["n"]: r["v"] for r in rows} == {"defaulted__f": "1", "defaulted__g": "1", "required_null__a": "2",
+                                                  "required_null__b": None, "dropped__row": "2"}
+    conn.commit()
+    assert scalar(conn, "SELECT current_setting('omop_agent.dropped__row', true)") in (None, "")
+
+    # an older version is replaced, functions it lacked included, and functions whose parameter
+    # names or return type changed (which CREATE OR REPLACE refuses)
+    execute(conn, f"CREATE OR REPLACE FUNCTION {etl}.omop_agent_functions_version() RETURNS text "
+                  "LANGUAGE sql AS $$ SELECT 'old' $$")
+    execute(conn, f"DROP FUNCTION {etl}.omop_drop(text[], boolean[])")
+    execute(conn, f"DROP FUNCTION {etl}.omop_count(text, text)")
+    execute(conn, f"CREATE FUNCTION {etl}.omop_count(field text, what text) RETURNS void LANGUAGE sql AS $$ SELECT $$")
+    assert install_etl_functions(conn, schemas) is True
+    assert installed_functions_version(conn, schemas) == FUNCTIONS_VERSION
+    assert scalar(conn, "SELECT to_regprocedure(%s) IS NOT NULL", (f"{etl}.omop_drop(text[], boolean[])",))
+    assert scalar(conn, f"SELECT {etl}.omop_count('f', 'defaulted')") is True
+    conn.commit()
+
+    # a role that does not own them cannot replace them: the error says what to do
+    role = f"{schemas.cdm}_other"
+    execute(conn, f"CREATE ROLE {role} NOLOGIN")
+    execute(conn, f"GRANT USAGE, CREATE ON SCHEMA {etl} TO {role}")
+    conn.commit()
+    try:
+        with conn.transaction(force_rollback=True):
+            execute(conn, f"CREATE OR REPLACE FUNCTION {etl}.omop_agent_functions_version() RETURNS text "
+                          "LANGUAGE sql AS $$ SELECT 'old' $$")
+            execute(conn, f"SET LOCAL ROLE {role}")
+            with pytest.raises(psycopg.errors.InsufficientPrivilege, match=(
+                    f"the ETL helper functions in schema {etl} belong to another role and must be updated: "
+                    "run `omop-agent build` once as their owner")):
+                install_etl_functions(conn, schemas)
+        # installing grants EXECUTE to the build's role
+        with conn.transaction(force_rollback=True):
+            execute(conn, f"CREATE OR REPLACE FUNCTION {etl}.omop_agent_functions_version() RETURNS text "
+                          "LANGUAGE sql AS $$ SELECT 'old' $$")
+            assert install_etl_functions(conn, schemas, role) is True
+            assert scalar(conn, """SELECT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) a
+                WHERE p.oid = to_regprocedure(%s) AND a.grantee = to_regrole(%s) AND a.privilege_type = 'EXECUTE')""",
+                          (f"{etl}.omop_count(text, text)", role))
+    finally:
+        conn.rollback()
+        execute(conn, f"DROP OWNED BY {role}")
+        execute(conn, f"DROP ROLE {role}")
+        conn.commit()
+
+
+@pytest.mark.postgres
 def test_steps_run_under_the_etl_role(staged):
     conn, schemas, cfg = staged
     role = f"{schemas.cdm}_role"
@@ -871,7 +1163,11 @@ def test_steps_run_under_the_etl_role(staged):
     conn.commit()
     try:
         cfg = cfg.model_copy(update={"target": cfg.target.model_copy(update={"etl_role": role})})
-        spec = fixed_ref().model_copy(deep=True)
+        # the reference spec: visits without a discharge date end on their start date, and the
+        # counters (settings set by the ETL helper functions) work under the role; results without
+        # a date are dropped and counted the same way
+        spec = set_field(load_ref(), "measurement", "measurement_date",
+                         expression="CASE WHEN r.test <> 'HB' THEN r.test_date::date END")
         # filtered visits are retired under the role: the grants cover the retired-key tables
         spec.mapping_for("visit_occurrence").where = "v.visit_type <> 'EMERG'"
         spec.custom_sql = [
@@ -887,6 +1183,15 @@ def test_steps_run_under_the_etl_role(staged):
         assert fetch_all(conn, f"SELECT value_as_string FROM {schemas.cdm}.metadata") == [{"value_as_string": role}]
         assert count(conn, schemas, "person") == 400 and count(conn, schemas, "visit_occurrence") > 0
         assert len(id_map(conn, schemas, "visit_map_retired")) > 0
+        by_table = {s.target_table: s for s in result.steps}
+        no_discharge = int(scalar(conn, f"""SELECT COUNT(*) FROM {schemas.src}.clinic_visits
+            WHERE visit_type <> 'EMERG' AND discharge_date IS NULL"""))
+        hb = int(scalar(conn, f"""SELECT COUNT(*) FROM {schemas.src}.lab_results r
+            JOIN {schemas.etl}.person_map pm ON pm.source_value = r.individual_id WHERE r.test = 'HB'"""))
+        assert no_discharge > 0 and hb > 0
+        assert by_table["visit_occurrence"].value_counts == {"defaulted": {"visit_end_date": no_discharge}}
+        assert by_table["measurement"].value_counts == {
+            "required_null": {"measurement_date": hb}, "row": {"dropped": hb}}
         for t in new_tables:
             assert scalar(conn, "SELECT has_table_privilege(%s, %s, 'SELECT, INSERT, DELETE')", (role, f"{schemas.etl}.{t}"))
         assert scalar(conn, "SELECT current_user") == scalar(conn, "SELECT session_user")  # SET LOCAL only
@@ -954,13 +1259,14 @@ def test_session_sql():
     # without a configured zone the session keeps the server's
     assert session_sql() == [
         "SET LOCAL datestyle = 'ISO, YMD';",
+        "SET LOCAL standard_conforming_strings = on;",
         "SELECT set_config('omop_agent.imputation_cap', CURRENT_DATE::text, true);",
     ]
     cfg = make_test_config().model_copy(update={
         "etl": EtlConfig(timezone="Africa/Nairobi"),
         "cdm_source": CdmSourceConfig(source_release_date=date(2023, 12, 31)),
     })
-    assert session_sql(cfg)[1:] == [
+    assert session_sql(cfg)[2:] == [
         "SET LOCAL timezone = 'Africa/Nairobi';",
         "SELECT set_config('omop_agent.imputation_cap', '2023-12-31', true);",
     ]
@@ -1126,6 +1432,13 @@ def test_spec_sql_is_read_under_the_session_settings(staged):
     assert query_rows(conn, sql, cfg) == [{"ds": "ISO, YMD", "tz": "Asia/Kolkata"}]
     server_zone = scalar(conn, "SELECT current_setting('TimeZone')")
     assert query_rows(conn, sql) == [{"ds": "ISO, YMD", "tz": server_zone}]
+    # a backslash is an ordinary character in '...' strings, as sqlguard reads them, whatever the
+    # server's or role's setting
+    execute(conn, "SET standard_conforming_strings = off")
+    try:
+        assert query_rows(conn, r"SELECT length('\') AS n") == [{"n": 1}]
+    finally:
+        execute(conn, "RESET standard_conforming_strings")
     # the build: a timestamptz literal is read in the site zone
     spec = fixed_ref().model_copy(deep=True)
     spec.custom_sql = [CustomSQL(name="when", target_table="metadata", sql=(

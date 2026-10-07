@@ -10,8 +10,12 @@ corresponding DQD SQL file, so results line up with the official R package:
   ``sourceConceptRecordCompleteness``, ``sourceValueCompleteness``, ``plausibleValueLow/High``,
   ``plausibleStartBeforeEnd``, ``plausibleAfterBirth``, ``plausibleBeforeDeath``,
   ``plausibleDuringLife``, ``withinVisitDates``;
-* ETL level (ours): ``etlRecordRetention`` (source rows that never reached the CDM) and
-  ``etlStepError`` (an ETL step that failed). Each carries the step's label (``step``): a second
+* ETL level (ours): ``etlRecordRetention`` (source rows that never reached the CDM, including
+  rows dropped for a NULL required value), ``etlStepError`` (an ETL step that failed),
+  ``etlRequiredFieldNull`` (rows dropped because a required field such as a start date or the
+  year of birth was NULL, per field; threshold 0 for person, 5% elsewhere) and
+  ``etlDefaultedValue`` (required values the build completed by the CDM convention: a concept 0,
+  an end date equal to the start date; 5%). Each carries the step's label (``step``): a second
   mapping into one table gets its own key, e.g. ``etlRecordRetention.measurement.measurement_2``.
 
 The other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``, ``plausibleTemporalAfter``,
@@ -43,11 +47,17 @@ from ..cdm.spec import RESOURCE_PKG, load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, execute, fetch_all, fetch_one, qi, ql, short_error
 from ..etl.compiler import SPEC_KINDS, step_label, target_tables
+from ..etl.policies import END_FROM_START, required_null_policy
 from ..models import CheckResult, DQReport, ETLRunResult, ETLSpec, TableLoadResult
 from ..workspace import utcnow
 
 CHECK_TIMEOUT_MS = 600_000
 ETL_RETENTION_THRESHOLD = 5.0
+# Required values the build had to complete or drop (etlDefaultedValue, etlRequiredFieldNull): the
+# share of a step's rows that fails the check. A person dropped for a NULL required value (year of
+# birth) takes every record of that person with them, so for person any drop fails.
+ETL_VALUE_THRESHOLD = 5.0
+ETL_PERSON_DROP_THRESHOLD = 0.0
 
 # Field-level checks we implement, in DQD order, with the metadata filter that enables each one
 # (the ``evaluationFilter`` column of the Check_Descriptions file).
@@ -575,7 +585,9 @@ def _not_implemented_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
 
 def etl_checks(etl_result: ETLRunResult, min_retention_pct: float = 50.0) -> list[CheckResult]:
     """``etlStepError`` for failed steps; ``etlRecordRetention`` for steps that report source rows,
-    and the fatal ``etlRecordLoss`` when a step keeps less than ``min_retention_pct`` of them.
+    and the fatal ``etlRecordLoss`` when a step keeps less than ``min_retention_pct`` of them;
+    ``etlRequiredFieldNull`` and ``etlDefaultedValue`` per field whose required values a step
+    dropped or completed (``TableLoadResult.value_counts``).
 
     Every result carries the step label. The error of a non-blocking step is a convention-level
     failure, and the repair agent only gets the errors of steps that run spec SQL. When a person
@@ -624,7 +636,63 @@ def etl_checks(etl_result: ETLRunResult, min_retention_pct: float = 50.0) -> lis
                         }
                     )
                 )
+        if not s.error:
+            out += _required_value_checks(s, label)
     return out
+
+
+def _required_value_checks(s: TableLoadResult, label: str) -> list[CheckResult]:
+    """``etlRequiredFieldNull`` per field with rows dropped for a NULL required value, and
+    ``etlDefaultedValue`` per field whose NULL required values got the CDM default. Both count
+    source rows (before vocabulary fan-out) out of the rows that survived the id-map joins."""
+    rows = s.id_retained_rows if s.id_retained_rows is not None else int(s.source_rows or 0)
+    out: list[CheckResult] = []
+    for f, n in sorted(s.value_counts.get("required_null", {}).items()):
+        threshold = ETL_PERSON_DROP_THRESHOLD if s.target_table == "person" else ETL_VALUE_THRESHOLD
+        out.append(_value_check(
+            s, label, "etlRequiredFieldNull", f, n, rows, threshold,
+            f"Rows of ETL step '{s.step}' dropped because the required field {s.target_table}.{f} was NULL (missing "
+            f"in the source, or the expression gave no value): {n} of {rows} rows. The CDM has no convention for a "
+            "missing value of this field, so the record cannot be loaded; fix the expression if the source has the "
+            "value in another form.",
+        ))
+    for f, n in sorted(s.value_counts.get("defaulted", {}).items()):
+        start = END_FROM_START.get((s.target_table, f))
+        if start:
+            what = f"took the start date ({start})"
+        elif required_null_policy(s.target_table, f) == "zero":
+            what = "became 0 (no matching concept)"
+        else:
+            what = "got the CDM default"
+        out.append(_value_check(
+            s, label, "etlDefaultedValue", f, n, rows, ETL_VALUE_THRESHOLD,
+            f"Rows of ETL step '{s.step}' whose required field {s.target_table}.{f} was NULL and {what}, by the CDM "
+            f"convention: {n} of {rows} rows. Write an explicit fallback when the source has a better value.",
+        ))
+    return out
+
+
+def _value_check(
+    s: TableLoadResult, label: str, name: str, target_field: str, n: int, rows: int, threshold: float,
+    description: str,
+) -> CheckResult:
+    return CheckResult(
+        check_name=name,
+        check_level="ETL",
+        table=s.target_table,
+        field=target_field,
+        description=description,
+        category="Completeness",
+        subcategory="ETL",
+        severity="convention",
+        num_violated_rows=n,
+        num_denominator_rows=rows,
+        pct_violated_rows=n / rows if rows else 0.0,
+        threshold_pct=threshold,
+        failed=n * 100 > threshold * rows,
+        sql=s.sql,
+        step=label,
+    )
 
 
 def _retention(s: TableLoadResult) -> CheckResult:
@@ -651,7 +719,8 @@ def _retention(s: TableLoadResult) -> CheckResult:
         description=(
             f"The number and percent of source rows of ETL step '{s.step}' that were not loaded into "
             f"{s.target_table}: {dropped} of {source} records dropped (for example rows whose person or visit key "
-            f"has no match). Rows the mapping's own filter or inner joins leave out are not counted here.{extra}"
+            "has no match, or rows dropped because a required value was NULL: see etlRequiredFieldNull). Rows the "
+            f"mapping's own filter or inner joins leave out are not counted here.{extra}"
         ),
         category="Completeness",
         subcategory="ETL",

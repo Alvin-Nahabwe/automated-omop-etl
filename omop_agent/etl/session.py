@@ -2,8 +2,8 @@
 
 Spec expressions run in the build (``etl.runner``), in the vocabulary stage (``query_rows``,
 used by ``collect_terms`` and the coverage queries), in the repair agent's counts and EXPLAINs,
-and in the design validator's EXPLAINs. They must read dates and times the same way in every
-one of them, whatever the server or role defaults are:
+and in the design validator's EXPLAINs. They must read dates, times and strings the same way in
+every one of them, whatever the server or role defaults are:
 
 * ``DateStyle = 'ISO, YMD'``: an ambiguous ``'03/04/2020'::date`` does not silently depend on
   the server's setting (MDY in a default install, DMY elsewhere). Under YMD a day-first or
@@ -14,7 +14,9 @@ one of them, whatever the server or role defaults are:
   are read in the site's zone, whatever the server's is. Unset, the session keeps the server's
   (or role's) zone, as builds always did;
 * ``omop_agent.imputation_cap``: the latest date a partial date may be completed to, the
-  configured ``cdm_source.source_release_date`` or else the current date.
+  configured ``cdm_source.source_release_date`` or else the current date;
+* ``standard_conforming_strings = on`` (the default): a backslash is an ordinary character in
+  '...' strings, as ``sqlguard`` reads them, and as the literals the compiler writes assume.
 
 Every setting is transaction-local (``SET LOCAL``, ``set_config(..., true)``): run them inside
 the transaction or savepoint of the statements they apply to.
@@ -35,6 +37,7 @@ def session_sql(cfg: ProjectConfig | None = None) -> list[str]:
     cap = ql(release.isoformat()) if release is not None else "CURRENT_DATE::text"
     return [
         "SET LOCAL datestyle = 'ISO, YMD';",
+        "SET LOCAL standard_conforming_strings = on;",
         *([f"SET LOCAL timezone = {ql(zone)};"] if zone else []),
         f"SELECT set_config('omop_agent.imputation_cap', {cap}, true);",
     ]

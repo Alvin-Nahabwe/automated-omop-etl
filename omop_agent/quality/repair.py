@@ -54,7 +54,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ..cdm.spec import load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, execute, rollback_only, short_error
-from ..etl.compiler import SPEC_KINDS
+from ..etl.compiler import LAYER_1_MARKER, SPEC_KINDS
 from ..etl.session import apply_session
 from ..llm.base import AgentTool, LLMClient, LLMError, LLMUnavailable
 from ..models import (
@@ -100,7 +100,11 @@ with one field mapping per CDM field. Source columns are all text, so cast expli
                source_vocabulary_id, target_domain = the OMOP domain of the targets; concept_role 'source'
                returns the map's source_concept_id
   null         leave the field NULL
-Concept lookups yield 0 when a source value exists but has no mapping. Source and join tables are staged
+Concept lookups yield 0 when a source value exists but has no mapping. A required value that comes out
+NULL follows the CDM convention automatically and is counted: a required concept becomes 0 and
+visit_end_date, visit_detail_end_date and drug_exposure_end_date take the start date (etlDefaultedValue
+tells you where a better fallback may exist); a row without another required value (a start date,
+year_of_birth, death_date) is dropped (etlRequiredFieldNull). Source and join tables are staged
 source table names (or {src}., {vocab}., {etl}.-qualified names). Spec SQL must be a single expression or
 condition: no statement separators, no catalog, file or session functions, and no direct identifiers
 (names, phone numbers, national ids, addresses, GPS): those are never loaded into the CDM.
@@ -831,6 +835,7 @@ def validate_mapping(
 ) -> str | None:
     """None if ``tm`` compiles and its INSERT EXPLAINs cleanly (under the build's session
     settings), else the error."""
+    from ..cdm.ddl import create_etl_tables
     from ..etl.compiler import compile_table
 
     try:
@@ -839,6 +844,7 @@ def validate_mapping(
         return f"does not compile: {e}"
     try:
         with rollback_only(conn):
+            create_etl_tables(conn, schemas)  # the INSERT calls the ETL helper functions
             apply_session(conn, cfg)
             execute(conn, "EXPLAIN\n" + sql.rstrip().rstrip(";"))
     except psycopg.Error as e:
@@ -1114,6 +1120,17 @@ def _clip(text: str | None, n: int) -> str:
     return text if len(text) <= n else text[:n] + "\n... (truncated)"
 
 
+def _clip_sql(sql: str | None, n: int) -> str:
+    """``_clip`` for the SQL of a step or check. A table mapping's INSERT computes the spec's values
+    in its innermost layer, at the end of the text, after the column list and the outer SELECTs:
+    when it is too long, it is shown from that layer."""
+    text = (sql or "").strip()
+    start = text.find(LAYER_1_MARKER)
+    if len(text) > n and start > 0:
+        text = "-- (the INSERT column list and the outer SELECTs are left out)\n" + text[start:]
+    return _clip(text, n)
+
+
 def _small_count(n: int | None, k: int) -> str:
     """A record count for a prompt: counts between 1 and k-1 are shown as '<k'."""
     if n is None:
@@ -1159,7 +1176,7 @@ def build_repair_prompt(
             if s.source_rows is not None:
                 lines.append(f"   source rows: {_small_count(s.source_rows, k)}")
             if s.sql:
-                lines.append("   failing SQL:\n```sql\n" + _clip(s.sql, 4000) + "\n```")
+                lines.append("   failing SQL:\n```sql\n" + _clip_sql(s.sql, 4000) + "\n```")
     else:
         lines.append(
             f"The data-quality checks found {len(checks)} failure(s) with a severity the pipeline repairs "
@@ -1177,7 +1194,7 @@ def build_repair_prompt(
             lines.append(f"{i}. {head}")
             lines.append(f"   {r.check_level} check: {description}")
             if r.sql:
-                lines.append("   check SQL:\n```sql\n" + _clip(r.sql, 1500) + "\n```")
+                lines.append("   check SQL:\n```sql\n" + _clip_sql(r.sql, 1500) + "\n```")
         if len(checks) > MAX_FAILURES_IN_PROMPT:
             lines.append(f"... and {len(checks) - MAX_FAILURES_IN_PROMPT} more failures (fix the ones above first).")
     lines.append("\nTABLE MAPPINGS IN THE ETL SPEC")
