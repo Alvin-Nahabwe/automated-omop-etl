@@ -42,6 +42,7 @@ from ..approvals import (
     record_approval,
 )
 from ..db import Schemas, connect
+from ..etl.compiler import key_sources
 from ..models import ConceptCandidate, DQReport, ETLSpec, MappingDecision
 from ..runlock import RunInProgress, run_lock
 from ..vocab.review import import_review, update_review_row
@@ -402,7 +403,8 @@ def create_app(
         user = need(request)
         proj = configured(project_or_404(pid))
         ws = proj.ws
-        ctx: dict[str, Any] = {"project": proj, "gate": gate_state(ws, "design"), "spec": None, "spec_error": None}
+        ctx: dict[str, Any] = {"project": proj, "gate": gate_state(ws, "design"), "spec": None, "spec_error": None,
+                               "key_sources": {"person": [], "visit": []}}
         if ws.spec_yaml.exists():
             text = ws.spec_yaml.read_text()
             ctx["spec_text"] = text
@@ -410,6 +412,11 @@ def create_app(
                 ctx["spec"] = ETLSpec.model_validate(yaml.safe_load(text))
             except (ValidationError, yaml.YAMLError) as e:
                 ctx["spec_error"] = str(e)[:3000]
+            else:  # the other mappings whose keys go into the person and visit id maps
+                ctx["key_sources"] = {
+                    what: [{"table": tm.source.table, "expression": expr} for tm, expr, _ in key_sources(ctx["spec"], t)]
+                    for what, t in (("person", "person"), ("visit", "visit_occurrence"))
+                }
             approved = approved_snapshot(ws, "design")
             if approved is not None and not ctx["gate"].current:
                 ctx["diff"] = list(

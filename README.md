@@ -182,9 +182,12 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   the first build that runs as their owner.
 * **Nothing Claude produces is trusted blindly.** Concept ids must exist in your vocabulary
   as valid standard concepts in the right domain. Person and visit ids always come from the id
-  maps, so events can't attach to the wrong patient. The repair agent may not filter out
-  records, add inner joins or blank fields; a repair that makes results worse, or loads fewer
-  records, is rolled back; and DQ verdicts come from SQL.
+  maps, so events can't attach to the wrong patient, and a record links only to a visit of its
+  own person (checked after the load by `fkVisitPerson`). The repair agent may not filter out
+  records, add inner joins or blank fields, nor change who exists in the CDM (person keys, the
+  visit key, new person, visit or death mappings, their filters): those are left to a person; a
+  repair that makes results worse, or loads fewer records, is rolled back; and DQ verdicts come
+  from SQL.
 * **A PASS means the data is there.** Besides fatal DQD failures, the gate blocks when a table
   mapping loads less than half of its source rows (`etlRecordLoss`) and when persons have no
   observation period (`quality.blocking_checks`). A required value that comes out NULL follows
@@ -250,6 +253,15 @@ runs the demo inside it.
   are treated as reference data and are not suppressed.
 
 * The target database is PostgreSQL only. Source databases can be anything SQLAlchemy reads.
+* People and visits can come from several source tables: every person and visit_occurrence
+  mapping adds the keys of its rows to the id map (prefix the keys of a source that numbers its
+  own, e.g. `'EMR:' || patient_no`). `person` and `death` keep one row per person and
+  `visit_occurrence` one row per visit and person (several rows of a visit span its earliest
+  start to its latest end); a mapping's `dedup_order` chooses the row (a missing value ranks
+  last), and duplicates and conflicting rows are reported (`etlDuplicateRecords`,
+  `etlKeyConflict`), never resolved silently. A visit key shared by two people still fails
+  `isPrimaryKey`, and one coarser than a visit (rows that are separate stays) fails
+  `etlVisitGrain`.
 * Person and visit ids are kept stable across re-runs and are never given to another key.
   People and visits that a load filtered out are retired from the id maps with their ids
   (`etl.person_map_retired`, `etl.visit_map_retired`) and get the same ids back when they return.

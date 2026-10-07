@@ -34,6 +34,7 @@ from pydantic import BaseModel
 from ..cdm.spec import LOAD_ORDER, load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, fetch_all, qi, short_error
+from ..etl.compiler import key_sources
 from ..privacy import apply_overrides
 from ..models import (
     CheckResult,
@@ -44,6 +45,7 @@ from ..models import (
     RepairAction,
     SourceAnnotations,
     SourceProfile,
+    TableLoadResult,
 )
 from ..workspace import STAGES, Workspace, utcnow
 
@@ -457,16 +459,23 @@ def _design_section(spec: ETLSpec) -> dict[str, Any]:
                 "source": f"{m.source.table} {m.source.alias}",
                 "joins": [f"{j.join_type} join {j.table} {j.alias} on {j.on}" for j in m.joins],
                 "where": m.where or "",
+                "dedup_order": m.dedup_order or "",
                 "n_fields": len(m.fields),
                 "kinds": ", ".join(f"{k} {n}" for k, n in sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))),
                 "rationale": m.rationale,
             }
         )
     order = FIELD_KINDS + sorted(k for k in total if k not in FIELD_KINDS)
+
+    def also(table: str) -> str:  # the other mappings whose keys go into the id map
+        return "; ".join(f"{tm.source.table}: {' '.join(expr.split())}" for tm, expr, _ in key_sources(spec, table))
+
     return {
         "cdm_version": spec.cdm_version,
         "person_key": f"{spec.person_key.table}: {spec.person_key.expression}",
+        "person_key_also": also("person"),
         "visit_key": f"{spec.visit_key.table}: {spec.visit_key.expression}" if spec.visit_key else "",
+        "visit_key_also": also("visit_occurrence") if spec.visit_key else "",
         "observation_period": spec.observation_period,
         "n_mappings": len(spec.table_mappings),
         "n_fields": sum(total.values()),
@@ -593,14 +602,56 @@ def _mapping_section(decisions: list[MappingDecision], cfg: ProjectConfig, share
     }
 
 
-def _etl_section(run: ETLRunResult) -> dict[str, Any]:
+def _key_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
+    """One row per key (person, death, visit_occurrence): source rows that lost to another row of
+    their key, keys an earlier mapping loaded, conflicting keys and keys with a code of several
+    concepts, e.g. '30 dup / 45 earlier / 3 conflicting'."""
+    st = s.stats
+    if s.error or "keys" not in st:
+        return ""
+    parts = [f"{count(int(st.get('duplicate_rows') or 0))} dup", f"{count(int(st.get('already_loaded_keys') or 0))} "
+             "earlier", f"{count(int(st.get('conflict_keys') or 0))} conflicting"]
+    if st.get("fan_out_keys"):
+        parts.append(f"{count(int(st['fan_out_keys']))} fan-out")
+    if st.get("gap_keys"):
+        parts.append(f"{count(int(st['gap_keys']))} separate stays")
+    return " / ".join(parts)
+
+
+def _link_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
+    """Visit links of a step's records: linked of those with a visit key, how many name another
+    person's visit and how many a visit a visit mapping left out (filtered out, or not loaded)."""
+    links = s.stats.get("visit_links") or {}
+    if not links:
+        return ""
+    text = f"{count(int(links.get('linked') or 0))}/{count(int(links.get('with_key') or 0))}"
+    extra = [f"{count(int(links[k]))} {label}" for k, label in (("other_person", "other person"),
+                                                                 ("filtered", "filtered")) if links.get(k)]
+    return ", ".join([text] + extra)
+
+
+def _retention(s: TableLoadResult) -> float | None:
+    """Rows inserted per source row; for a step that keeps one row per key, the source rows kept
+    (``retained_rows``, the etlRecordRetention basis): rows that lost to another row of their key,
+    or rolled up into one visit, are not lost (the 'One row per key' column counts them)."""
+    if "keys" in s.stats and s.retained_rows is not None:
+        return _ratio(s.retained_rows, s.source_rows)
+    return _ratio(s.rows_inserted, s.source_rows)
+
+
+def _etl_section(run: ETLRunResult, min_cell_count: int = 5, shareable: bool = False) -> dict[str, Any]:
+    def count(n: int) -> str:  # counts in (0, min_cell_count) are withheld in the shareable report
+        return small_cell(n, min_cell_count)["display"] if shareable else fmt_int(n)
+
     steps = [
         {
             "table": s.target_table,
             "step": s.step,
             "rows": s.rows_inserted,
             "source_rows": s.source_rows,
-            "retention": _ratio(s.rows_inserted, s.source_rows) if s.error is None else None,
+            "retention": _retention(s) if s.error is None else None,
+            "one_row_per_key": _key_stats(s, count),
+            "visit_links": _link_stats(s, count),
             "seconds": s.seconds,
             "error": _short(s.error, 600) if s.error else "",
         }
@@ -1048,7 +1099,7 @@ def collect_report_data(
     design = _design_section(spec) if spec else None
     vocab = _vocab_section(vocab_eval, mcc, shareable) if vocab_eval is not None else None
     mapping = _mapping_section(decisions, cfg, shareable) if decisions is not None else None
-    etl = _etl_section(etl_run) if etl_run else None
+    etl = _etl_section(etl_run, mcc, shareable) if etl_run else None
     dq_data = _dq_section(dq, cfg) if dq else None
     notes = list(annotations.notes) if annotations else []
     llm = _llm_section(cfg, ws, audit)

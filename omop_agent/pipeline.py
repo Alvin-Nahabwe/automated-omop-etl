@@ -603,6 +603,7 @@ class _BuildHistory:
 
     def __init__(self) -> None:
         self.rows: dict[str, int] = {}
+        self.links: dict[str, tuple[int, int]] = {}  # table -> (records with a visit key, linked to a visit)
         self.applicable: set[str] = set()
 
     @staticmethod
@@ -617,9 +618,25 @@ class _BuildHistory:
                 out[s.target_table] = out.get(s.target_table, 0) + int(s.rows_inserted or 0)
         return out
 
+    @staticmethod
+    def _links(etl: ETLRunResult) -> dict[str, tuple[int, int]]:
+        """Per CDM table, the records with a visit key and those linked to a visit of their person
+        (``stats['visit_links']``): a repair that makes visit keys NULL or breaks them loses links."""
+        out: dict[str, tuple[int, int]] = {}
+        for s in etl.steps:
+            links = s.stats.get("visit_links") if not s.error and s.target_table else None
+            if links:
+                with_key, linked = out.get(s.target_table, (0, 0))  # type: ignore[arg-type]
+                out[s.target_table] = (with_key + int(links.get("with_key") or 0),  # type: ignore[index]
+                                       linked + int(links.get("linked") or 0))
+        return out
+
     def add(self, etl: ETLRunResult, report: DQReport | None) -> None:
         for table, n in self._rows(etl).items():
             self.rows[table] = max(self.rows.get(table, 0), n)
+        for table, (with_key, linked) in self._links(etl).items():
+            before = self.links.get(table, (0, 0))
+            self.links[table] = (max(before[0], with_key), max(before[1], linked))
         if report is not None:
             self.applicable |= {r.key for r in report.results if not r.not_applicable and r.check_level != "ETL"}
 
@@ -630,6 +647,13 @@ class _BuildHistory:
             n = now.get(table, 0)
             if before > 0 and n < LOSS_TOLERANCE * before:
                 out.append(f"{table} loaded {n} rows, {before} before")
+        links = self._links(etl)
+        for table, (with_key, linked) in sorted(self.links.items()):
+            now_key, now_linked = links.get(table, (0, 0))
+            if with_key > 0 and now_key < LOSS_TOLERANCE * with_key:
+                out.append(f"{table} has {now_key} records with a visit key, {with_key} before")
+            elif linked > 0 and now_linked < LOSS_TOLERANCE * linked:
+                out.append(f"{table} has {now_linked} records linked to their visit, {linked} before")
         if report is not None:
             blanked = sorted(r.key for r in report.results if r.not_applicable and r.key in self.applicable)
             if blanked:

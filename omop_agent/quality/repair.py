@@ -88,10 +88,13 @@ The ETL is defined by an ETL spec. Each table mapping compiles to one
 with one field mapping per CDM field. Source columns are all text, so cast explicitly. Field kinds:
   column / expression / constant  a PostgreSQL expression over the source aliases, cast to the CDM type
   person_id    the source patient key, resolved through the person id map (rows without a person are
-               dropped). Every person_id field must use this kind.
+               dropped). Every person_id field must use this kind. Every person mapping adds the keys of
+               its rows to the map, so people can come from several source tables.
   visit_id     the source visit key, resolved through the visit id map. An optional field (e.g.
                condition_occurrence.visit_occurrence_id) keeps the row with NULL when there is no match;
-               the required visit_occurrence primary key drops rows without a visit.
+               the required visit_occurrence primary key drops rows without a visit. A record links only
+               to a visit of its own person, and only when its visit key is written exactly as in the
+               visit mapping (same text: case, padding, separators, prefix, date format).
   auto_id      generated surrogate key (only for the table's own primary key; never for person.person_id
                or visit_occurrence.visit_occurrence_id, which come from the id maps)
   vocab_code   a code of an OMOP vocabulary: expression = the code as in concept_code, vocabulary = its
@@ -100,6 +103,18 @@ with one field mapping per CDM field. Source columns are all text, so cast expli
                source_vocabulary_id, target_domain = the OMOP domain of the targets; concept_role 'source'
                returns the map's source_concept_id
   null         leave the field NULL
+person, death and visit_occurrence keep one row per key (person and death: one per person; visit_occurrence:
+one per visit and person, from the earliest start to the latest end of its rows). A mapping's dedup_order (an
+ORDER BY list over its aliases, best row first, e.g. "x.verified = '1' DESC"; a missing or unreadable value
+ranks last) says which row of a key is loaded; without one the most complete row is (for death, a date
+known to the day, then the latest). Set it when etlKeyConflict reports person rows that disagree on sex or
+birth year, ranking the row that should win first. Who exists in the CDM is decided by people: changes to a
+person_id expression (in any table, unless the mapping cannot run at all), to the key of person or
+visit_occurrence, to the filter of person, visit_occurrence or death, and new mappings into those tables
+are refused. A record that names another person's visit, or a key no visit mapping reads (etlVisitLinkage,
+etlVisitLinkLoss), is fixed in its visit_id expression so that it gives the visit mapping's key, never by
+changing its person_id and never by making the visit key NULL: an edit that takes the visit key away from
+records that have one is refused.
 Concept lookups yield 0 when a source value exists but has no mapping. Casts (::date, ::numeric, ...)
 and to_date / to_timestamp in column and expression fields and in the filter are tolerant: a value that
 cannot be read as written (31/02/2019, a date in another layout than the template, a number with text in
@@ -252,7 +267,7 @@ class ReplaceTableMappingInput(_ToolInput):
     mapping_yaml: str = Field(
         ...,
         description="The complete new TableMapping as YAML, in the format get_table_mapping returns "
-        "(target_table, source {table, alias}, joins, where, fields, rationale).",
+        "(target_table, source {table, alias}, joins, where, dedup_order, fields, rationale).",
     )
     rationale: str = Field(..., description="Why this change fixes the failure.")
     mapping_index: int = Field(
@@ -297,10 +312,12 @@ def _same_logic(a: FieldMapping, b: FieldMapping) -> bool:
 
 
 def _same_mapping_logic(a: TableMapping, b: TableMapping) -> bool:
-    """Same source, joins, filter and field logic (rationales and field order aside)."""
+    """Same source, joins, filter, dedup_order and field logic (rationales and field order aside)."""
     if a.target_table.lower() != b.target_table.lower() or (a.source, a.joins) != (b.source, b.joins):
         return False
     if (a.where or "").strip() != (b.where or "").strip():
+        return False
+    if (a.dedup_order or "").strip() != (b.dedup_order or "").strip():
         return False
     fa = {f.target_field: f for f in a.fields}
     fb = {f.target_field: f for f in b.fields}
@@ -317,6 +334,8 @@ def _mapping_diff(old: TableMapping | None, new: TableMapping) -> str:
         parts.append("joins changed")
     if (old.where or "") != (new.where or ""):
         parts.append(f"where: {old.where or '(none)'} → {new.where or '(none)'}")
+    if (old.dedup_order or "").strip() != (new.dedup_order or "").strip():
+        parts.append(f"dedup_order: {old.dedup_order or '(none)'} → {new.dedup_order or '(none)'}")
     old_f = {f.target_field: f for f in old.fields}
     new_f = {f.target_field: f for f in new.fields}
     for name, fm in new_f.items():
@@ -791,7 +810,7 @@ def _pii_tokens(state: RepairState, tm: TableMapping) -> list[str]:
     """Direct-identifier columns of the mapping's source tables named anywhere in its SQL (also
     unqualified); complements ``privacy.pii_references``, which follows alias.column references."""
     pii = pii_columns(state.profile, state.cfg.privacy)
-    texts = [f.expression for f in tm.fields] + [tm.where] + [j.on for j in tm.joins]
+    texts = [f.expression for f in tm.fields] + [tm.where, tm.dedup_order] + [j.on for j in tm.joins]
     tokens = set().union(*(_tokens(t) for t in texts))
     hits: list[str] = []
     for ref in [tm.source.table] + [j.table for j in tm.joins]:
@@ -816,6 +835,13 @@ def mapping_issues(state: RepairState, tm: TableMapping) -> list[str]:
     for fm in tm.fields:
         issues += [f"{fm.target_field} expression {i}" for i in fragment_issues(fm.expression)]
     issues += [f"where {i}" for i in fragment_issues(tm.where)]
+    issues += [f"dedup_order {i}" for i in fragment_issues(tm.dedup_order)]
+    if tm.dedup_order:
+        from ..design.validate import paren_problem
+
+        problem = paren_problem(tm.dedup_order)
+        if problem:
+            issues.append(f"dedup_order has unbalanced parentheses ({problem}); it must be an ORDER BY list")
     for j in tm.joins:
         issues += [f"join {j.alias} condition {i}" for i in fragment_issues(j.on)]
     with _readonly(state.conn):
@@ -851,8 +877,9 @@ def validate_mapping(
     """None if ``tm`` compiles and its INSERT EXPLAINs cleanly (under the build's session
     settings), else the error. With ``old`` (the mapping ``tm`` replaces) the edit is also
     dry-run: a change that makes a required field whose NULL drops the row (a start date,
-    year_of_birth, death_date) NULL for rows where it was not would drop those records, which
-    the repair agent may not do (``drop_guard``)."""
+    year_of_birth, death_date) NULL for rows where it was not would drop those records, and one
+    that makes a record's visit key NULL would hide the records that lose their visit, which the
+    repair agent may not do (``drop_guard``)."""
     from ..cdm.ddl import create_etl_tables
     from ..etl.compiler import compile_table
 
@@ -886,16 +913,18 @@ def drop_guard(
     old: TableMapping, new: TableMapping, spec: ETLSpec, conn: psycopg.Connection, schemas: Schemas,
     cfg: ProjectConfig | None = None,
 ) -> str | None:
-    """Why the edit ``old`` -> ``new`` may not be applied because it would drop records (None:
-    it may). For each changed required field whose NULL drops the row, the rows where it becomes
-    NULL are counted (``etl.compiler.nulling_count_sql``) under ``COUNT_TIMEOUT_MS``; when the old
+    """Why the edit ``old`` -> ``new`` may not be applied because it would drop records, or take
+    their visit key away (None: it may). For each changed required field whose NULL drops the row,
+    and each changed visit key of a record's visit link, the rows where it becomes NULL are
+    counted (``etl.compiler.nulling_count_sql``) under ``COUNT_TIMEOUT_MS``; when the old
     value does not fit the new mapping's sources (a renamed alias), the NULLs of each mapping over
     its own rows are compared instead. A count that times out or fails lets the edit through: the
     build history still reverts a build that lost records."""
     from ..etl.compiler import nulling_count_sql
 
     try:
-        counts = nulling_count_sql(old, new, spec, schemas, etl=cfg.etl if cfg is not None else None)
+        counts = nulling_count_sql(old, new, spec, schemas, etl=cfg.etl if cfg is not None else None,
+                                   na_values=cfg.source.effective_na_values if cfg is not None else ())
     except Exception:  # validate_mapping compiled it already; nothing to guard
         return None
     k = cfg.privacy.min_cell_count if cfg is not None else PrivacyConfig().min_cell_count
@@ -909,6 +938,14 @@ def drop_guard(
             if new_t is None or old_t is None:
                 continue
             n = (int(new_t["n"]) - int(new_t["v"])) - (int(old_t["n"]) - int(old_t["v"]))
+        if n > 0 and sql.what == "visit_key":
+            return (
+                f"it would take the visit key away from {_small_count(n, k)} rows of {new.target_table}: "
+                f"{new.target_table}.{name} becomes NULL for them (their key is not NULL with the current mapping), "
+                "which hides records that lose their visit instead of linking them. Keep the key: write it so that it "
+                "gives the visit mapping's key (etlVisitLinkage counts the records whose key links to no visit of "
+                "their person)"
+            )
         if n > 0:
             return (
                 f"it would drop {_small_count(n, k)} rows of {new.target_table}: the required field "
@@ -970,6 +1007,42 @@ def data_loss_issues(old: TableMapping | None, new: TableMapping) -> list[str]:
     return out
 
 
+# Tables whose rows decide who exists in the CDM (people, visits, deaths).
+IDENTITY_TABLES = ("person", "visit_occurrence", "death")
+_KEY_FIELDS = {"person": ("person_id", "person_id"), "visit_occurrence": ("visit_occurrence_id", "visit_id")}
+
+
+def identity_issues(old: TableMapping | None, new: TableMapping, *, old_runs: bool = True) -> list[str]:
+    """Edits that change who exists in the CDM or whose records are whose, which only a person may
+    decide: a changed person_id expression (in any table: it re-attributes records), a changed key
+    of person or visit_occurrence, a new mapping into person, visit_occurrence or death, and a
+    removed or changed filter of those tables (a new or changed filter is also data loss). When
+    the old mapping cannot run at all (``old_runs`` False: it does not compile or EXPLAIN, e.g. a
+    misspelled key column), it never loaded a record, so its keys may be fixed."""
+    target = new.target_table.lower()
+    if old is None:
+        if target in IDENTITY_TABLES:
+            return [f"it adds a mapping into {target}, which decides who (or which visits and deaths) exist in "
+                    "the CDM"]
+        return []
+    out: list[str] = []
+    before = {f.target_field: f for f in old.fields}
+    after = {f.target_field: f for f in new.fields}
+    key_field, key_kind = _KEY_FIELDS.get(target, (None, None))
+    for name in sorted(set(before) | set(after)) if old_runs else []:
+        a, b = before.get(name), after.get(name)
+        ids = {f.kind for f in (a, b) if f is not None} & {"person_id", "visit_id"}
+        if "person_id" not in ids and not (name == key_field and key_kind in ids):
+            continue
+        if a is None or b is None or (a.kind, _norm_sql(a.expression)) != (b.kind, _norm_sql(b.expression)):
+            what = "the key" if name == key_field else "the person key"
+            out.append(f"it changes {what} of {target}.{name} ({_fm_text(a)} → {_fm_text(b)}), which re-attributes "
+                       "records or changes who exists in the CDM")
+    if target in IDENTITY_TABLES and old.where and _norm_sql(old.where) != _norm_sql(new.where):
+        out.append(f"it {'changes' if new.where else 'removes'} the filter of {target} (where: {old.where})")
+    return out
+
+
 def _apply(
     state: RepairState,
     pos: int | None,
@@ -979,7 +1052,8 @@ def _apply(
     change: str,
     rationale: str,
 ) -> str:
-    loss = data_loss_issues(state.spec.table_mappings[pos] if pos is not None else None, new_tm)
+    old_tm = state.spec.table_mappings[pos] if pos is not None else None
+    loss = data_loss_issues(old_tm, new_tm)
     if loss:
         return (
             "REJECTED: " + "; ".join(loss) + ". The repair agent may not remove records or data to make a check "
@@ -989,13 +1063,22 @@ def _apply(
     issues = mapping_issues(state, new_tm)
     if issues:
         return "REJECTED: " + "; ".join(issues)
+    identity = identity_issues(old_tm, new_tm)
+    if identity and old_tm is not None and validate_mapping(old_tm, state.spec, state.conn, state.schemas,
+                                                            state.cfg) is not None:
+        identity = identity_issues(old_tm, new_tm, old_runs=False)  # it never loaded a record
+    if identity:
+        return (
+            "REJECTED: " + "; ".join(identity) + ". Who exists in the CDM, and whose records are whose, is decided "
+            "by people: leave the spec as it is and describe the change you would make in your summary, for a "
+            "person to decide."
+        )
     mappings = list(state.spec.table_mappings)
     if pos is None:
         mappings.append(new_tm)
     else:
         mappings[pos] = new_tm
     new_spec = state.spec.model_copy(update={"table_mappings": mappings}, deep=True)
-    old_tm = state.spec.table_mappings[pos] if pos is not None else None
     error = validate_mapping(new_tm, new_spec, state.conn, state.schemas, state.cfg, old=old_tm)
     if error:
         return f"REJECTED: {error}"
@@ -1184,9 +1267,12 @@ def repair_triggers(
 ) -> tuple[list[TableLoadResult], list[CheckResult]]:
     """The errors of blocking steps that run spec SQL, if there are any; otherwise the repairable DQ
     failures in ``repair_severities`` (``checks.repairable``). Errors of steps the build generates
-    (id-map pruning, routing, eras, ...) are never given to the agent: its tools cannot change them."""
+    (id-map pruning, routing, eras, ...) and errors a spec change cannot fix (a missing privilege,
+    ``TableLoadResult.repairable``) are never given to the agent: its tools cannot change them."""
     if etl_result is not None:
-        fixable = [s for s in etl_result.blocking_errors() if s.kind is None or s.kind in SPEC_KINDS]
+        fixable = [
+            s for s in etl_result.blocking_errors() if (s.kind is None or s.kind in SPEC_KINDS) and s.repairable
+        ]
         if fixable:
             return fixable, []
     if dq is None:
@@ -1286,9 +1372,10 @@ def build_repair_prompt(
         counts[tm.target_table] = idx + 1
         joins = f" + {', '.join(f'{j.table} {j.alias}' for j in tm.joins)}" if tm.joins else ""
         where = f" WHERE {tm.where}" if tm.where else ""
+        order = f" dedup_order {tm.dedup_order}" if (tm.dedup_order or "").strip() else ""
         lines.append(
             f"- {tm.target_table} (mapping_index {idx}) <- {{src}}.{tm.source.table} {tm.source.alias}{joins}{where}"
-            f" [{len(tm.fields)} fields]"
+            f"{order} [{len(tm.fields)} fields]"
         )
     if spec.custom_sql:
         lines.append(

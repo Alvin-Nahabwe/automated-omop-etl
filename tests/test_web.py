@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+import yaml
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
@@ -306,6 +307,22 @@ def test_spec_page_shows_the_design_and_changes_since_approval(site):
     ws.spec_yaml.write_text(ws.spec_yaml.read_text().replace("Sex code 9", "Sex code 9 (edited)"))
     page = client.get("/p/demo/spec").text
     assert "changed since approval" in page and "Sex code 9 (edited)" in page and 'class="add"' in page
+
+
+def test_spec_page_shows_key_sources_and_dedup_order(site):
+    from omop_agent.models import ETLSpec, FieldMapping, TableMapping
+
+    client, ws, *_ = site
+    login(client, "rita")
+    spec = ETLSpec.model_validate(yaml.safe_load(ws.spec_yaml.read_text()))
+    spec.mapping_for("death").dedup_order = "x.dod::date DESC"
+    spec.table_mappings.append(TableMapping(
+        target_table="person", source={"table": "emr_patients", "alias": "e"}, fields=[
+            FieldMapping(target_field="person_id", kind="person_id", expression="'EMR:' || e.patient_no")]))
+    ws.save_yaml(ws.spec_yaml, spec)
+    page = client.get("/p/demo/spec").text
+    assert "also <code>emr_patients</code> keyed by <code>&#39;EMR:&#39; || e.patient_no</code>" in page
+    assert "one row per key, the best row first by <code>x.dod::date DESC</code>" in page
 
 
 def test_report_is_served_with_a_strict_policy(site):

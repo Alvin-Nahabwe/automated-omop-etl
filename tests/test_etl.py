@@ -90,10 +90,13 @@ def test_step_order_and_targets():
     assert steps[0].slot[0] == steps[1].slot[0] == -1 and steps[-1].slot[0] > len(LOAD_ORDER) - 1
     assert step(steps, "person_map_prune").slot == (LOAD_ORDER.index("person"), 1, 0)
     assert [s.label for s in steps][:3] == ["person_map", "visit_map", "person"]
-    # every step is blocking and reads a row count; its SQL is its statements (two for the id maps
-    # and the visit pruning); the spec kinds. The inserts count the required values they complete
-    # or drop (per field, and the dropped rows), the generated steps count nothing
-    assert all(s.blocking and s.returns == "rowcount" for s in steps)
+    # every step is blocking and reads a row count, except the tables that keep one row per key,
+    # whose statement returns its statistics; its SQL is its statements (two for the id maps and
+    # the visit pruning); the spec kinds. The inserts count the required values they complete or
+    # drop (per field, and the dropped rows), the generated steps count nothing
+    assert all(s.blocking for s in steps)
+    assert [s.label for s in steps if s.returns != "rowcount"] == ["person", "visit_occurrence", "death"]
+    assert {s.returns for s in steps if s.label in ("person", "visit_occurrence", "death")} == {"row"}
     assert all(s.count_sites == () for s in steps if s.kind != "insert")
     # and the tolerant conversions count the values they cannot read, per field
     assert step(steps, "visit_occurrence").count_sites == (
@@ -159,9 +162,12 @@ def test_id_maps():
     vprune = step(steps, "visit_map_prune")
     assert (vprune.kind, vprune.requires) == ("prune", None)
     refresh, retire = vprune.statements
-    # 1) each loaded visit's person is recorded (DELETE + INSERT: the ETL role has no UPDATE)
-    assert "USING cdm.visit_occurrence v, etl.person_map pm" in refresh
-    assert "AND vm.person_source_value IS DISTINCT FROM pm.source_value" in refresh
+    # 1) each loaded visit's person is recorded (DELETE + INSERT: the ETL role has no UPDATE); a
+    #    visit loaded for two people records the same one on every run (the smaller key, byte-wise)
+    assert ("WITH loaded AS (\n    SELECT v.visit_occurrence_id, MIN(pm.source_value COLLATE \"C\") AS person_source_value\n"
+            "    FROM cdm.visit_occurrence v\n    JOIN etl.person_map pm ON pm.person_id = v.person_id\n"
+            "    GROUP BY v.visit_occurrence_id\n)") in refresh
+    assert "AND vm.person_source_value IS DISTINCT FROM l.person_source_value" in refresh
     assert "UPDATE" not in strip_literals(refresh)
     # 2) then the keys without a visit are retired with their person
     assert "DELETE FROM etl.visit_map vm" in retire and "FROM cdm.visit_occurrence v" in retire
@@ -278,16 +284,36 @@ def test_source_count_sql_excludes_lookups():
     m = step(steps, "measurement")
     assert m.source_table == "lab_results"
     assert m.source_count_sql == "SELECT COUNT(*) AS n\nFROM src.lab_results r"
-    # retained: + the INNER person-map join; the optional visit link and the lookups can't drop rows
+    # retained: + the INNER person-map join; the optional visit link and the lookups can't drop
+    # rows. The same pass counts the visit links: rows with a visit key, linked to a visit of their
+    # person, naming another person's visit, or a key of the visit mapping's source rows (before its
+    # filter) without a visit (filtered out); the visit map and the distinct source keys are joined
+    # on their keys, so they do not change n
     assert m.retained_count_sql == (
-        "SELECT COUNT(*) AS n\nFROM src.lab_results r\n"
-        "INNER JOIN etl.person_map pm1 ON pm1.source_value = (r.individual_id)::text"
+        "SELECT COUNT(*) AS n,\n"
+        "       COUNT(*) FILTER (WHERE (r.visit_id) IS NOT NULL) AS with_key,\n"
+        "       COUNT(*) FILTER (WHERE vm2.person_source_value = pm1.source_value) AS linked,\n"
+        "       COUNT(*) FILTER (WHERE vm2.person_source_value <> pm1.source_value) AS other_person,\n"
+        "       COUNT(*) FILTER (WHERE vm2.source_value IS NULL AND vs1.source_value IS NOT NULL) AS filtered\n"
+        "FROM src.lab_results r\n"
+        "INNER JOIN etl.person_map pm1 ON pm1.source_value = (r.individual_id)::text\n"
+        "LEFT JOIN etl.visit_map vm2 ON vm2.source_value = (r.visit_id)::text\n"
+        "LEFT JOIN (\n"
+        "    SELECT DISTINCT k.source_value\n"
+        "    FROM (\n"
+        "        SELECT (v.visit_id)::text AS source_value\n"
+        "        FROM src.clinic_visits v\n"
+        "        WHERE (v.visit_id) IS NOT NULL\n"
+        "    ) k\n"
+        ") vs1 ON vs1.source_value = (r.visit_id)::text"
     )
-    vo = step(steps, "visit_occurrence")  # the required visit key is an INNER join too
+    # the visit mapping's SQL runs in the count, so the runner re-checks it with the step's own
+    assert m.origins == (load_ref().mapping_for("measurement"), load_ref().mapping_for("visit_occurrence"))
+    vo = step(steps, "visit_occurrence")  # the required visit key is an INNER join too, after the person's
     assert vo.retained_count_sql == (
         "SELECT COUNT(*) AS n\nFROM src.clinic_visits v\n"
-        "INNER JOIN etl.visit_map vm1 ON vm1.source_value = (v.visit_id)::text\n"
-        "INNER JOIN etl.person_map pm1 ON pm1.source_value = (v.individual_id)::text"
+        "INNER JOIN etl.person_map pm1 ON pm1.source_value = (v.individual_id)::text\n"
+        "INNER JOIN etl.visit_map vm1 ON vm1.source_value = (v.visit_id)::text"
     )
     assert "concept" not in step(steps, "condition_occurrence").retained_count_sql
     assert all(s.source_count_sql is None and s.retained_count_sql is None for s in steps if s.kind != "insert")
@@ -314,7 +340,8 @@ def test_where_joins_and_custom_sql():
         "        FROM src.prescriptions p\n"
         "        INNER JOIN src.clinic_visits cv ON cv.visit_id = p.visit_id\n"
         "        INNER JOIN etl.person_map pm1 ON pm1.source_value = (p.individual_id)::text\n"
-        "        LEFT JOIN etl.visit_map vm1 ON vm1.source_value = (p.visit_id)::text\n"
+        "        LEFT JOIN etl.visit_map vm1 ON vm1.source_value = (p.visit_id)::text"
+        " AND vm1.person_source_value = pm1.source_value\n"
         "        WHERE (cv.visit_type <> 'EMERG')\n"
         "        OFFSET 0\n"
         "    ) v\n"
@@ -323,6 +350,15 @@ def test_where_joins_and_custom_sql():
     assert de.retained_count_sql.endswith(
         "INNER JOIN src.clinic_visits cv ON cv.visit_id = p.visit_id\n"
         "INNER JOIN etl.person_map pm1 ON pm1.source_value = (p.individual_id)::text\n"
+        "LEFT JOIN etl.visit_map vm2 ON vm2.source_value = (p.visit_id)::text\n"
+        "LEFT JOIN (\n"
+        "    SELECT DISTINCT k.source_value\n"
+        "    FROM (\n"
+        "        SELECT (v.visit_id)::text AS source_value\n"
+        "        FROM src.clinic_visits v\n"
+        "        WHERE (v.visit_id) IS NOT NULL\n"
+        "    ) k\n"
+        ") vs1 ON vs1.source_value = (p.visit_id)::text\n"
         "WHERE (cv.visit_type <> 'EMERG')"
     )
     custom = steps[names.index("09_custom_drop_orphans")]
@@ -427,28 +463,31 @@ def test_compiled_insert_shape():
     vo = compile_spec(spec, S)[4]
     assert vo.label == "visit_occurrence"
     sql = vo.sql
-    # three layers, each fenced: the source rows, the required-field policies, the outer SELECT
+    # four layers: the source rows, the required-field policies (each fenced), the candidate rows
+    # (the outer SELECT of the other tables) and one row per visit and person
     one, two = sql.index("-- 1) the source rows"), sql.index("-- 2) required values that are NULL")
-    assert sql.index("INSERT INTO cdm.visit_occurrence (") < sql.index("\nSELECT\n    s.visit_occurrence_id,") < two < one
-    assert sql.count("OFFSET 0") == 2 and sql.rstrip().endswith(") s;")
+    three, four = sql.index("-- 3) the candidate rows"), sql.index("-- 4) one row per visit_occurrence_id")
+    assert four < three < sql.index("\n    SELECT\n        s.visit_occurrence_id,") < two < one
+    assert one < sql.index("INSERT INTO cdm.visit_occurrence (")
+    assert sql.count("OFFSET 0") == 2 and "        OFFSET 0\n    ) s\n),\npicked AS (" in sql
     # layer 1 computes every value from the source once, with tolerant conversions (a start date
     # reads an unknown day as the first, an end date as the last); a constant keeps its cast
-    assert ("            etl.omop_as_date_at('visit_start_date', 'first', v.visit_date) AS visit_start_date,"
+    assert ("                etl.omop_as_date_at('visit_start_date', 'first', v.visit_date) AS visit_start_date,"
             "  -- expression\n") in sql
-    assert ("            etl.omop_as_date_at('visit_end_date', 'last', v.discharge_date) AS visit_end_date,"
+    assert ("                etl.omop_as_date_at('visit_end_date', 'last', v.discharge_date) AS visit_end_date,"
             "  -- expression\n") in sql
-    assert "            (32817)::integer AS visit_type_concept_id,  -- constant\n" in sql
+    assert "                (32817)::integer AS visit_type_concept_id,  -- constant\n" in sql
     # layer 2: a NULL required concept becomes 0, a NULL end the start, and a NULL start drops the
     # row; each counted, and only on the NULL branch
-    assert ("        CASE WHEN v.visit_type_concept_id IS NULL THEN etl.omop_default_int('visit_type_concept_id', 0)"
+    assert ("            CASE WHEN v.visit_type_concept_id IS NULL THEN etl.omop_default_int('visit_type_concept_id', 0)"
             " ELSE v.visit_type_concept_id END AS visit_type_concept_id,  -- NULL -> 0 (counted)\n") in sql
-    assert ("        COALESCE(v.visit_end_date, etl.omop_derived_date('visit_end_date', v.visit_start_date))"
+    assert ("            COALESCE(v.visit_end_date, etl.omop_derived_date('visit_end_date', v.visit_start_date))"
             " AS visit_end_date,  -- NULL -> visit_start_date (counted)\n") in sql
-    assert ("    WHERE CASE WHEN v.visit_start_date IS NOT NULL THEN true\n"
-            "               ELSE etl.omop_drop(ARRAY['visit_start_date'], ARRAY[v.visit_start_date IS NULL]) END\n"
-            "    OFFSET 0\n) s;") in sql
+    assert ("        WHERE CASE WHEN v.visit_start_date IS NOT NULL THEN true\n"
+            "                   ELSE etl.omop_drop(ARRAY['visit_start_date'], ARRAY[v.visit_start_date IS NULL]) END\n"
+            "        OFFSET 0\n    ) s\n),") in sql
     # optional fields, id-map values and the lookups' codes pass through
-    assert "        v.visit_start_datetime,\n" in sql and "        v.person_id,\n" in sql
+    assert "            v.visit_start_datetime,\n" in sql and "            v.person_id,\n" in sql
     assert vo.count_sites == (
         "visit_concept_id", "visit_start_date", "visit_start_datetime", "visit_end_date", "visit_type_concept_id", "row")
 
@@ -1516,7 +1555,8 @@ def make_test_config():
 
 @pytest.mark.postgres
 def test_step_returns_counters_and_session(staged):
-    from datetime import date
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
 
     from omop_agent.config import CdmSourceConfig, EtlConfig
 
@@ -1544,7 +1584,9 @@ def test_step_returns_counters_and_session(staged):
     with conn.transaction(force_rollback=True):
         execute(conn, "SET LOCAL timezone = 'Asia/Kolkata'")  # e.g. the server's zone
         res = _run_step(conn, stats, None)
-    assert res.stats["tz"] == "Asia/Kolkata" and res.stats["cap"] == date.today().isoformat()
+    # (the current date in that zone: the container's clock may be on the day before)
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    assert res.stats["tz"] == "Asia/Kolkata" and res.stats["cap"] == today
 
     # returns="rows": the records a route step moved; a non-blocking step reports its kind
     route = CompiledStep(
@@ -1566,14 +1608,14 @@ def test_step_returns_counters_and_session(staged):
         " set_config('omop_agent.dropped__row', '1', true),"
         " set_config('omop_agent.invalid__not_a_site', '9', true)",
         count_sites=("year_of_birth", "gender_concept_id", "row"),
-        retained_count_sql="SELECT 5 AS n, 3 AS visit_key_rows",
+        retained_count_sql="SELECT 5 AS n, 3 AS with_key",
     )
     res = _run_step(conn, counted, cfg)
     assert res.error is None
     assert res.value_counts == {"invalid": {"year_of_birth": 2}, "defaulted": {"gender_concept_id": 5},
                                 "row": {"dropped": 1}}
     assert (res.id_retained_rows, res.retained_rows) == (5, 4)
-    assert res.stats == {"visit_links": {"visit_key_rows": 3}}
+    assert res.stats == {"visit_links": {"with_key": 3}}
     # counters set earlier in an enclosing transaction are reset at step start
     with conn.transaction():
         execute(conn, "SELECT set_config('omop_agent.invalid__year_of_birth', '8', true)")

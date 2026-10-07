@@ -365,7 +365,7 @@ def pii_references(tm: "TableMapping", profile: SourceProfile | None, cfg: Priva
         return []
     aliases = {tm.source.alias.lower(): tm.source.table.lower()}
     aliases.update({j.alias.lower(): j.table.lower() for j in tm.joins})
-    texts = [f.expression for f in tm.fields] + [tm.where] + [j.on for j in tm.joins]
+    texts = [f.expression for f in tm.fields] + [tm.where, tm.dedup_order] + [j.on for j in tm.joins]
     hits: list[str] = []
     for text in texts:
         for alias, col in _ALIAS_COL.findall(strip_literals(text or "")):

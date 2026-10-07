@@ -84,7 +84,7 @@ a Rabbit-in-a-Hat document, and it compiles directly to SQL. Each `TableMapping`
 | `column`, `expression` | the expression, converted to the CDM column type tolerantly, with its own casts and `to_date` / `to_timestamp` calls (see "Tolerant conversion"); a NULL required value follows the CDM convention (see "How a mapping compiles") |
 | `constant` | the literal, cast to the CDM column type (a bad constant fails `EXPLAIN`, so the validator reports it) |
 | `person_id` | `JOIN etl.person_map pm ON pm.source_value = (expr)::text`: unmatched rows are dropped (and counted). Required for every `person_id` field, including `person.person_id` |
-| `visit_id` | `LEFT JOIN etl.visit_map` (INNER when the field is required) |
+| `visit_id` | `LEFT JOIN etl.visit_map` (INNER when the field is required); in every table but `visit_occurrence` the visit must belong to the row's person |
 | `auto_id` | `max(existing id) + ROW_NUMBER() OVER ()`, so several mappings can feed one table |
 | `vocab_code` | `LEFT JOIN vocab.concept` on code+vocabulary, then `Maps to` for `concept_role: standard` |
 | `concept_map` | `LEFT JOIN etl.source_to_concept_map` on code+`source_vocabulary_id` |
@@ -97,10 +97,29 @@ to `etl.person_map_retired` / `etl.visit_map_retired`, so events can't point at 
 key that returns gets its old id back, and new keys are numbered after the largest id in the
 map or retired. (Versions before the retired tables deleted such keys, so the first build after
 an upgrade can give a deleted key's id to a new key once.) The visit pruning step also records
-the person each loaded visit belongs to (`visit_map.person_source_value`). The build
+the person each loaded visit belongs to (`visit_map.person_source_value`; for a visit key loaded
+for two people, the smaller person key, so the choice is the same on every run). The build
 re-validates the spec first, because it may have been edited by hand. Retention is measured
 before vocabulary fan-out (`TableLoadResult.retained_rows`), so one-to-many mappings can't hide
 dropped records.
+
+**Several key sources.** Besides `person_key` / `visit_key`, every `person` and
+`visit_occurrence` mapping whose key is not the key expression over the key table
+(`compiler.key_sources`) adds the keys of its rows (its `FROM`, joins and `WHERE`) to the id map
+in its own step (`person_map_2`, `visit_map_2`, ...), restored and numbered like the others, so
+one failing source loses only its own keys. A key found in two sources is one person (visit):
+the validator warns about keys from another table without a prefix, about a mapping on the key
+table that writes the key in another form, and about a record's visit key whose shape matches
+no visit source.
+
+**Visit links.** A record's `visit_occurrence_id` joins the visit map on the key *and* on the
+row's person (`visit_map.person_source_value = person_map.source_value`), so a record never
+points at another person's visit. The retained-row count of each such mapping classifies its
+rows in the same pass (`stats["visit_links"]`): with a key, linked, naming another person's
+visit, or filtered: no loaded visit, but a key of a visit mapping's source rows (read before
+its filter, so a filtered-out or dropped visit counts here, while a `visit_key` that no visit
+mapping writes and keys of an older spec do not). The rest name a key that no visit mapping
+reads.
 
 Concept lookups yield `0` when the source value exists but has no mapping. When the source
 value is NULL they yield NULL, or 0 if the CDM field is required. `varchar(n)` targets are
@@ -133,6 +152,27 @@ PostgreSQL neither merges them nor evaluates a value twice:
 3. **Lookups.** The vocabulary and `source_to_concept_map` joins on the layer-1 codes,
    `auto_id` and `null` fields. A code with several targets inserts several rows, but the counts
    above are per source row.
+4. **One row per key** (`person`, `death`: one per person; `visit_occurrence`: one per visit and
+   person). The layer-3 rows become the candidates of one statement (`WITH cand AS MATERIALIZED
+   ... picked ... ins AS (INSERT ...) SELECT <statistics>`). Among the rows of a key the
+   mapping's `dedup_order` wins (an `ORDER BY` list over the aliases, ranked in layer 1 and read
+   tolerantly; `NULLS LAST` is added to every item that does not say where NULLs go, so a missing
+   or unreadable value never wins), then the table's default (for death a date known to the day
+   before one completed from a year or month, then the latest date), then the most complete
+   row (a concept 0 counts as missing, so an unknown sex never wins over a known one), then the
+   source row's text (compared byte-wise, `COLLATE "C"`): the choice is deterministic and
+   prefers no value. A visit takes the earliest start and the latest end of its rows (window
+   `MIN` / `MAX`), where the patient came from as in its first row and where they went as in
+   its last (`FIRST_VALUE`). Rows with a NULL
+   drop-policy field are gone in layer 2, so they never win. A key an earlier mapping loaded is
+   skipped (an anti-join outside `DISTINCT ON`); a visit key shared by two people gives two rows,
+   so `isPrimaryKey` still fails. The statement returns `inserted`, `source_rows_kept`, `keys`,
+   `duplicate_rows`, `already_loaded_keys`, `conflict_keys` (rows that disagree on sex or birth
+   year, the date of death, or a visit's person, among themselves or with the row an earlier
+   mapping loaded), `undecided_keys` (person and death: keys whose best-ranked rows still
+   disagree), `fan_out_keys` (a code with several concepts) and, for visits, `gap_keys` (visits
+   whose rows are separate stays) into `TableLoadResult.stats`. A NULL (`null`) field is a typed
+   NULL, so it passes through the candidates.
 
 The counters are transaction-local settings (`omop_agent.<category>__<field>`) that the
 helper functions in the ETL schema (`etl/functions.sql`: `omop_count`, `omop_drop`,
@@ -212,7 +252,22 @@ source rows with rows kept after the person/visit joins and the required-field p
 each table mapping. `etlRequiredFieldNull` reports, per field, rows dropped for a NULL required
 value (convention; threshold 0 for `person`, because a dropped person takes their records along,
 5% elsewhere), and `etlDefaultedValue` the NULL required values the build completed (convention,
-5%), so the repair agent can write a better fallback where the source has one. DQD checks the
+5%), so the repair agent can write a better fallback where the source has one. For the tables
+that keep one row per key, `etlDuplicateRecords` reports the rows that lost to another row of
+their key (convention at 5% for `person`, where many mean a source of another grain; not
+repairable; characterization otherwise), `etlKeyConflict` the keys whose rows disagree
+(convention at 0 for the person keys whose best-ranked rows still disagree: all rows without a
+`dedup_order`; characterization otherwise), `etlKeyFanOut` the keys with a code of several
+concepts (convention, not repairable) and `etlVisitGrain` the visits rolled up from rows that are
+separate stays, a visit key coarser than one visit (fatal above 5%, not repairable).
+`etlVisitLinkage` reports records whose visit key gives no visit of their own person
+(convention, 5%; rows whose key is one of a visit mapping's source rows that the mapping left
+out are not counted: the retained count reads the visit mappings' keys before their filters),
+and `etlVisitLinkLoss` fails fatally when more than 100 - `min_record_retention_pct` percent
+name a key that no visit mapping reads. Two checks re-verify
+after the load what custom SQL could break (fatal, threshold 0, not repairable):
+`measureDuplicateDeaths` (one death per person) and `fkVisitPerson` (a record's visit belongs to
+its person). DQD checks the
 built-in engine doesn't implement are listed as not applicable, and so is each empty table, as a
 single summary row. The run passes when no check with a
 blocking severity (default `fatal`) fails, no check listed in `quality.blocking_checks` fails
@@ -232,11 +287,22 @@ repair agent gets the failures and a set of tools:
   still compiles and `EXPLAIN`s cleanly. An edit identical to the current mapping is a no-op.
   The repair agent may not make a check pass by removing data: adding or changing a `WHERE`
   filter, adding an inner join, changing the source table, blanking a field or removing a
-  field mapping is rejected, and the agent is told to leave such failures to a person.
+  field mapping is rejected, and the agent is told to leave such failures to a person. So are
+  edits that change who exists in the CDM or whose records are whose: a changed person_id
+  expression (in any table, unless the mapping cannot run at all, e.g. a misspelled key column),
+  a changed key of `person` or `visit_occurrence`, a new mapping into `person`,
+  `visit_occurrence` or `death`, or a removed or changed filter of those tables. An edit that
+  makes a record's visit key NULL where it was not (a blank or NA-marker key aside) is refused
+  too: it would hide records that lost their visit from `etlVisitLinkage`.
+
+Errors of steps the build generates (id-map pruning, ...) and errors a spec change cannot fix (a
+missing privilege of the ETL role: the error names the GRANT to run) are never sent to the
+repair agent.
 
 The ETL is rebuilt and re-checked, up to `quality.max_repair_iterations` times. Each build is
-scored: losing data (a CDM table keeping under 95% of the rows an earlier build loaded, or
-checks that applied before becoming not applicable) ranks below any number of failing checks,
+scored: losing data (a CDM table keeping under 95% of the rows an earlier build loaded, or of
+its records with a visit key or linked to their visit, or checks that applied before becoming
+not applicable) ranks below any number of failing checks,
 then ETL errors, then blocking and repairable failures. An iteration that makes the score worse
 is rolled back to the best spec, rebuilt, and its repairs are marked `reverted` in
 `repairs.json`. `etl_spec.before_repair.yaml` keeps the spec as it was before automatic

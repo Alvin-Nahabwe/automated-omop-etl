@@ -149,10 +149,13 @@ class FieldMapping(BaseModel):
                    'Maps to' to the standard concept; concept_role='source' returns the source
                    concept itself (for *_source_concept_id fields).
       person_id    expression = the source patient key; resolved to person_id via the person
-                   id map. Rows whose key has no person are dropped.
+                   id map. Rows whose key has no person are dropped. Every person mapping adds
+                   the keys of its rows to the map (people can come from several tables).
       visit_id     expression = the source visit key; resolved via the visit id map. When the CDM
                    field is optional the row is kept with NULL; when it is required (the
-                   visit_occurrence primary key) rows without a visit are dropped.
+                   visit_occurrence primary key) rows without a visit are dropped. A record
+                   links only to a visit of its own person, and only when its key gives exactly
+                   the text of the visit mapping's key.
       auto_id      a generated surrogate key (only for the table's own primary key; never for
                    person.person_id or visit_occurrence.visit_occurrence_id, which must come from
                    the id maps so that events link to the right person and visit).
@@ -204,10 +207,11 @@ class TableMapping(BaseModel):
     dedup_order: str | None = Field(
         None,
         description="Only for tables that keep one row per key (person and death: one per person; "
-        "visit_occurrence: one per visit). A SQL ORDER BY list over the aliases that ranks the source rows of "
-        "one key, best first, e.g. \"x.dod::date DESC\" (latest death) or \"(v.visit_type = 'IPD') DESC\". "
-        "Rows whose required fields are NULL never win. Leave it empty to keep the most complete row (for "
-        "death: the latest death date).",
+        "visit_occurrence: one per visit and person, spanning the earliest start to the latest end of its rows). "
+        "A SQL ORDER BY list over the aliases that ranks the source rows of one key, best first, e.g. "
+        "\"x.dod::date DESC\" (latest death) or \"(v.visit_type = 'IPD') DESC\". A missing or unreadable "
+        "value ranks last, and rows whose required fields are NULL never win. Leave it empty to keep the most "
+        "complete row (for death: a date known to the day, then the latest).",
     )
     fields: list[FieldMapping]
     rationale: str = ""
@@ -471,6 +475,10 @@ class TableLoadResult(BaseModel):
     skipped: str | None = Field(None, description="Why the step was not run (a step it requires failed).")
     seconds: float = 0.0
     error: str | None = None
+    repairable: bool = Field(
+        True, description="False: the error is not one a change of the spec can fix (a missing privilege), so it is "
+        "never sent to the repair agent.",
+    )
     sql: str | None = None
 
 

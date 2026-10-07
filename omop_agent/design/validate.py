@@ -22,10 +22,19 @@ column); so is a strftime template ('%d/%m/%Y'). A to_date template that differs
 profiled format, and a mapped days_supply that the drug_exposure_end_date does not use, are
 warnings.
 
+Keys can come from several sources: every person and visit_occurrence mapping adds the keys of
+its rows to the id map (``compiler.key_sources``). Keys written in another form than the
+person_key / visit_key over the key table, unprefixed keys from another table, and records whose
+visit key has another shape than every visit key (``key_shape``) are warnings. A dedup_order (the
+ranking of the rows of one key) on a table that does not keep one row per key is a warning; one
+whose parentheses do not balance is refused, by the runner too (it is written inside a window
+clause).
+
 With a database connection the validator also checks concept constants against the loaded
 vocabulary, checks that ``vocab_code`` vocabularies are loaded, and ``EXPLAIN``s each compiled
-INSERT inside a transaction that is always rolled back, under the build's session settings
-(``etl.session``).
+INSERT, and every statement of the id-map steps and of the steps the build generates (an error
+when the step is blocking, a warning when it is not), inside a transaction that is always rolled
+back, under the build's session settings (``etl.session``).
 
 Semantic problems (a code format that does not match the vocabulary) and runtime problems (a
 NOT NULL violation that only shows up with real rows) are left to the build and the
@@ -44,7 +53,16 @@ from ..cdm.ddl import create_cdm_tables, create_etl_tables
 from ..cdm.spec import CdmTable, load_cdm_spec
 from ..config import PrivacyConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, list_columns, qi, rollback_only, short_error
-from ..etl.compiler import ID_MAP_KEYS, CompileError, alias_refs, compile_table, source_ref
+from ..etl.compiler import (
+    ID_MAP_KEYS,
+    ONE_ROW_PER,
+    CompileError,
+    alias_refs,
+    compile_spec,
+    compile_table,
+    key_sources,
+    source_ref,
+)
 from ..etl.session import apply_session
 from ..etl.tolerant import DATE_KINDS, LexError, lex, rewrite, without_conversions
 from ..models import CustomSQL, ETLSpec, KeySpec, SourceProfile, TableMapping
@@ -190,7 +208,19 @@ def _fragments(tm: TableMapping) -> list[tuple[str | None, str, str]]:
     out += [(None, f"join '{j.alias}' condition", j.on) for j in tm.joins]
     if tm.where:
         out.append((None, "where", tm.where))
+    if tm.dedup_order:
+        out.append((None, "dedup_order", tm.dedup_order))
     return out
+
+
+def paren_problem(text: str) -> str | None:
+    """Why the parentheses of an ORDER BY list (outside literals and comments) do not balance."""
+    depth = 0
+    for ch in strip_literals(text):
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if depth < 0:
+            return "a ')' closes a parenthesis it did not open"
+    return "a '(' is not closed" if depth else None
 
 
 def _mapping_sql_problems(tm: TableMapping) -> list[tuple[str | None, str]]:
@@ -200,6 +230,12 @@ def _mapping_sql_problems(tm: TableMapping) -> list[tuple[str | None, str]]:
         issue = table_ref_issue(table)
         if issue:
             out.append((None, issue))
+    if tm.dedup_order:
+        # it is written inside RANK() OVER (... ORDER BY <dedup_order>): it must not close that
+        problem = paren_problem(tm.dedup_order)
+        if problem:
+            out.append((None, f"dedup_order: unbalanced parentheses ({problem}); it must be an ORDER BY list over "
+                              "the aliases, e.g. \"x.dod::date DESC\""))
     declared = {tm.source.alias.lower()} | {j.alias.lower() for j in tm.joins}
     for field, what, sql in _fragments(tm):
         out += [(field, f"unsafe SQL in {what}: {x}") for x in fragment_issues(sql)]
@@ -264,12 +300,14 @@ def _pii_loaded(tm: TableMapping, profile: SourceProfile | None, privacy: Privac
     """Direct-identifier columns whose values a mapping loads into the CDM.
 
     Fields of kind person_id / visit_id only resolve the key through the id maps (the CDM gets
-    the integer id), and join conditions and filters only select rows, so those are not counted.
+    the integer id), and join conditions, filters and the dedup_order only select rows, so those
+    are not counted.
     """
     loading = tm.model_copy(
         update={
             "fields": [f for f in tm.fields if f.kind not in ("person_id", "visit_id")],
             "where": None,
+            "dedup_order": None,
             "joins": [j.model_copy(update={"on": "TRUE"}) for j in tm.joins],
         }
     )
@@ -560,6 +598,13 @@ def _static_mapping(
     if tm.where:
         for severity, msg in _conversion_problems(tm.where, "where", hard=False, aliases=aliases, cat=cat):
             (err if severity == "error" else warn)(msg)
+    if (tm.dedup_order or "").strip():
+        if tt not in ONE_ROW_PER:
+            warn(f"dedup_order is ignored: only {', '.join(sorted(ONE_ROW_PER))} keep one row per key")
+        else:  # read tolerantly and uncounted, like the WHERE
+            for severity, msg in _conversion_problems(tm.dedup_order, "dedup_order", hard=False, aliases=aliases,
+                                                      cat=cat):
+                (err if severity == "error" else warn)(msg)
     for j in tm.joins:
         for severity, msg in _conversion_problems(j.on, f"join '{j.alias}' condition", hard=True, aliases=aliases,
                                                   cat=cat):
@@ -611,6 +656,7 @@ def _static_spec(spec: ETLSpec, cat: _SourceCatalog) -> list[SpecIssue]:
                 "both will insert periods",
             )
         )
+    issues += _key_source_issues(spec)
     for cs in spec.custom_sql:
         if not cdm.has_table(cs.target_table) or cdm.table(cs.target_table).schema_class != "CDM":
             issues.append(
@@ -657,6 +703,103 @@ def _custom_aliases(sql: str) -> dict[str, str]:
             alias = table.split(".")[-1].strip('"').lower()
         out.setdefault(alias, table)
     return out
+
+
+_SHAPE_TOKEN = re.compile(
+    r"'(?:[^']|'')*'|::\s*[A-Za-z_][A-Za-z0-9_ ]*?(?=\W|$)|[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)?\s*\(?|\S"
+)
+_SHAPE_WORDS = {"and", "or", "not", "null", "is", "case", "when", "then", "else", "end", "true", "false", "in"}
+
+
+def key_shape(expr: str) -> str:
+    """A key expression with its column references replaced by '?' (functions, casts other than
+    to text, literals and operators kept): 'd.visit_id' and 'visit_id' have the same shape, while
+    'lower(d.visit_id)', another separator or another date format do not."""
+    out: list[str] = []
+    for m in _SHAPE_TOKEN.finditer(expr.strip()):
+        tok = m.group(0)
+        if tok.startswith("'"):
+            out.append(tok)
+        elif tok.startswith("::"):
+            cast = " ".join(tok[2:].split()).lower()
+            if cast not in ("text", "varchar"):
+                out.append("::" + cast)
+        elif re.match(r"[A-Za-z_]", tok):
+            if tok.rstrip().endswith("("):
+                out.append(re.sub(r"\s+", "", tok.lower()))
+            else:
+                out.append(tok.lower() if tok.lower() in _SHAPE_WORDS else "?")
+        else:
+            out.append(tok)
+    shape = " ".join(out)
+    while shape.startswith("( ") and shape.endswith(" )"):  # one pair of outer parentheses
+        shape = shape[2:-2]
+    return shape
+
+
+def _key_source_issues(spec: ETLSpec) -> list[SpecIssue]:
+    """Warnings about keys that come from several sources (``compiler.key_sources``). They are not
+    errors: the build reports what actually links (etlRecordRetention, etlDuplicateRecords,
+    etlKeyConflict, etlVisitLinkage).
+
+    * a person / visit_occurrence mapping on the key table whose key is written in another form
+      than the person_key / visit_key: its keys go into the id map as another source;
+    * a mapping from another table whose keys have no prefix (no string literal): a key found in
+      both is one person (visit), which is wrong when that table numbers its own;
+    * a record's visit key whose shape (``key_shape``) matches no visit source: it can only link
+      when both give exactly the same text."""
+    issues: list[SpecIssue] = []
+    for table, key in (("person", spec.person_key), ("visit_occurrence", spec.visit_key)):
+        if key is None:
+            continue
+        what, field = ("person", "person_id") if table == "person" else ("visit", "visit_occurrence_id")
+        for tm, expr, _ in key_sources(spec, table):
+            written = " ".join(expr.split())
+            if tm.source.table.strip().lower() == key.table.strip().lower():
+                issues.append(SpecIssue(
+                    severity="warning", target_table=table, target_field=field,
+                    message=f"the mapping from {tm.source.table} reads the {what} key table but writes the key as "
+                    f"{written}, not as the {what}_key ({' '.join(key.expression.split())}): its keys are added to "
+                    f"the {what} id map as another source. Write the key exactly as the {what}_key does, unless "
+                    "this is deliberate"))
+            elif "'" not in expr:
+                plural = "people" if table == "person" else "visits"
+                issues.append(SpecIssue(
+                    severity="warning", target_table=table, target_field=field,
+                    message=f"the mapping from {tm.source.table} adds its keys ({written}) to the same id space as "
+                    f"{key.table}: a key found in both is one {what}. If {tm.source.table} numbers its {plural} "
+                    "independently, prefix its keys (for example 'EMR:' || ...) here and in every mapping that "
+                    "refers to them"))
+    if spec.visit_key is None:
+        return issues
+    vk = spec.visit_key
+    # the visit_key's keys are visits only when a visit mapping writes them as the visit_key does
+    # (or custom SQL loads visits through its map); otherwise records written like it link nowhere
+    shapes: dict[str, str] = {}
+    extra = {id(tm) for tm, _, _ in key_sources(spec, "visit_occurrence")}
+    if any(tm.target_table.lower() == "visit_occurrence" and id(tm) not in extra for tm in spec.table_mappings) or any(
+            cs.target_table.lower() == "visit_occurrence" for cs in spec.custom_sql):
+        shapes[key_shape(vk.expression)] = f"{' '.join(vk.expression.split())} (visit_key, {vk.table})"
+    for tm in spec.table_mappings:
+        if tm.target_table.lower() != "visit_occurrence":
+            continue
+        fm = next((f for f in tm.fields if f.target_field == "visit_occurrence_id" and f.kind == "visit_id"
+                   and (f.expression or "").strip()), None)
+        if fm is not None:
+            shapes.setdefault(key_shape(fm.expression or ""),
+                              f"{' '.join((fm.expression or '').split())} (visit mapping from {tm.source.table})")
+    for tm in spec.table_mappings:
+        if tm.target_table.lower() == "visit_occurrence":
+            continue
+        for fm in tm.fields:
+            if fm.kind != "visit_id" or not (fm.expression or "").strip() or key_shape(fm.expression or "") in shapes:
+                continue
+            issues.append(SpecIssue(
+                severity="warning", target_table=tm.target_table, target_field=fm.target_field,
+                message=f"the visit key is written as {' '.join((fm.expression or '').split())}, in another form "
+                f"than the visit keys ({'; '.join(shapes.values())}): a record links to its visit only when both give "
+                "exactly the same text (same case, padding, separators, prefix and date format)"))
+    return issues
 
 
 def _key_columns(key: KeySpec, cat: _SourceCatalog, what: str) -> list[SpecIssue]:
@@ -797,17 +940,21 @@ def _explain_all(
                 create_cdm_tables(conn, schemas, include_vocab=False)
                 create_etl_tables(conn, schemas)
             apply_session(conn, cfg)  # constants are folded at EXPLAIN: read them as the build does
+            failed_keys: list[KeySpec] = []
             for key, what in [(spec.person_key, "person_key"), (spec.visit_key, "visit_key")]:
                 if key is None or not keys or _key_sql_problems(key):
                     continue
                 probe = schemas.render(f"SELECT DISTINCT ({key.expression})::text FROM {source_ref(key.table)}")
                 error = _explain(conn, probe)
                 if error:
+                    failed_keys.append(key)
                     issues.append(SpecIssue(severity="error", message=f"{what} expression fails: {error}"))
             for tm, sql in compiled:
                 error = _explain(conn, sql)
                 if error:
                     issues.append(SpecIssue(severity="error", target_table=tm.target_table, message=f"EXPLAIN failed: {error}"))
+            if keys:
+                issues += _explain_generated(spec, tables, failed_keys, conn, schemas, cfg)
             for cs in customs:
                 stmt = _single_statement(schemas.render(cs.sql))
                 if stmt is None:
@@ -819,6 +966,40 @@ def _explain_all(
     except psycopg.Error as e:
         issues.append(SpecIssue(severity="warning", message=f"could not EXPLAIN the spec: {short_error(e)}"))
     return issues
+
+
+# The steps the build generates (or runs for the keys) whose statements the validator EXPLAINs.
+_EXPLAINED_KINDS = ("id_map", "prune", "route", "merge", "derived")
+
+
+def _explain_generated(
+    spec: ETLSpec, clean: list[TableMapping], failed_keys: list[KeySpec], conn: psycopg.Connection,
+    schemas: Schemas, cfg: ProjectConfig | None,
+) -> list[SpecIssue]:
+    """EXPLAIN every statement of the id-map steps (the person_key / visit_key and the other key
+    sources, ``compiler.key_sources``) and of the steps the build generates (pruning, and the
+    later routing, merge and derived steps), inside the caller's rolled-back transaction. A step
+    that would fail is an error when it is blocking (the build would fail) and a warning when it
+    is not (it is reported and skipped). Steps that run the SQL of a mapping with errors, or of a
+    key whose probe failed, are left out: those errors are reported already."""
+    steps = compile_spec(spec, schemas, cfg.cdm_source if cfg is not None else None,
+                         etl=cfg.etl if cfg is not None else None, strict=False)
+    out: list[SpecIssue] = []
+    for s in steps:
+        if s.kind not in _EXPLAINED_KINDS or s.error:
+            continue
+        if any(isinstance(o, TableMapping) and not any(o is c for c in clean) for o in s.origins):
+            continue
+        if any(isinstance(o, KeySpec) and any(o is k for k in failed_keys) for o in s.origins):
+            continue
+        for stmt in s.statements:
+            error = _explain(conn, stmt)
+            if error:
+                how = "the build would fail" if s.blocking else "the step is skipped and reported"
+                out.append(SpecIssue(severity="error" if s.blocking else "warning", target_table=s.target_table,
+                                     message=f"step {s.label} cannot run ({how}): {error}"))
+                break
+    return out
 
 
 # --------------------------------------------------------------------------------------

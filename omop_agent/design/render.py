@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..cdm.spec import LOAD_ORDER
+from ..etl.compiler import key_sources
 from ..models import ETLSpec, FieldMapping, TableMapping
 
 
@@ -50,6 +51,8 @@ def _mapping_md(tm: TableMapping, n: int | None) -> list[str]:
         out.append("")
     if tm.where:
         out += [f"Filter: `{' '.join(tm.where.split())}`", ""]
+    if (tm.dedup_order or "").strip():
+        out += [f"One row per key, best row first by: `{' '.join((tm.dedup_order or '').split())}`", ""]
     out.append("| CDM field | kind | source / expression | vocabulary | rationale |")
     out.append("|---|---|---|---|---|")
     for fm in tm.fields:
@@ -58,6 +61,14 @@ def _mapping_md(tm: TableMapping, n: int | None) -> list[str]:
         )
     out.append("")
     return out
+
+
+def _also(spec: ETLSpec, table: str) -> str:
+    """The other mappings whose keys go into the id map (``compiler.key_sources``)."""
+    sources = key_sources(spec, table)
+    if not sources:
+        return ""
+    return "; also from " + ", ".join(f"`{tm.source.table}`.`{' '.join(expr.split())}`" for tm, expr, _ in sources)
 
 
 def render_spec_md(spec: ETLSpec) -> str:
@@ -77,9 +88,11 @@ def render_spec_md(spec: ETLSpec) -> str:
     )
     out += ["", "## Overview", ""]
     out.append(f"- **CDM version:** {spec.cdm_version}")
-    out.append(f"- **Person key:** `{spec.person_key.table}`.`{' '.join(spec.person_key.expression.split())}`")
+    out.append(f"- **Person key:** `{spec.person_key.table}`.`{' '.join(spec.person_key.expression.split())}`"
+               + _also(spec, "person"))
     if spec.visit_key:
-        out.append(f"- **Visit key:** `{spec.visit_key.table}`.`{' '.join(spec.visit_key.expression.split())}`")
+        out.append(f"- **Visit key:** `{spec.visit_key.table}`.`{' '.join(spec.visit_key.expression.split())}`"
+                   + _also(spec, "visit_occurrence"))
     else:
         out.append("- **Visit key:** none (records are not linked to visits)")
     if spec.observation_period == "from_events":

@@ -412,10 +412,16 @@ def test_conversion_issues():
     # the uncounted functions are the way to write such a key
     spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={
         "expression": "{etl}.try_integer(individual_id)"})})
-    assert not any("person_key" in m for m in _issues(spec, "warning") + _issues(spec, "error"))
+    assert not any(m.startswith("person_key") for m in _issues(spec, "warning") + _issues(spec, "error"))
+    # (the person mapping now writes the key in another form than the person_key: its keys are
+    # another source of the person id map, which is reported)
+    assert any("writes the key as i.individual_id, not as the person_key" in m for m in _issues(spec, "warning"))
     spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={
         "expression": "{etl}.try_date(dob, 'DD/MM/YYYY')::text"})})
-    assert not any("person_key" in m for m in _issues(spec, "warning") + _issues(spec, "error"))
+    assert not any(m.startswith("person_key") for m in _issues(spec, "warning") + _issues(spec, "error"))
+    # (the person mapping now writes the key in another form than the person_key: its keys are
+    # another source of the person id map, which is reported)
+    assert any("writes the key as i.individual_id, not as the person_key" in m for m in _issues(spec, "warning"))
     # in a field, try_* is counted like a cast: nothing to warn about
     spec = set_field(ref, "person", "birth_datetime", expression="{etl}.try_timestamp(i.dob, 'DD/MM/YYYY')")
     assert _issues(spec, "warning", "person", "birth_datetime") == []

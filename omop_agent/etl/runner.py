@@ -15,8 +15,10 @@ back. Last, the value counters of the step's ``count_sites`` (transaction-local 
 ``omop_agent.<category>__<site>``) go to ``value_counts``. A step whose ``requires`` (a CDM table
 or a step label) failed or was skipped is skipped too, and so are the steps that require it in
 turn. An error of a non-blocking step (``blocking=False``) is reported but does not fail the
-build (``ETLRunResult.ok``). After the id maps, and after every step that wrote rows, the written
-tables are ANALYZEd, so the next steps are planned with fresh statistics.
+build (``ETLRunResult.ok``). A step that fails for a missing privilege is marked not repairable
+(``TableLoadResult.repairable``), and its error names the grants to run: the repair agent cannot
+fix it in the spec. After the id maps, and after every step that wrote rows, the written tables
+are ANALYZEd, so the next steps are planned with fresh statistics.
 
 The spec's SQL is written by an LLM (and possibly edited by people), so before anything runs
 each step's fragments are checked again by ``design.validate.sql_safety_issues``; unsafe steps
@@ -211,6 +213,9 @@ def _run_step(conn: psycopg.Connection, step: CompiledStep, cfg: ProjectConfig |
                     value_counts = _read_counters(conn, step)
                 except (ValueError, TypeError) as e:  # raised out of the transaction: rolled back
                     raise _UnreadableResult(_result_error(e)) from e
+    except psycopg.errors.InsufficientPrivilege as e:
+        res.error = f"{short_error(e)}. {_privilege_hint(cfg)}"[:1000]
+        res.repairable = False  # a grant, not the spec: never sent to the repair agent
     except psycopg.Error as e:
         res.error = short_error(e)  # nothing was loaded: no statistics, moves or value counts
     except _UnreadableResult as e:
@@ -222,6 +227,27 @@ def _run_step(conn: psycopg.Connection, step: CompiledStep, cfg: ProjectConfig |
         res.retained_rows = max(res.id_retained_rows - res.value_counts.get(ROW_SITE, {}).get("dropped", 0), 0)
     res.seconds = round(time.time() - started, 3)
     return res
+
+
+def _privilege_hint(cfg: ProjectConfig | None) -> str:
+    """What to grant when a step fails for a missing privilege (e.g. ETL tables a new version
+    added, which an administrator granted before they existed)."""
+    if cfg is None:
+        return "The build's database user lacks a privilege; this is not a problem of the ETL spec."
+    t = cfg.target
+    who = f"The ETL role {t.etl_role}" if t.etl_role else "The database user of target.url"
+    to = qi(t.etl_role) if t.etl_role else "<user>"
+
+    def names(*schemas: str) -> str:
+        return ", ".join(qi(s) for s in dict.fromkeys(schemas))
+
+    return (
+        f"{who} lacks a privilege the build needs; this is not a problem of the ETL spec. An administrator can "
+        f"grant it: GRANT USAGE ON SCHEMA {names(t.staging_schema, t.vocab_schema, t.cdm_schema, t.etl_schema)} "
+        f"TO {to}; GRANT SELECT ON ALL TABLES IN SCHEMA {names(t.staging_schema, t.vocab_schema)} TO {to}; "
+        f"GRANT SELECT, INSERT, DELETE ON ALL TABLES IN SCHEMA {names(t.cdm_schema, t.etl_schema)} TO {to} "
+        "(see README.md, 'Privacy and safety')."
+    )
 
 
 def _refuse_unsafe(steps: list[CompiledStep]) -> None:

@@ -51,8 +51,9 @@
 <section class="card">
   <h2>Overview</h2>
   <dl class="facts">
-    <dt>People</dt><dd><code>{{ spec.person_key.table }}</code> keyed by <code>{{ spec.person_key.expression }}</code></dd>
-    <dt>Visits</dt><dd>{% if spec.visit_key %}<code>{{ spec.visit_key.table }}</code> keyed by <code>{{ spec.visit_key.expression }}</code>{% else %}<span class="muted">none</span>{% endif %}</dd>
+    <dt>People</dt><dd><code>{{ spec.person_key.table }}</code> keyed by <code>{{ spec.person_key.expression }}</code>{% for s in key_sources.person %}<br><span class="small">also <code>{{ s.table }}</code> keyed by <code>{{ s.expression }}</code></span>{% endfor %}</dd>
+    <dt>Visits</dt><dd>{% if spec.visit_key %}<code>{{ spec.visit_key.table }}</code> keyed by <code>{{ spec.visit_key.expression }}</code>{% for s in key_sources.visit %}<br><span class="small">also <code>{{ s.table }}</code> keyed by <code>{{ s.expression }}</code></span>{% endfor %}{% else %}<span class="muted">none</span>{% endif %}</dd>
+    <dt>One row per key</dt><dd>person and death: one per person; visit_occurrence: one per visit and person, from the earliest start to the latest end of its rows</dd>
     <dt>Observation periods</dt><dd>{{ 'from the first and last event of each person' if spec.observation_period == 'from_events' else 'from a table mapping' }}</dd>
     <dt>CDM tables filled</dt><dd>{{ spec.table_mappings|map(attribute='target_table')|join(', ') }}</dd>
   </dl>
@@ -66,6 +67,7 @@
   {% if tm.rationale %}<p class="small">{{ tm.rationale }}</p>{% endif %}
   {% for j in tm.joins %}<p class="small">{{ j.join_type }} join <code>{{ j.table }}</code> as {{ j.alias }} on <code>{{ j.on }}</code></p>{% endfor %}
   {% if tm.where %}<p class="small">only rows where <code>{{ tm.where }}</code></p>{% endif %}
+  {% if tm.dedup_order %}<p class="small">one row per key, the best row first by <code>{{ tm.dedup_order }}</code></p>{% endif %}
   <div class="tw"><table>
     <thead><tr><th>CDM field</th><th>How</th><th>From</th><th>Why</th></tr></thead>
     <tbody>{% for f in tm.fields %}

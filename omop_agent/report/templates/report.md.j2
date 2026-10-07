@@ -105,14 +105,14 @@ _None._
 ## 4. ETL design
 
 {% if design %}
-{{ design.n_mappings }} table mappings, {{ design.n_fields }} field mappings, CDM {{ design.cdm_version|md }}. Person key: {{ design.person_key|md }}. Visit key: {{ design.visit_key|md if design.visit_key else 'none' }}. Observation period: {{ design.observation_period }}.
+{{ design.n_mappings }} table mappings, {{ design.n_fields }} field mappings, CDM {{ design.cdm_version|md }}. Person key: {{ design.person_key|md }}{% if design.person_key_also %} (also from: {{ design.person_key_also|md }}){% endif %}. Visit key: {{ design.visit_key|md if design.visit_key else 'none' }}{% if design.visit_key_also %} (also from: {{ design.visit_key_also|md }}){% endif %}. Observation period: {{ design.observation_period }}.
 
 Fields by kind: {% for k in design.kinds_total %}{{ k.kind }} {{ k.n }}{{ ', ' if not loop.last else '' }}{% endfor %}.
 
 | Target | Source | Joins / filter | Fields | Kinds | Rationale |
 |---|---|---|--:|---|---|
 {% for t in design.tables %}
-| {{ t.target }} | {{ t.source|md }} | {{ (t.joins + (['where ' ~ t.where] if t.where else []))|map('md')|join('; ') }} | {{ t.n_fields }} | {{ t.kinds }} | {{ t.rationale|md }} |
+| {{ t.target }} | {{ t.source|md }} | {{ (t.joins + (['where ' ~ t.where] if t.where else []) + (['one row per key by ' ~ t.dedup_order] if t.dedup_order else []))|map('md')|join('; ') }} | {{ t.n_fields }} | {{ t.kinds }} | {{ t.rationale|md }} |
 {% endfor %}
 {% if design.custom_sql %}
 
@@ -221,11 +221,13 @@ _Not run: no mappings/decisions.json in the workspace._
 {% if etl %}
 Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }} ({{ etl.duration|secs }}){% endif %}. {{ etl.steps|length }} steps, {{ etl.total_rows|num }} rows loaded, {{ etl.n_errors }} error(s).
 
-| Step | Table | Rows inserted | Source rows | Retention | Time | Error |
-|---|---|--:|--:|--:|--:|---|
+| Step | Table | Rows inserted | Source rows | Retention | One row per key | Visit links | Time | Error |
+|---|---|--:|--:|--:|---|---|--:|---|
 {% for s in etl.steps %}
-| {{ s.step|md }} | {{ s.table|md }} | {{ s.rows|num }} | {{ s.source_rows|num }} | {{ s.retention|pct }} | {{ s.seconds|secs }} | {{ ('**ERROR** ' ~ s.error)|md if s.error else '' }} |
+| {{ s.step|md }} | {{ s.table|md }} | {{ s.rows|num }} | {{ s.source_rows|num }} | {{ s.retention|pct }} | {{ s.one_row_per_key|md }} | {{ s.visit_links|md }} | {{ s.seconds|secs }} | {{ ('**ERROR** ' ~ s.error)|md if s.error else '' }} |
 {% endfor %}
+
+Retention: rows inserted per source row; for steps that keep one row per key, source rows kept (rows that lost to another row of their key are not lost). One row per key: source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays. Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.
 {% else %}
 _Not run: no etl_run.json in the workspace._
 {% endif %}

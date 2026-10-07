@@ -21,8 +21,22 @@ corresponding DQD SQL file, so results line up with the official R package:
   unreadable, and for the mapping's WHERE, whose undecided rows etlRecordRetention counts as
   dropped) and
   ``etlPartialDate`` (dates with an unknown day or month, completed by the partial-date rule or
-  left NULL; characterization, never failed). Each carries the step's label (``step``): a second
-  mapping into one table gets its own key, e.g. ``etlRecordRetention.measurement.measurement_2``.
+  left NULL; characterization, never failed); for person, death and visit_occurrence, which keep
+  one row per key, ``etlDuplicateRecords`` (source rows that lost to another row of their key:
+  convention at 5% for person, whose duplicates mean a source of another grain; characterization
+  otherwise), ``etlKeyConflict`` (keys whose rows disagree: on sex or birth year, convention at 0
+  for the person keys whose rows the mapping's dedup_order does not tell apart; on the date of
+  death or a visit's person, characterization), ``etlKeyFanOut`` (keys with a code mapped to
+  several concepts: convention at 0, not repairable) and ``etlVisitGrain`` (visits rolled up from
+  rows that are separate stays: a visit key coarser than one visit; fatal above 5%, not
+  repairable); for records that link to a visit, ``etlVisitLinkage`` (records whose visit key
+  gives no visit of their own person; convention, 5%) and the fatal ``etlVisitLinkLoss`` (more
+  than 100 - ``quality.min_record_retention_pct`` percent name a visit key that no visit mapping
+  reads). Each carries the step's label (``step``): a second mapping into
+  one table gets its own key, e.g. ``etlRecordRetention.measurement.measurement_2``;
+* integrity (ours, re-checked after the load because custom SQL bypasses the build's INSERTs;
+  fatal, threshold 0, not repairable): ``measureDuplicateDeaths`` (persons with more than one
+  death record) and ``fkVisitPerson`` (records whose visit belongs to another person).
 
 The other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``, ``plausibleTemporalAfter``,
 ``measureConditionEraCompleteness`` and the concept-level checks) are reported once per
@@ -52,7 +66,7 @@ from ..cdm.ddl import schema_for
 from ..cdm.spec import RESOURCE_PKG, load_cdm_spec
 from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, fetch_one, qi, ql, short_error
-from ..etl.compiler import SPEC_KINDS, step_label, target_tables
+from ..etl.compiler import ONE_ROW_PER, SPEC_KINDS, step_label, target_tables
 from ..etl.policies import END_FROM_START, THEMIS_PARTIAL, WHERE_SITE, partial_policy, required_null_policy
 from ..models import CheckResult, DQReport, ETLRunResult, ETLSpec, TableLoadResult
 from ..workspace import utcnow
@@ -69,6 +83,14 @@ ETL_PERSON_DROP_THRESHOLD = 0.0
 # unless more than ETL_INVALID_MOSTLY of its values are unreadable: then the expression is wrong.
 ETL_INVALID_THRESHOLD = 5.0
 ETL_INVALID_MOSTLY = 50.0
+# One row per key (etlDuplicateRecords): the share of a person mapping's rows that lost to another
+# row of the same person key (more means a source of another grain than one row per person).
+ETL_DUPLICATE_THRESHOLD = 5.0
+# Records with a visit key that got no visit of their own person (etlVisitLinkage).
+ETL_VISIT_LINK_THRESHOLD = 5.0
+# Visits whose rows are separate stays (etlVisitGrain): above this share of the visits of a
+# visit_occurrence mapping, its visit key is coarser than one visit (a person or facility key).
+ETL_VISIT_GRAIN_THRESHOLD = 5.0
 # What each partial-date rule (etl.policies.partial_policy) does with an unknown day or month.
 _PARTIAL_RULES = {
     "first": "took the first day of the known month or year",
@@ -534,6 +556,10 @@ def _field_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
             if check not in catalog or not applies(row):
                 continue
             res = _new(check, "FIELD", table, fld, _threshold(row, check), extra)
+            if check == "isPrimaryKey" and table in ONE_ROW_PER:
+                # the build loads one row per person (per visit and person): a duplicate is a key
+                # shared by two people or custom SQL, which people fix (the agent may not change keys)
+                res = res.model_copy(update={"repairable": False})
             if fld not in ctx.columns.get(table, set()):
                 out.append(res.model_copy(update={"error": f"column {table}.{fld} does not exist"}))
                 continue
@@ -573,6 +599,57 @@ def _field_summary(ctx: _Ctx, table: str) -> CheckResult | None:
         description=f"The {n} field-level checks of {table} ({', '.join(names)}) are not applicable: {reason}.",
         not_applicable=True,
     )
+
+
+def _integrity_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
+    """Checks of what the build guarantees, re-checked after the load because custom SQL bypasses
+    the generated INSERTs (they are not DQD checks; fatal, threshold 0, never sent to the repair
+    agent, whose tools cannot change custom SQL):
+
+    * ``measureDuplicateDeaths`` (TABLE, death): persons with more than one death record (THEMIS:
+      at most one);
+    * ``fkVisitPerson`` (FIELD, ``visit_occurrence_id`` of every other table): records whose visit
+      belongs to another person."""
+    out: list[CheckResult] = []
+    filled = table in ctx.populated and bool(ctx.n_rows.get(table))
+    if table == "death":
+        res = CheckResult(
+            check_name="measureDuplicateDeaths", check_level="TABLE", table=table,
+            description="The number and percent of persons in death with more than one death record (THEMIS: one "
+            "death record per person). The build loads one per person, so a duplicate comes from custom SQL.",
+            category="Plausibility", subcategory="Uniqueness", severity="fatal", threshold_pct=0.0, repairable=False,
+        )
+        if not filled:
+            out.append(res.model_copy(update={"not_applicable": True}))
+        else:
+            out.append(_evaluate(ctx, res, _q(
+                f"SELECT COUNT(*) FILTER (WHERE d.n > 1) FROM (SELECT person_id, COUNT(*) AS n FROM {ctx.t(table)} "
+                "GROUP BY person_id) d",
+                f"SELECT COUNT(DISTINCT person_id) FROM {ctx.t(table)}",
+            )))
+    cdm = load_cdm_spec()
+    if table != "visit_occurrence" and filled and cdm.table(table).field("visit_occurrence_id") is not None:
+        res = CheckResult(
+            check_name="fkVisitPerson", check_level="FIELD", table=table, field="visit_occurrence_id",
+            description=f"The number and percent of {table} records with a visit_occurrence_id whose visit belongs to "
+            "another person. The build links a record only to a visit of its own person, so such a link comes from "
+            "custom SQL.",
+            category="Conformance", subcategory="Relational", severity="fatal", threshold_pct=0.0, repairable=False,
+        )
+        if "visit_occurrence" not in ctx.existing or not ctx.non_null.get(table, {}).get("visit_occurrence_id"):
+            out.append(res.model_copy(update={"not_applicable": True}))
+        else:
+            # a visit key shared by two people (isPrimaryKey fails) has a row for each: a record of
+            # either one links to a visit of its person
+            V = ctx.t("visit_occurrence")
+            with_visit = (f"FROM {ctx.t(table)} t WHERE EXISTS (SELECT 1 FROM {V} v "
+                          "WHERE v.visit_occurrence_id = t.visit_occurrence_id)")
+            out.append(_evaluate(ctx, res, _q(
+                f"SELECT COUNT(*) {with_visit} AND NOT EXISTS (SELECT 1 FROM {V} v "
+                "WHERE v.visit_occurrence_id = t.visit_occurrence_id AND v.person_id = t.person_id)",
+                f"SELECT COUNT(*) {with_visit}",
+            )))
+    return out
 
 
 def _not_implemented_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
@@ -616,17 +693,24 @@ def etl_checks(
     ``etlRequiredFieldNull`` and ``etlDefaultedValue`` per field whose required values a step
     dropped or completed, and ``etlInvalidValue`` / ``etlPartialDate`` per field (or the WHERE)
     with values its conversions could not read or that were partial dates
-    (``TableLoadResult.value_counts``; ``etl`` gives the partial-date rule the build used).
+    (``TableLoadResult.value_counts``; ``etl`` gives the partial-date rule the build used);
+    ``etlDuplicateRecords``, ``etlKeyConflict`` and ``etlKeyFanOut`` for the steps that keep one
+    row per key (``_key_checks``), and ``etlVisitLinkage`` / the fatal ``etlVisitLinkLoss`` for
+    the steps whose records link to a visit (``_visit_link_checks``).
 
     Every result carries the step label. The error of a non-blocking step is a convention-level
-    failure, and the repair agent only gets the errors of steps that run spec SQL. When a person
-    load (a mapping or custom SQL) failed, the other steps' retention is left out: its error is
-    the cause of their drops, since the id-map pruning retires the keys of people not loaded.
+    failure, and the repair agent only gets the errors of steps that run spec SQL, and not those
+    a change of the spec cannot fix (a missing privilege). When a person load (a mapping or
+    custom SQL) failed, the other steps' retention and visit links are left out: its error is the
+    cause of their drops, since the id-map pruning retires the keys of people not loaded; so are
+    the visit links when a visit_occurrence load failed.
     """
     out: list[CheckResult] = []
-    person_failed = any(
-        s.error and s.target_table == "person" and s.kind in (None, "insert", "custom") for s in etl_result.steps
-    )
+
+    def load_failed(table: str) -> bool:
+        return any(s.error and s.target_table == table and s.kind in (None, "insert", "custom") for s in etl_result.steps)
+
+    person_failed, visit_failed = load_failed("person"), load_failed("visit_occurrence")
     for s in etl_result.steps:
         label = step_label(s.step)
         if s.error:
@@ -643,10 +727,11 @@ def etl_checks(
                     error=s.error,
                     sql=s.sql,
                     step=label,
-                    repairable=s.kind is None or s.kind in SPEC_KINDS,
+                    repairable=(s.kind is None or s.kind in SPEC_KINDS) and s.repairable,
                 )
             )
-        elif s.source_rows is not None and not person_failed:
+            continue
+        if s.source_rows is not None and not person_failed:
             kept = _retention(s).model_copy(update={"step": label})
             out.append(kept)
             if kept.num_denominator_rows and (1 - kept.pct_violated_rows) * 100 < min_retention_pct:
@@ -665,9 +750,12 @@ def etl_checks(
                         }
                     )
                 )
-        if not s.error:
-            out += _required_value_checks(s, label)
-            out += _conversion_checks(s, label, etl)
+        out += _key_checks(s, label)
+        # a failed person or visit load is the cause of the records left without their visit
+        if s.stats.get("visit_links") and not person_failed and not visit_failed:
+            out += _visit_link_checks(s, label, min_retention_pct)
+        out += _required_value_checks(s, label)
+        out += _conversion_checks(s, label, etl)
     return out
 
 
@@ -847,6 +935,187 @@ def _retention(s: TableLoadResult) -> CheckResult:
     )
 
 
+_ONE_ROW_PER_WHAT = {"person": "person", "death": "person (THEMIS: one death record)", "visit_occurrence": "visit and person"}
+
+
+def _key_check(
+    s: TableLoadResult, label: str, name: str, v: int, d: int, description: str, *, severity: str, threshold: float,
+    repairable: bool | None = None, subcategory: str = "Uniqueness",
+) -> CheckResult:
+    failed = severity != "characterization" and v * 100 > threshold * d  # characterization is for review only
+    return CheckResult(
+        check_name=name, check_level="ETL", table=s.target_table, description=description, category="Plausibility",
+        subcategory=subcategory, severity=severity,  # type: ignore[arg-type]
+        num_violated_rows=v, num_denominator_rows=d, pct_violated_rows=min(v / d, 1.0) if d else 0.0,
+        threshold_pct=threshold if severity != "characterization" else 100.0, failed=failed, sql=s.sql, step=label,
+        repairable=repairable,
+    )
+
+
+def _key_checks(s: TableLoadResult, label: str) -> list[CheckResult]:
+    """For a step that keeps one row per key (its statistics, ``etl.compiler._one_row_per_key``):
+
+    * ``etlDuplicateRecords``: source rows not loaded as a row of their own. For person, the rows
+      of a key that another row of the mapping won (convention, 5%: many mean a source of another
+      grain; not repairable, since only a person can choose another source table); for death and
+      visit_occurrence also the keys an earlier mapping loaded (characterization: ward stays roll
+      up into one visit);
+    * ``etlKeyConflict``: keys whose rows disagree, among themselves or with the row an earlier
+      mapping loaded (person: sex or year of birth; convention at 0 over the keys this mapping
+      loads whose best-ranked rows still disagree, so that row is arbitrary: all of a key's rows
+      without a dedup_order, the rows its dedup_order ranks first with one; death: the date; visit:
+      the person; both characterization, a visit shared by two people fails isPrimaryKey);
+    * ``etlKeyFanOut``: keys with several rows for one source row (a code mapped to several
+      concepts in a field of a one-row-per-key table): convention at 0, not repairable (the
+      vocabulary mapping is reviewed by people);
+    * ``etlVisitGrain`` (visit_occurrence): visits whose rows are separate stays, a row starting
+      more than a day after the earlier rows of the visit ended: the visit key is coarser than one
+      visit (a person or facility key), and those stays were loaded as one visit spanning them all.
+      Fatal above 5% of the visits (a coarse key used to fail isPrimaryKey), not repairable (the
+      visit key is for people to change).
+
+    The descriptions give counts only as "<n> of <rows>", which the repair prompt can suppress."""
+    st = s.stats
+    if "keys" not in st:
+        return []
+    t = s.target_table
+    kept, keys = int(st.get("source_rows_kept") or 0), int(st.get("keys") or 0)
+    dup, earlier = int(st.get("duplicate_rows") or 0), int(st.get("already_loaded_keys") or 0)
+    conflicts, fan_out = int(st.get("conflict_keys") or 0), int(st.get("fan_out_keys") or 0)
+    undecided = int(st.get("undecided_keys", conflicts) or 0)
+    ranked = bool(st.get("dedup_order"))
+    what = _ONE_ROW_PER_WHAT.get(t, "key")
+    out: list[CheckResult] = []
+    if t == "person":
+        out.append(_key_check(
+            s, label, "etlDuplicateRecords", dup, kept,
+            f"person keeps one row per person. Source rows of ETL step '{s.step}' not loaded because another row of "
+            f"the same person key was loaded instead: {dup} of {kept} rows ("
+            + ("the mapping's dedup_order chose the row" if ranked else "the most complete row was kept")
+            + "). Many such rows mean a source table of another grain than one row per person (one row per "
+            "registration or per visit). Which table lists the people is for a person to decide (the repair agent "
+            "may not change it): map a table that lists each person once, or keep this one and its dedup_order. Keys "
+            "that an earlier person mapping loaded are skipped and not counted here.",
+            severity="convention", threshold=ETL_DUPLICATE_THRESHOLD, repairable=False,
+        ))
+    else:
+        rollup = (" Several rows of one visit (ward stays, diagnoses) are one visit, from the earliest start to the "
+                  "latest end of its rows." if t == "visit_occurrence" else
+                  " A death date known to the day was kept before one completed from a year or month, then the "
+                  "latest, unless the mapping's dedup_order chose another.")
+        out.append(_key_check(
+            s, label, "etlDuplicateRecords", dup + earlier, kept,
+            f"{t} keeps one row per {what}. Source rows of ETL step '{s.step}' not loaded as a row of their own, "
+            f"because another row of the same key was loaded instead or an earlier mapping of {t} had loaded the "
+            f"key: {dup + earlier} of {kept} rows.{rollup} Reported for review.",
+            severity="characterization", threshold=100.0,
+        ))
+    if t == "person":
+        severity, v = "convention", undecided
+        description = (
+            f"Person keys of ETL step '{s.step}' whose rows disagree on sex or year of birth (a re-registration that "
+            "corrected them, or two people sharing one key), among themselves or with the person an earlier person "
+            f"mapping loaded (which is kept): {conflicts} of {keys} keys. For {undecided} of {keys} keys this mapping "
+            "loads, the rows it ranks best disagree, so the row loaded is arbitrary"
+            + (" (the dedup_order does not tell them apart)" if ranked else " (it has no dedup_order)")
+            + ": set dedup_order to rank the row that should win first (for example the latest registration). If the "
+            "person key joins different people, a person must fix the key (the repair agent may not change it)."
+        )
+    elif t == "visit_occurrence":
+        severity, v = "characterization", conflicts
+        description = (
+            f"Visit keys of ETL step '{s.step}' that belong to more than one person (in this mapping, or a visit an "
+            f"earlier mapping loaded for another person): {conflicts} of {keys} keys. Each person gets a row, so the "
+            "visit key is not unique and isPrimaryKey fails: when visit numbers restart for each person the visit "
+            "key must include the person key (e.g. v.individual_id || ':' || v.visit_no); keys of two sources that "
+            "number their visits independently need a prefix. A person must change the visit key."
+        )
+    else:
+        severity, v = "characterization", conflicts
+        description = (
+            f"Persons of ETL step '{s.step}' whose death rows give different dates, among themselves or with the "
+            f"death an earlier death mapping loaded (which is kept): {conflicts} of {keys} persons. One death per "
+            "person was kept (a date known to the day before a completed one, then the latest, unless the mapping's "
+            "dedup_order chose another). Reported for review."
+        )
+    out.append(_key_check(s, label, "etlKeyConflict", v, keys, description, severity=severity, threshold=0.0,
+                          repairable=None if t == "person" else False))
+    if fan_out:
+        out.append(_key_check(
+            s, label, "etlKeyFanOut", fan_out, keys,
+            f"Keys of ETL step '{s.step}' with more than one candidate row for one source row: a source code maps to "
+            f"several concepts ('Maps to', or several source_to_concept_map rows) in a field of {t}, which keeps one "
+            f"row per {what}: {fan_out} of {keys} keys. One of the concepts was kept (the smallest id). Review the "
+            "vocabulary mapping of these codes.",
+            severity="convention", threshold=0.0, repairable=False, subcategory="Vocabulary",
+        ))
+    if t == "visit_occurrence" and "gap_keys" in st:
+        gaps = int(st.get("gap_keys") or 0)
+        out.append(_key_check(
+            s, label, "etlVisitGrain", gaps, keys,
+            f"Visits of ETL step '{s.step}' loaded from rows that are separate stays (a row starts more than a day "
+            f"after the earlier rows of the visit ended): {gaps} of {keys} visits. The rows of one visit key are "
+            "loaded as one visit from the earliest start to the latest end, which is right for the ward stays of one "
+            "admission but not for separate visits: many such visits mean the visit key is coarser than one visit (a "
+            "person or facility key), so each of them spans several visits. A person must fix the visit key (the "
+            "repair agent may not change it).",
+            severity="fatal", threshold=ETL_VISIT_GRAIN_THRESHOLD, repairable=False, subcategory="ETL",
+        ))
+    return out
+
+
+def _visit_link_checks(s: TableLoadResult, label: str, min_retention_pct: float) -> list[CheckResult]:
+    """``etlVisitLinkage``: the step's source rows with a visit key that got no visit of their own
+    person (``stats['visit_links']``, counted with the retained rows), out of the rows with a key
+    whose visit a visit mapping left out (a key of its source rows that it filtered out or could
+    not load) (convention, 5%); and the fatal ``etlVisitLinkLoss`` when more than 100 -
+    ``min_retention_pct`` percent of them name a visit key that no visit mapping reads: a visit key
+    written in another form than in the visit mappings, which drops the links of most records.
+    The agent cannot pass them by making visit keys NULL (``repair.drop_guard``)."""
+    links = s.stats.get("visit_links") or {}
+    with_key, linked = int(links.get("with_key") or 0), int(links.get("linked") or 0)
+    other, filtered = int(links.get("other_person") or 0), int(links.get("filtered") or 0)
+    unknown = max(with_key - linked - other - filtered, 0)
+    d = max(with_key - filtered, 0)
+    v = other + unknown
+    if other and unknown:
+        kinds = " Some name a loaded visit of another person, and some a visit key that no visit mapping reads."
+    elif other:
+        kinds = " They name a loaded visit of another person."
+    elif unknown:
+        kinds = " They name a visit key that no visit mapping reads."
+    else:
+        kinds = ""
+    out = [CheckResult(
+        check_name="etlVisitLinkage", check_level="ETL", table=s.target_table, field="visit_occurrence_id",
+        description=(
+            f"Source rows of ETL step '{s.step}' whose visit key gives no visit of their own person, so they were "
+            f"loaded without a visit_occurrence_id: {v} of {d} rows with a visit key (rows whose visit the visit "
+            f"mapping filtered out are not counted).{kinds} A record links only to a visit of its own person, and "
+            "only when its visit key gives exactly the text of the visit mapping's key (case, padding, separators, "
+            "prefix, date format). Fix the visit_id expression so it gives that text; never make it NULL, and never "
+            "change a person_id expression to make a link."
+        ),
+        category="Conformance", subcategory="Relational", severity="convention",
+        num_violated_rows=v, num_denominator_rows=d, pct_violated_rows=v / d if d else 0.0,
+        threshold_pct=ETL_VISIT_LINK_THRESHOLD, failed=v * 100 > ETL_VISIT_LINK_THRESHOLD * d, sql=s.sql, step=label,
+    )]
+    loss = 100 - min_retention_pct
+    if d and unknown * 100 > loss * d:
+        out.append(out[0].model_copy(update={
+            "check_name": "etlVisitLinkLoss",
+            "description": (
+                f"ETL step '{s.step}': rows whose visit key is a key that no visit mapping reads (not one a visit "
+                f"mapping filtered out): {unknown} of {d} rows with a visit key, more than {loss:g}%. The visit key is "
+                "almost certainly written in another form here than in the visit mapping (case, padding, separators, "
+                "prefix, date format), so these records lost their visit."
+            ),
+            "severity": "fatal", "num_violated_rows": unknown, "pct_violated_rows": unknown / d,
+            "threshold_pct": loss, "failed": True,
+        }))
+    return out
+
+
 def summarize(r: CheckResult) -> str:
     """One-line summary of a check outcome, e.g. for gate messages and prompts."""
     if r.error:
@@ -946,6 +1215,7 @@ def run_builtin_checks(
         for t in cdm_tables:
             if t in existing:
                 results.extend(_field_checks(ctx, t))
+                results.extend(_integrity_checks(ctx, t))
                 results.extend(_not_implemented_checks(ctx, t))
     if etl_result is not None:
         results.extend(etl_checks(etl_result, cfg.quality.min_record_retention_pct, cfg.etl))

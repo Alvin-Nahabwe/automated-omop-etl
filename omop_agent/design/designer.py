@@ -21,7 +21,7 @@ import json
 import psycopg
 import yaml
 
-from ..cdm.spec import load_cdm_spec
+from ..cdm.spec import LOAD_ORDER, load_cdm_spec
 from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, fetch_all, qi, short_error
 from ..llm import LLMClient, LLMUnavailable
@@ -152,6 +152,26 @@ follow row order and attach every event to the wrong person. Other tables' own p
 (condition_occurrence_id, drug_exposure_id, measurement_id, ...) use kind auto_id.
 - Use where to keep only the rows that belong in this table when one source table feeds \
 several CDM tables.
+- Every person and visit_occurrence mapping adds the keys of the rows it loads to the person or \
+visit id map, so people and visits can come from several source tables (the HDSS register and a \
+clinic register; outpatient visits and admissions). A key found in two sources is one person \
+(visit). When a source numbers its people or visits independently of the person_key or \
+visit_key table, prefix its keys (for example 'EMR:' || e.patient_no or 'IPD:' || a.admission_no), \
+here and in every mapping that refers to them.
+- person, death and visit_occurrence keep one row per key: person and death one per person, \
+visit_occurrence one per visit and person. Several rows of one visit (ward stays, diagnoses) may \
+feed visit_occurrence: the build keeps one row per visit and person, taking the earliest start and \
+the latest end (admitted_from from the first row, discharged_to from the last). Rows of one visit \
+key that are separate stays (days apart) fail etlVisitGrain: the visit key must identify one \
+visit. Set dedup_order (an ORDER BY list over the aliases, best row first, for example \
+"x.verified = '1' DESC" or "i.reg_date::date DESC"; a missing or unreadable value ranks last) when \
+the rows of one key can disagree and one should win; otherwise the most complete row is kept (for \
+death, a date known to the day, then the latest).
+- A record links only to a visit of its own person, and only when its visit key gives exactly the \
+text of the visit mapping's key (case, padding, separators, prefix, date format): write it the same \
+way.
+- When visit numbers restart for each person, the visit key must include the person key, e.g. \
+v.individual_id || ':' || v.visit_no (in the visit_key, the visit mapping and every record).
 """
 
 
@@ -316,16 +336,36 @@ def _cdm_tables_text() -> str:
     return "\n".join(lines)
 
 
-def _keys_text(person_key: KeySpec, visit_key: KeySpec | None) -> str:
+def _keys_text(person_key: KeySpec, visit_key: KeySpec | None, drafted: list[TableMapping] | None = None) -> str:
+    """The patient and visit keys every mapping must write the same way: the plan's keys, plus the
+    keys of the person and visit_occurrence mappings drafted so far (each adds its keys to the map)."""
+
+    def written(table: str, field: str) -> list[str]:
+        out = []
+        for tm in drafted or []:
+            fm = next((f for f in tm.fields if f.target_field == field and (f.expression or "").strip()), None)
+            if tm.target_table == table and fm is not None and fm.kind in ("person_id", "visit_id"):
+                out.append(f"  - {tm.source.table} ({tm.source.alias}): {' '.join((fm.expression or '').split())}")
+        return out
+
     lines = [
         f"Person key: {person_key.table}.{person_key.expression}. Fill person_id with kind person_id "
         "and the column that holds this patient key in the table you are mapping."
     ]
+    people = written("person", "person_id")
+    if people:
+        lines.append("Person mappings drafted so far (a record refers to a person with exactly the same key text as "
+                     "one of them):\n" + "\n".join(people))
     if visit_key is not None:
         lines.append(
             f"Visit key: {visit_key.table}.{visit_key.expression}. Fill visit_occurrence_id with kind "
-            "visit_id and the column that holds this visit key (NULL when a record has no visit)."
+            "visit_id and the column that holds this visit key (NULL when a record has no visit). Write it "
+            "exactly as the visit mapping does: a key that gives other text (case, padding, separators, prefix, "
+            "date format) leaves the record without a visit, and a record links only to a visit of its own person."
         )
+        visits = written("visit_occurrence", "visit_occurrence_id")
+        if visits:
+            lines.append("Visit mappings drafted so far (their visit keys):\n" + "\n".join(visits))
     else:
         lines.append("There is no visit key: leave visit_occurrence_id fields unmapped.")
     return "\n".join(lines)
@@ -337,8 +377,13 @@ Plan the ETL of the source dataset below into OMOP CDM v5.4.
 
 Decide:
 1. person_key: the source table that lists each individual once, and the SQL expression of \
-the patient key over that table's bare column names.
-2. visit_key: the source table of visits/encounters and its key expression, if there is one.
+the patient key over that table's bare column names. Plan one person mapping per source table \
+that lists people (for example the HDSS register, and a clinic register of patients who are not \
+in it): each adds the people it loads to the person id map.
+2. visit_key: the source table of visits/encounters and its key expression, if there is one. \
+Plan one visit_occurrence mapping per source of visits (outpatient visits, admissions, ward \
+stays): each adds its visits to the visit id map. If visit numbers restart for each person, \
+include the person key in the visit key.
 3. observation_period: 'table_mapping' if a source table records enrollment, residency or \
 follow-up periods (then plan an observation_period table from it), otherwise 'from_events'.
 4. tables: one entry per table mapping, in load order (person first). For each, the CDM \
@@ -364,6 +409,7 @@ def _table_prompt(
     profile: SourceProfile,
     annotations: SourceAnnotations | None,
     cfg: ProjectConfig,
+    drafted: list[TableMapping] | None = None,
 ) -> str:
     cdm = load_cdm_spec()
     others = [f"{t.target_table} <- {', '.join(t.source_tables)}" for t in plan.tables if t is not pt]
@@ -376,7 +422,7 @@ Why this table was planned: {pt.rationale}
 Other planned mappings: {'; '.join(others) or 'none'}
 Observation period strategy: {plan.observation_period}
 
-{_keys_text(plan.person_key, plan.visit_key)}
+{_keys_text(plan.person_key, plan.visit_key, drafted)}
 
 TARGET TABLE
 {cdm.describe(pt.target_table)}
@@ -472,22 +518,29 @@ def design_etl(
         raise _need_llm(e) from e
     plan = _normalise_plan(plan)
 
-    # one mapping per planned table
+    # one mapping per planned table, drafted in CDM load order (the person and visit mappings before
+    # the records that refer to their keys, which their prompts list) but kept in plan order (the
+    # order among the mappings of one table is their priority). The keys of the calls follow the
+    # plan order, so recorded answers replay whatever the drafting order
     keys: list[str] = []
-    prompts: list[str] = []
-    mappings: list[TableMapping] = []
     seen: dict[str, int] = {}
     for pt in plan.tables:
         seen[pt.target_table] = seen.get(pt.target_table, 0) + 1
-        key = f"table:{pt.target_table}" + (f":{seen[pt.target_table]}" if seen[pt.target_table] > 1 else "")
-        prompt = _table_prompt(pt, plan, profile, annotations, cfg)
+        keys.append(f"table:{pt.target_table}" + (f":{seen[pt.target_table]}" if seen[pt.target_table] > 1 else ""))
+    rank = {t: i for i, t in enumerate(LOAD_ORDER)}
+    draft_order = sorted(range(len(plan.tables)), key=lambda i: (rank.get(plan.tables[i].target_table, len(rank)), i))
+    prompts: list[str] = [""] * len(plan.tables)
+    drafted: dict[int, TableMapping] = {}
+    for i in draft_order:
+        pt = plan.tables[i]
+        prompt = _table_prompt(pt, plan, profile, annotations, cfg, [drafted[j] for j in sorted(drafted)])
         try:
-            tm = llm.structured(stage="design", key=key, system=system, prompt=prompt, output=TableMapping)
+            tm = llm.structured(stage="design", key=keys[i], system=system, prompt=prompt, output=TableMapping)
         except LLMUnavailable as e:
             raise _need_llm(e) from e
-        keys.append(key)
-        prompts.append(prompt)
-        mappings.append(tm.model_copy(update={"target_table": pt.target_table}))
+        prompts[i] = prompt
+        drafted[i] = tm.model_copy(update={"target_table": pt.target_table})
+    mappings = [drafted[i] for i in range(len(plan.tables))]
 
     open_questions = list(plan.open_questions)
     if plan.unmapped_source_tables:

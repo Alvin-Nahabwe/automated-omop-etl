@@ -119,12 +119,13 @@ _BARE = re.compile(r"(?<![\w.])([A-Za-z_][A-Za-z0-9_]*)(?![\w.]|\s*\()")
 def _field_pii(tm: TableMapping, fm: FieldMapping, profile: SourceProfile | None, privacy: PrivacyConfig) -> list[str]:
     """``table.column`` direct identifiers read by one field's expression.
 
-    Uses :func:`omop_agent.privacy.pii_references` on the field alone (the mapping's WHERE and
-    join conditions filter rows but do not become terms), and also catches unqualified column
-    names and PII-like names when no profile is available.
+    Uses :func:`omop_agent.privacy.pii_references` on the field alone (the mapping's WHERE,
+    dedup_order and join conditions select rows but do not become terms), and also catches
+    unqualified column names and PII-like names when no profile is available.
     """
     only = tm.model_copy(
-        update={"fields": [fm], "where": None, "joins": [j.model_copy(update={"on": ""}) for j in tm.joins]}
+        update={"fields": [fm], "where": None, "dedup_order": None,
+                "joins": [j.model_copy(update={"on": ""}) for j in tm.joins]}
     )
     hits = list(pii_references(only, profile, privacy))
     tables = [tm.source.table] + [j.table for j in tm.joins]
