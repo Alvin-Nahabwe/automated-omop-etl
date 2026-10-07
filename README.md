@@ -185,7 +185,10 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   the ETL schema (PUBLIC has it by default). A new version of those functions is installed by
   the first build that runs as their owner.
 * **Nothing Claude produces is trusted blindly.** Concept ids must exist in your vocabulary
-  as valid standard concepts in the right domain. Person and visit ids always come from the id
+  as valid standard concepts in the right domain (for the main concept of a condition,
+  procedure, drug, device or measurement code list also another domain the table accepts, whose
+  records the build moves to their own table; such a choice is never approved automatically).
+  Person and visit ids always come from the id
   maps, so events can't attach to the wrong patient, and a record links only to a visit of its
   own person (checked after the load by `fkVisitPerson`). The repair agent may not filter out
   records, add inner joins or blank fields, nor change who exists in the CDM (person keys, the
@@ -276,8 +279,20 @@ runs the demo inside it.
   Versions before the retired tables deleted such keys: after an upgrade, a deleted key that
   returns gets a new id, and the id of a deleted key above the largest id still in the map can
   be given to a new key once.
-* Records are not yet re-routed by domain: a source code that maps to a concept in another
-  domain stays in the table the spec chose, and DQD flags it.
+* Records are moved to the table of their standard concept's domain after loading
+  (`route_by_domain`, on by default): a condition, procedure, drug, device or measurement record
+  whose concept is a condition, procedure, drug, device, measurement or observation of another
+  table goes to that table, a measurement with a result whose concept is not a measurement or an
+  observation goes to `observation` (the result is kept), and moves are reported
+  (`etlDomainRouting` and the report's "Records moved" table). Not moved: records out of
+  `observation` (DQD has no domain check there), records with concept 0 (by their source
+  concept), concepts of other domains (values, units: `fkDomain` still reports them), and the
+  value of a 'Maps to value' relationship (ICD-10 "history of" codes become valueless
+  observations). Upgrading: a spec that routed records by hand (a second mapping of the same codes
+  with a filter on `{vocab}.concept.domain_id`) now loads those records twice: the validator
+  warns, and every build reports such a mapping as a failed `etlHandRouting` check (convention,
+  not sent to the repair agent); remove the hand-made routing, or set `route_by_domain: false`.
+  Approvals of such specs stay valid, so look at the warning before the next build.
 * The eras (`condition_era`, `drug_era`), `visit_detail`, `note`/NLP and `cost` tables are not
   generated automatically; add them as table mappings or `custom_sql` in the spec.
 * The built-in checks cover most of DQD's table and field checks (19 of 27 check types, and

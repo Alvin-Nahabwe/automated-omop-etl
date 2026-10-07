@@ -39,8 +39,12 @@ corresponding DQD SQL file, so results line up with the official R package:
   overlapping and stale open episodes, the persons without a valid episode and the release date)
   and ``etlSourceReleaseDate`` (convention, threshold 0, not repairable: open episodes ended on
   a release date the build derived, or episodes after a configured one, a stale date; fatal when
-  the derived date is after the day of the build). Each
-  carries the step's label (``step``): a second mapping into one table gets its own key, e.g.
+  the derived date is after the day of the build); for each route step that moved records to the
+  table of their concept's domain, ``etlDomainRouting`` (characterization, never failed: the
+  records moved per destination and domain, and the moved rows with a value the destination has
+  no place for); for each mapping that routes records by hand while the build routes them,
+  ``etlHandRouting`` (convention, threshold 0, not repairable: its records may be loaded twice).
+  Each carries the step's label (``step``): a second mapping into one table gets its own key, e.g.
   ``etlRecordRetention.measurement.measurement_2``;
 * integrity (ours, re-checked after the load because custom SQL bypasses the build's INSERTs;
   fatal, threshold 0, not repairable): ``measureDuplicateDeaths`` (persons with more than one
@@ -52,8 +56,10 @@ The other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``, ``plausibleTe
 ``measureConditionEraCompleteness`` and the concept-level checks) are reported once per
 populated table as not applicable, pointing to the R package (``quality.use_r_dqd``).
 
-A check fails when ``pct_violated_rows * 100 > threshold``. Checks on tables the ETL does not
-populate, on empty tables, and (except ``isRequired`` / ``measureValueCompleteness``) on
+A check fails when ``pct_violated_rows * 100 > threshold``. measurePersonCompleteness of a table
+that only receives records moved there by domain (no mapping loads it), and fkDomain of the main
+concept field of a table whose route step failed, are not sent to the repair agent. Checks on tables the ETL does not populate (a route destination is populated when records
+were moved there), on empty tables, and (except ``isRequired`` / ``measureValueCompleteness``) on
 all-NULL fields are marked ``not_applicable``, as DQD does. A table without rows gets its
 table-level checks plus one ``fieldLevelChecks`` summary instead of one result per field and
 check, which keeps ``dq_results.json`` small. Every check runs as one query in its own
@@ -74,11 +80,12 @@ from typing import Any
 import psycopg
 
 from ..cdm.ddl import schema_for
-from ..cdm.spec import EVENT_DATE_FIELDS, RESOURCE_PKG, load_cdm_spec
+from ..cdm.spec import EVENT_DATE_FIELDS, EVENT_FIELD_ROLES, RESOURCE_PKG, ROUTE_SOURCES, load_cdm_spec
 from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, fetch_one, qi, ql, short_error
-from ..etl.compiler import ONE_ROW_PER, SPEC_KINDS, release_rank, step_label, target_tables
+from ..etl.compiler import ONE_ROW_PER, SPEC_KINDS, mapping_labels, release_rank, step_label, target_tables
 from ..etl.policies import END_FROM_START, THEMIS_PARTIAL, WHERE_SITE, partial_policy, required_null_policy
+from ..etl.routing import ROUTE_PREPARE, hand_routed, route_only_tables, route_targets
 from ..models import CheckResult, DQReport, ETLRunResult, ETLSpec, TableLoadResult
 from ..workspace import utcnow
 
@@ -507,16 +514,18 @@ def _evaluate(ctx: _Ctx, res: CheckResult, sql: str) -> CheckResult:
     )
 
 
+def _has_rows(conn: psycopg.Connection, schemas: Schemas, table: str) -> bool:
+    return bool(fetch_one(conn, f"SELECT 1 AS x FROM {qi(schemas.cdm)}.{qi(table)} LIMIT 1"))
+
+
 def _populated_tables(conn: psycopg.Connection, schemas: Schemas, existing: set[str], spec: ETLSpec | None) -> set[str]:
     if spec is not None:
-        # every table the compiled spec writes, incl. the derived observation_period and cdm_source
+        # every table the compiled spec writes, incl. the derived observation_period and cdm_source,
+        # and the route destinations that received records (one that received none is not checked)
         names = {m.target_table for m in spec.table_mappings} | {c.target_table for c in spec.custom_sql}
-        return {n.lower() for n in names} | set(target_tables(spec)) | {"person", "observation_period", "cdm_source"}
-    out = set()
-    for t in existing:
-        if fetch_one(conn, f"SELECT 1 AS x FROM {qi(schemas.cdm)}.{qi(t)} LIMIT 1"):
-            out.add(t)
-    return out
+        out = {n.lower() for n in names} | set(target_tables(spec)) | {"person", "observation_period", "cdm_source"}
+        return out | {t for t in route_targets(spec) if t not in out and t in existing and _has_rows(conn, schemas, t)}
+    return {t for t in existing if _has_rows(conn, schemas, t)}
 
 
 def _table_facts(ctx: _Ctx, table: str) -> None:
@@ -740,7 +749,8 @@ def etl_checks(
     (``TableLoadResult.value_counts``; ``etl`` gives the partial-date rule the build used);
     ``etlDuplicateRecords``, ``etlKeyConflict`` and ``etlKeyFanOut`` for the steps that keep one
     row per key (``_key_checks``), and ``etlVisitLinkage`` / the fatal ``etlVisitLinkLoss`` for
-    the steps whose records link to a visit (``_visit_link_checks``).
+    the steps whose records link to a visit (``_visit_link_checks``); ``etlDomainRouting`` for the
+    route steps that moved records (``_routing_check``).
 
     Every result carries the step label. The error of a non-blocking step is a convention-level
     failure, and the repair agent only gets the errors of steps that run spec SQL, and not those
@@ -755,6 +765,10 @@ def etl_checks(
         return any(s.error and s.target_table == table and s.kind in (None, "insert", "custom") for s in etl_result.steps)
 
     person_failed, visit_failed = load_failed("person"), load_failed("visit_occurrence")
+    loaded: dict[str, int] = {}  # rows the mappings and custom SQL loaded per table (route steps' denominator)
+    for s in etl_result.steps:
+        if not s.error and s.kind in (None, "insert", "custom"):
+            loaded[s.target_table] = loaded.get(s.target_table, 0) + int(s.rows_inserted or 0)
     fill = next((s for s in etl_result.steps if step_label(s.step) == "observation_period_fill" and not s.error), None)
     # observation_period ends the mappings could not read: loaded as open, so the merge ran them to the release date
     unreadable_ends = sum(int((s.value_counts.get("invalid") or {}).get("observation_period_end_date") or 0)
@@ -767,7 +781,7 @@ def etl_checks(
                     check_name="etlStepError",
                     check_level="ETL",
                     table=s.target_table,
-                    description=f"ETL step '{s.step}' loading {s.target_table} failed: {s.error}",
+                    description=_step_error_text(s),
                     category="Conformance",
                     subcategory="ETL",
                     severity="fatal" if s.blocking else "convention",
@@ -799,6 +813,8 @@ def etl_checks(
                     )
                 )
         out += _key_checks(s, label)
+        if s.kind == "route" and s.moved:
+            out.append(_routing_check(s, label, loaded.get(s.target_table, 0)))
         if s.kind == "merge" and "episodes" in s.stats:
             out += _merge_checks(s, label, min_retention_pct, fill, unreadable_ends,
                                  etl_result.started_at.date() if etl_result.started_at else None)
@@ -808,6 +824,54 @@ def etl_checks(
         out += _required_value_checks(s, label)
         out += _conversion_checks(s, label, etl)
     return out
+
+
+def _step_error_text(s: TableLoadResult) -> str:
+    """The description of a step's etlStepError. A route step loads nothing: when it fails, the
+    records of its table stay where they were loaded."""
+    if s.kind == "route" and step_label(s.step) == ROUTE_PREPARE:
+        return (f"ETL step '{s.step}' (preparing the moves of records to the table of their concept's domain) failed, "
+                f"so no record was moved: {s.error}")
+    if s.kind == "route":
+        return (f"ETL step '{s.step}' moving {s.target_table} records to the table of their concept's domain failed; "
+                f"they stay in {s.target_table}, where they were loaded: {s.error}")
+    return f"ETL step '{s.step}' loading {s.target_table} failed: {s.error}"
+
+
+def _routing_check(s: TableLoadResult, label: str, loaded: int) -> CheckResult:
+    """``etlDomainRouting`` (ETL, characterization, never failed, not repairable): the records a
+    route step moved from its table to the table of their concept's domain, per destination and
+    domain, out of the rows the mappings and custom SQL loaded into its table, and the moved rows
+    that had a value the destination has no place for (dropped). Moves are expected (a code list
+    holds codes of several domains: ICD-10 Z codes are observations, a procedure list holds
+    diagnoses), so they are reported for review only; many moves can also mean a wrong vocabulary
+    or concept mapping."""
+    moved = sum(m.moved_rows for m in s.moved)
+    dropped = sum(m.rows_with_dropped_fields for m in s.moved)
+    rows = max(loaded, moved)
+    where = "; ".join(f"{m.moved_rows} to {m.to_table} ({m.domain_id})" for m in s.moved)
+    return CheckResult(
+        check_name="etlDomainRouting",
+        check_level="ETL",
+        table=s.target_table,
+        description=f"Records of {s.target_table} whose standard concept belongs to another domain, moved by ETL step "
+        f"'{s.step}' to the table of that domain: {moved} of {rows} rows ({where})"
+        + (f". {dropped} of them had a value the destination table has no place for, which was dropped (for example "
+           "a measurement's range or operator, a drug's days_supply or route)" if dropped else "")
+        + ". Reported for review: a code list often holds codes of several domains, but many moves can also mean a "
+        "wrong vocabulary or concept mapping.",
+        category="Conformance",
+        subcategory="Domain",
+        severity="characterization",
+        num_violated_rows=moved,
+        num_denominator_rows=rows,
+        pct_violated_rows=min(moved / rows, 1.0) if rows else 0.0,
+        threshold_pct=100.0,
+        failed=False,
+        sql=s.sql,
+        step=label,
+        repairable=False,
+    )
 
 
 def _required_value_checks(s: TableLoadResult, label: str) -> list[CheckResult]:
@@ -1328,6 +1392,77 @@ def _period_completeness_note(r: CheckResult, etl_result: ETLRunResult) -> Check
     })
 
 
+def _route_only_note(r: CheckResult, route_only: set[str]) -> CheckResult:
+    """measurePersonCompleteness of a table whose records were all moved there by domain
+    (``etl.routing.route_only_tables``): few persons have such records, and no change of the spec
+    can give the others one, so it is not repairable (it still blocks when it is a blocking check)."""
+    if r.check_name != "measurePersonCompleteness" or r.table not in route_only or r.not_applicable:
+        return r
+    return r.model_copy(update={
+        "description": r.description + f" No mapping loads {r.table}: its records were moved there from other tables "
+        "because their concepts belong to its domain, so most persons have none (the repair agent cannot change that).",
+        "repairable": False,
+    })
+
+
+def _unrouted_note(r: CheckResult, etl_result: ETLRunResult) -> CheckResult:
+    """fkDomain of the main concept field of a routed table whose route step failed or was skipped
+    (or whose route_prepare failed): the records of other event domains stayed in the table, and
+    no change of the spec makes the route step run, so it is not repairable (the step error says
+    why it failed)."""
+    if r.check_name != "fkDomain" or r.table not in ROUTE_SOURCES or r.field != EVENT_FIELD_ROLES[r.table]["concept"]:
+        return r
+    step = next((s for s in etl_result.steps if s.kind == "route" and step_label(s.step) == f"route_{r.table}"), None)
+    if step is None or not (step.error or step.skipped):
+        return r
+    return r.model_copy(update={
+        "description": r.description + f" The build could not move the {r.table} records of other domains to the "
+        f"tables of their domains (step '{step.step}' failed or was skipped), so they are counted here; fix the cause "
+        "of that step error first (the repair agent cannot).",
+        "repairable": False,
+    })
+
+
+def _hand_routing_checks(spec: ETLSpec, etl_result: ETLRunResult) -> list[CheckResult]:
+    """``etlHandRouting`` (ETL, convention, not repairable) for each mapping that routes records
+    by the domain of their concept by hand while the build routes them (``etl.routing.hand_routed``:
+    a filter on {vocab}.concept domain_id, or the same codes of the same rows as another mapping of
+    its source table into another event table), typically a spec written before the build routed by
+    domain. Its records are loaded twice: once by the mapping, once moved there by the build (or
+    the filter drops records the build would have moved). It fails when the mapping loaded rows;
+    the counts are those rows. Removing the mapping (or its filter) is for a person to decide."""
+    if not spec.route_by_domain:
+        return []
+    labels = mapping_labels(spec)
+    out = []
+    for i, why in hand_routed(spec):
+        tm, label = spec.table_mappings[i], labels[i]
+        step = next((s for s in etl_result.steps if s.kind in (None, "insert") and step_label(s.step) == label), None)
+        if step is None or step.error or step.skipped:
+            continue
+        n = int(step.rows_inserted or 0)
+        out.append(CheckResult(
+            check_name="etlHandRouting",
+            check_level="ETL",
+            table=tm.target_table.lower(),
+            description=f"The mapping of ETL step '{step.step}' (from {tm.source.table} into {tm.target_table}, "
+            f"{n} rows) routes records by the domain of their concept by hand, while the build moves every record to "
+            f"the table of its concept's domain itself: {why}. Its records may be in the CDM twice. Remove the mapping "
+            "or its domain filter (or set route_by_domain: false); the repair agent may not.",
+            category="Conformance",
+            subcategory="Domain",
+            severity="convention",
+            num_violated_rows=n,
+            num_denominator_rows=n,
+            pct_violated_rows=1.0 if n else 0.0,
+            threshold_pct=0.0,
+            failed=n > 0,
+            step=label,
+            repairable=False,
+        ))
+    return out
+
+
 def summarize(r: CheckResult) -> str:
     """One-line summary of a check outcome, e.g. for gate messages and prompts."""
     if r.error:
@@ -1400,8 +1535,9 @@ def run_builtin_checks(
     """Run the built-in DQD subset over the CDM tables in ``schemas.cdm``.
 
     "Populated" tables are every table the compiled spec writes (``compiler.target_tables``,
-    which includes cdm_source) plus person and observation_period, or, without a spec, the
-    tables that have rows; checks on other tables are reported as not applicable.
+    which includes cdm_source) plus person and observation_period and the route destinations
+    that received records, or, without a spec, the tables that have rows; checks on other tables
+    are reported as not applicable.
     All statements run in a transaction that is rolled back, so the connection is left as found.
     """
     cdm = load_cdm_spec()
@@ -1430,8 +1566,13 @@ def run_builtin_checks(
                 results.extend(_integrity_checks(ctx, t))
                 results.extend(_within_observation_period_checks(ctx, t))
                 results.extend(_not_implemented_checks(ctx, t))
+    if spec is not None:
+        route_only = route_only_tables(spec)
+        results = [_route_only_note(r, route_only) for r in results]
     if etl_result is not None:
-        results = [_period_completeness_note(r, etl_result) for r in results]
+        results = [_unrouted_note(_period_completeness_note(r, etl_result), etl_result) for r in results]
         results.extend(etl_checks(etl_result, cfg.quality.min_record_retention_pct, cfg.etl))
+        if spec is not None:
+            results.extend(_hand_routing_checks(spec, etl_result))
     passed, blocking = gate(results, cfg, etl_result)
     return DQReport(run_at=utcnow(), engine="builtin", results=results, passed=passed, blocking_failures=blocking)

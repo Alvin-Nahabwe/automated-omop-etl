@@ -329,6 +329,11 @@ class SourceTerm(BaseModel):
         description="Domains a target concept may belong to (the record is moved to its domain's table); "
         "empty: target_domain only.",
     )
+    auto_approve: bool = Field(
+        True,
+        description="False: the fields that use its source vocabulary expect concepts of different domains, so "
+        "no concept is approved for it without a reviewer.",
+    )
     units: list[ValueFreq] = Field(
         default_factory=list,
         description="Units recorded with this code (measurements/observations), each seen at least "
@@ -506,8 +511,15 @@ class ETLRunResult(BaseModel):
     def rows_loaded(self) -> int:
         """Rows the steps without an error wrote to the CDM. The id-map and pruning steps write only
         the id maps (new and retired keys) and are left out, and so is the observation-period merge,
-        whose periods replace the episodes its table's writers loaded."""
-        return sum(s.rows_inserted for s in self.steps if s.error is None and s.kind not in ("id_map", "prune", "merge"))
+        whose periods replace the episodes its table's writers loaded, and so are the route steps,
+        which only move records already loaded (``rows_moved``) and keep their bookkeeping."""
+        return sum(s.rows_inserted for s in self.steps
+                   if s.error is None and s.kind not in ("id_map", "prune", "merge", "route"))
+
+    def rows_moved(self) -> int:
+        """Records the route steps moved to the table of their concept's domain (they are counted in
+        ``rows_loaded`` by the steps that loaded them)."""
+        return sum(m.moved_rows for s in self.steps if s.error is None for m in s.moved)
 
     def rows_derived(self) -> int:
         """Of ``rows_loaded``, the rows the build derived from other CDM tables (observation periods

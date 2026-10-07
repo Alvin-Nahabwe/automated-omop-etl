@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, fetch_all, qi, ql, short_error
 from ..etl.compiler import CompileError, where_sql
+from ..etl.routing import accepted_domains_for
 from ..etl.session import apply_session
 from ..models import ETLSpec, FieldMapping, TableMapping, ValueFreq
 from .loader import vocabulary_inventory, vocabulary_version
@@ -173,9 +174,13 @@ def _required(spec: ETLSpec, present: set[str]) -> list[RequiredVocabulary]:
         vocabs = DOMAIN_VOCABULARIES.get(domain.lower())
         if vocabs:
             alt = f"; {' or '.join(vocabs)} accepted" if len(vocabs) > 1 else ""
+            # a field routed by domain also accepts concepts of other domains (their records move):
+            # the target domain's vocabulary is still the one most codes need
+            also = accepted_domains_for(spec, tm, fm)[1:]
+            routed = f"; {', '.join(also)} concepts also accepted" if also else ""
             need(
                 vocabs[0],
-                f"{domain} targets for {fm.vocabulary} ({tm.target_table}.{fm.target_field}){alt}",
+                f"{domain} targets for {fm.vocabulary} ({tm.target_table}.{fm.target_field}){alt}{routed}",
                 vocabs[1:],
             )
     for vocab in INFRASTRUCTURE_VOCABULARIES:

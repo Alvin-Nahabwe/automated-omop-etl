@@ -46,29 +46,64 @@ INDEXES = [
 
 
 _INDEX_NAME = re.compile(r"CREATE INDEX IF NOT EXISTS (\w+) ON")
+_PLAIN_INDEX = re.compile(r"ON \{vocab\}\.(\w+) \(([\w, ]+)\)$")  # a btree index over columns
+
+
+def _index_columns(conn: psycopg.Connection, schemas: Schemas) -> dict[str, list[tuple[str, ...]]]:
+    """The column lists of the existing indexes of each vocabulary table (an expression index
+    contributes the columns before its first expression)."""
+    rows = fetch_all(conn, """
+        SELECT c.relname AS table_name, i.indexrelid,
+               ARRAY(SELECT a.attname FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, n)
+                     JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                     WHERE k.attnum > 0 AND k.n <= COALESCE((SELECT min(z.n) FROM unnest(i.indkey::int2[])
+                                                             WITH ORDINALITY z(attnum, n) WHERE z.attnum = 0) - 1, 32)
+                     ORDER BY k.n) AS cols
+        FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace s ON s.oid = c.relnamespace
+        WHERE s.nspname = %s""", (schemas.vocab,))
+    out: dict[str, list[tuple[str, ...]]] = {}
+    for r in rows:
+        out.setdefault(r["table_name"], []).append(tuple(r["cols"] or ()))
+    return out
 
 
 def ensure_indexes(conn: psycopg.Connection, schemas: Schemas) -> list[str]:
-    """Create any missing vocabulary indexes (a vocabulary loaded by an older version lacks some).
+    """Create any missing vocabulary indexes (a vocabulary loaded by an older version, or by
+    someone else, lacks some). An index is missing when no index has its name and none starts
+    with its columns (the OHDSI DDL's primary key on concept_id serves the lookups by id).
     Idempotent; on a full Athena vocabulary the first run takes a few minutes. Returns the indexes
-    that are missing but could not be created (the vocabulary tables belong to another role)."""
+    that are missing but could not be created (the vocabulary tables belong to another role, are
+    views or foreign tables, the database is read-only, ...): indexes are an optimisation, so
+    that never fails the caller."""
     have = {
         r["indexname"]
         for r in fetch_all(conn, "SELECT indexname FROM pg_indexes WHERE schemaname = %s", (schemas.vocab,))
     }
+    try:
+        with conn.transaction():
+            columns = _index_columns(conn, schemas)
+    except psycopg.Error:
+        columns = {}
     stmts = INDEXES + (TRGM_INDEXES if ensure_trigram(conn) else [])
     skipped: list[str] = []
     for stmt in stmts:
         m = _INDEX_NAME.search(stmt)
         if m and m.group(1) in have:
             continue
+        plain = _PLAIN_INDEX.search(stmt)
+        if plain:
+            want = tuple(c.strip() for c in plain.group(2).split(","))
+            if any(cols[: len(want)] == want for cols in columns.get(plain.group(1), [])):
+                continue  # an index under another name serves the same lookups
         try:
             with conn.transaction():
                 execute(conn, schemas.render(stmt))
-        except psycopg.errors.InsufficientPrivilege:
+        except psycopg.Error:  # e.g. InsufficientPrivilege, WrongObjectType (a view), ReadOnlySqlTransaction
             skipped.append(m.group(1) if m else stmt)
     conn.commit()
     return skipped
+
+
 TRGM_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_concept_name_trgm ON {vocab}.concept USING gin (lower(concept_name) gin_trgm_ops)",
     "CREATE INDEX IF NOT EXISTS idx_concept_syn_trgm ON {vocab}.concept_synonym USING gin (lower(concept_synonym_name) gin_trgm_ops)",

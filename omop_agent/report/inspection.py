@@ -34,7 +34,8 @@ from pydantic import BaseModel
 from ..cdm.spec import LOAD_ORDER, load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, fetch_all, qi, short_error
-from ..etl.compiler import key_sources
+from ..etl.compiler import key_sources, step_label
+from ..etl.routing import ROUTE_PREPARE
 from ..privacy import apply_overrides
 from ..models import (
     CheckResult,
@@ -477,6 +478,7 @@ def _design_section(spec: ETLSpec) -> dict[str, Any]:
         "visit_key": f"{spec.visit_key.table}: {spec.visit_key.expression}" if spec.visit_key else "",
         "visit_key_also": also("visit_occurrence") if spec.visit_key else "",
         "observation_period": spec.observation_period,
+        "route_by_domain": spec.route_by_domain,
         "n_mappings": len(spec.table_mappings),
         "n_fields": sum(total.values()),
         "kinds_total": [{"kind": k, "n": total[k]} for k in order if total[k]],
@@ -659,6 +661,14 @@ def _period_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
     return ""
 
 
+def _moved_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
+    """A route step: the records it moved to the table of their concept's domain (it loads none,
+    so it has no retention), e.g. 'moved 12'."""
+    if s.kind != "route" or s.error or s.skipped or step_label(s.step) == ROUTE_PREPARE:
+        return ""
+    return f"moved {count(sum(m.moved_rows for m in s.moved))}"
+
+
 def _retention(s: TableLoadResult) -> float | None:
     """Rows inserted per source row; for a step that keeps one row per key, the source rows kept
     (``retained_rows``, the etlRecordRetention basis): rows that lost to another row of their key,
@@ -676,16 +686,23 @@ def _etl_section(run: ETLRunResult, min_cell_count: int = 5, shareable: bool = F
         {
             "table": s.target_table,
             "step": s.step,
-            "rows": s.rows_inserted,
+            "rows": None if s.kind == "route" else s.rows_inserted,  # a route step loads nothing: see "moved"
             "source_rows": s.source_rows,
             "retention": _retention(s) if s.error is None else None,
             "one_row_per_key": _key_stats(s, count),
             "periods": _period_stats(s, count),
             "visit_links": _link_stats(s, count),
+            "moved": _moved_stats(s, count),
             "seconds": s.seconds,
             "error": _short(s.error, 600) if s.error else "",
         }
         for s in run.steps
+    ]
+    # the records the route steps moved to the table of their concept's domain, per destination
+    moved = [
+        {"from_table": m.from_table, "to_table": m.to_table, "domain_id": m.domain_id, "rows": count(m.moved_rows),
+         "dropped": count(m.rows_with_dropped_fields)}
+        for s in run.steps if s.kind == "route" and not s.error for m in s.moved
     ]
     start, end = _as_utc(run.started_at), _as_utc(run.finished_at)
     return {
@@ -695,6 +712,8 @@ def _etl_section(run: ETLRunResult, min_cell_count: int = 5, shareable: bool = F
         "steps": steps,
         "total_rows": run.rows_loaded(),  # the merge's periods replace rows already counted
         "derived_rows": run.rows_derived(),
+        "moved": moved,
+        "moved_rows": count(run.rows_moved()) if run.rows_moved() else "",
         "n_errors": len(run.errors()),
         "ok": run.ok,
     }

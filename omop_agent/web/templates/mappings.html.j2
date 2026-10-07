@@ -81,7 +81,7 @@
         <dl class="facts small">
           <dt>Method</dt><dd>{{ d.method }}</dd>
           <dt>Equivalence</dt><dd>{{ d.equivalence|lower }}</dd>
-          {% if d.target_domain %}<dt>Target domain</dt><dd>{{ d.target_domain }}</dd>{% endif %}
+          {% if d.target_domain %}<dt>Target domain</dt><dd>{{ d.target_domain }}{% if d.accepted_domains|length > 1 %} <span class="muted small">(also accepted: {{ d.accepted_domains[1:]|join(', ') }}; the record moves to the table of the concept's domain)</span>{% endif %}</dd>{% endif %}
           {% if d.reviewed_by %}<dt>Reviewed</dt><dd>{{ d.reviewed_by }}, {{ d.reviewed_at|dt }}</dd>{% endif %}
           {% if d.review_note %}<dt>Reviewer's note</dt><dd>{{ d.review_note }}</dd>{% endif %}
         </dl>

@@ -108,6 +108,14 @@ def render_spec_md(spec: ETLSpec) -> str:
             "episodes that end before they start, and gives persons without a valid episode a period from their "
             "first to their last event"
         )
+    if spec.route_by_domain:
+        out.append(
+            "- **Routing by domain:** after loading, every condition_occurrence, procedure_occurrence, drug_exposure, "
+            "device_exposure and measurement record whose standard concept belongs to another event domain moves to "
+            "that domain's table (a measurement with a result goes to observation); records with concept 0 stay"
+        )
+    else:
+        out.append("- **Routing by domain:** off (`route_by_domain: false`): records stay in the table that loads them")
     out += ["", "| # | source table | → | CDM table | fields |", "|---|---|---|---|---|"]
     for k, (_, tm) in enumerate(mappings, start=1):
         src = tm.source.table + "".join(f" + {j.table}" for j in tm.joins)

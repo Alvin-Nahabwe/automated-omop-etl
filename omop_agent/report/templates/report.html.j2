@@ -235,7 +235,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     <div class="stat"><div class="v">{{ design.n_fields }}</div><div class="k">field mappings</div></div>
     <div class="stat"><div class="v">{{ design.open_questions|length }}</div><div class="k">open questions</div></div>
   </div>
-  <p>CDM {{ design.cdm_version }} · person key <code>{{ design.person_key }}</code>{% if design.person_key_also %} (also from <code>{{ design.person_key_also }}</code>){% endif %} · visit key {% if design.visit_key %}<code>{{ design.visit_key }}</code>{% if design.visit_key_also %} (also from <code>{{ design.visit_key_also }}</code>){% endif %}{% else %}none{% endif %} · observation period: {{ design.observation_period }}</p>
+  <p>CDM {{ design.cdm_version }} · person key <code>{{ design.person_key }}</code>{% if design.person_key_also %} (also from <code>{{ design.person_key_also }}</code>){% endif %} · visit key {% if design.visit_key %}<code>{{ design.visit_key }}</code>{% if design.visit_key_also %} (also from <code>{{ design.visit_key_also }}</code>){% endif %}{% else %}none{% endif %} · observation period: {{ design.observation_period }} · records moved to the table of their concept's domain: {{ 'yes' if design.route_by_domain else 'no' }}</p>
   <p class="muted">Fields by kind: {% for k in design.kinds_total %}{{ k.kind }} {{ k.n }}{{ ' · ' if not loop.last else '' }}{% endfor %}</p>
   <div class="tw"><table>
     <thead><tr><th>Target</th><th>Source</th><th>Joins / filter</th><th class="n">Fields</th><th>Kinds</th><th>Rationale</th></tr></thead>
@@ -326,6 +326,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     <div class="stat"><div class="v">{{ etl.steps|length }}</div><div class="k">steps</div></div>
     <div class="stat"><div class="v">{{ etl.total_rows|num }}</div><div class="k">rows loaded</div></div>
     {% if etl.derived_rows %}<div class="stat"><div class="v">{{ etl.derived_rows|num }}</div><div class="k">derived by the build (observation periods)</div></div>{% endif %}
+    {% if etl.moved_rows %}<div class="stat"><div class="v">{{ etl.moved_rows }}</div><div class="k">moved to the table of their concept's domain</div></div>{% endif %}
     <div class="stat"><div class="v">{{ etl.n_errors }}</div><div class="k">errors</div></div>
     <div class="stat"><div class="v">{{ etl.duration|secs }}</div><div class="k">duration</div></div>
   </div>
@@ -334,11 +335,23 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     <thead><tr><th>Step</th><th>Table</th><th class="n">Rows inserted</th><th class="n">Source rows</th><th class="n">Retention</th><th>Statistics</th><th>Visit links</th><th class="n">Time</th><th>Error</th></tr></thead>
     <tbody>
     {% for s in etl.steps %}
-      <tr{% if s.error %} class="blocking"{% endif %}><td>{{ s.step }}</td><td>{{ s.table }}</td><td class="n">{{ s.rows|num }}</td><td class="n">{{ s.source_rows|num }}</td><td class="n">{{ s.retention|pct }}</td><td class="wrap">{{ s.one_row_per_key or s.periods }}</td><td class="wrap">{{ s.visit_links }}</td><td class="n">{{ s.seconds|secs }}</td><td class="err">{% if s.error %}{{ badge('error', 'fail') }} {{ s.error }}{% endif %}</td></tr>
+      <tr{% if s.error %} class="blocking"{% endif %}><td>{{ s.step }}</td><td>{{ s.table }}</td><td class="n">{{ s.rows|num }}</td><td class="n">{{ s.source_rows|num }}</td><td class="n">{{ s.retention|pct }}</td><td class="wrap">{{ s.one_row_per_key or s.periods or s.moved }}</td><td class="wrap">{{ s.visit_links }}</td><td class="n">{{ s.seconds|secs }}</td><td class="err">{% if s.error %}{{ badge('error', 'fail') }} {{ s.error }}{% endif %}</td></tr>
     {% endfor %}
     </tbody>
   </table></div>
-  <p class="muted">Retention: rows inserted per source row; for steps that keep one row per key, source rows kept (rows that lost to another row of their key are not lost). Statistics: for steps that keep one row per key, source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays; for the observation-period merge, the episodes loaded and the periods they became (episodes that end before they start are dropped; open episodes end at the source release date, configured or derived from the exit dates, or at death; overlapping and back-to-back episodes merge; the persons with overlapping episodes, or with an open episode followed by a later one, are counted for review), and the persons without a period that the fill gave one from their events. Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.</p>
+  <p class="muted">Retention: rows inserted per source row; for steps that keep one row per key, source rows kept (rows that lost to another row of their key are not lost). Statistics: for steps that keep one row per key, source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays; for the observation-period merge, the episodes loaded and the periods they became (episodes that end before they start are dropped; open episodes end at the source release date, configured or derived from the exit dates, or at death; overlapping and back-to-back episodes merge; the persons with overlapping episodes, or with an open episode followed by a later one, are counted for review), and the persons without a period that the fill gave one from their events; for the route steps, the records they moved to the table of their concept's domain (they load none, so they have no retention). Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.</p>
+  {% if etl.moved %}
+  <h3>Records moved to the table of their concept's domain</h3>
+  <div class="tw"><table>
+    <thead><tr><th>From</th><th>To</th><th>Concept domain</th><th class="n">Records</th><th class="n">With a value dropped</th></tr></thead>
+    <tbody>
+    {% for m in etl.moved %}
+      <tr><td>{{ m.from_table }}</td><td>{{ m.to_table }}</td><td>{{ m.domain_id }}</td><td class="n">{{ m.rows }}</td><td class="n">{{ m.dropped }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  <p class="muted">A record whose standard concept belongs to another domain is moved after loading; a measurement with a result whose concept is not a measurement or an observation goes to observation. With a value dropped: moved records that had a value the destination table has no place for (a measurement's range or operator, a drug's days_supply or route, ...).</p>
+  {% endif %}
   {% else %}{{ empty('Not run: no etl_run.json in the workspace.') }}{% endif %}
 </section>
 

@@ -266,6 +266,27 @@ def test_reviewer_approves_flags_and_rejects(site):
     assert events[0]["after"] == {"target_concept_id": 12, "status": "APPROVED"} and events[0]["by"] == "rita"
 
 
+def test_mapping_edits_are_checked_against_the_current_spec(site, monkeypatch):
+    """The CSV edits and the approve action use the domains the spec accepts now (as the command
+    line does), not those stored when the terms were mapped."""
+    import omop_agent.web.app as webapp
+
+    client, ws, *_ = site
+    seen: list = []
+    real = webapp.import_review
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("domains"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(webapp, "import_review", spy)
+    login(client, "rita")
+    assert client.get("/p/demo/mappings?filter=all").status_code == 200
+    assert seen[-1]["SRC_DRUG"].accepted == ["Drug", "Device"]  # drug_exposure is routed by domain
+    ws.spec_yaml.write_text("table_mappings: [unclosed")
+    assert client.get("/p/demo/mappings?filter=all").status_code == 200 and seen[-1] is None
+
+
 def test_unlisted_concepts_need_the_database_and_stale_pages_are_refused(site):
     client, ws, *_ = site
     login(client, "rita")

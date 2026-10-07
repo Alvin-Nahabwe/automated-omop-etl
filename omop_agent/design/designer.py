@@ -87,7 +87,14 @@ has no person are dropped.
 - Concept fields hold standard concepts from the domain the CDM field expects. Use 0 ("No \
 matching concept") when a source value exists but cannot be mapped. Only use concept ids that \
 appear in the reference list; anything else must come from a lookup (concept_map or \
-vocab_code), never from memory.
+vocab_code), never from memory. The main concept field of condition_occurrence, \
+procedure_occurrence, drug_exposure, device_exposure and measurement may also receive a concept \
+of another domain: the build then moves the record to that domain's table. A local code \
+(concept_map) of a condition may map to a Condition, Observation, Procedure or Measurement \
+concept; of a procedure to a Procedure, Observation or Measurement concept; of a measurement to a \
+Measurement or Observation concept; of a drug or a device to a Drug or Device concept. Only the \
+standard concept decides: unmapped records (concept 0) stay where you load them, and concepts of \
+other domains (values, units, types) are never moved.
 - Keep the verbatim source value in the matching *_source_value field, and fill \
 *_source_concept_id from the source vocabulary when a vocab_code lookup is used (0 otherwise).
 - Required fields: when a required value can be missing or unreadable, the build applies the \
@@ -106,9 +113,16 @@ or at death, drops episodes that end before they start, and gives persons withou
 episode a period from their first to their last event. So do not merge, de-duplicate or filter \
 episodes yourself and do not write correlated subqueries for it. Without such a table use \
 'from_events'.
-- Records go to the table of their content's domain: diagnoses to condition_occurrence, \
-prescriptions and dispensings to drug_exposure, lab results and vital signs to measurement, \
-other facts to observation.
+- Map each source table of events to the table of its content: diagnoses to \
+condition_occurrence, prescriptions and dispensings to drug_exposure, lab results and vital signs \
+to measurement, other facts to observation. After loading, the build moves every \
+condition_occurrence, procedure_occurrence, drug_exposure, device_exposure and measurement record \
+whose standard concept belongs to another of these domains or to Observation to that domain's \
+table (an ICD-10 Z code for antenatal care to observation, a procedure code to \
+procedure_occurrence); a measurement with a result whose concept is not a measurement or an \
+observation goes to observation, so the result is kept. So never split a source table by the \
+domain of its codes yourself (a second mapping of the same codes, or a filter on \
+{vocab}.concept.domain_id): those records would be loaded twice.
 
 Answer with the requested JSON structure only. Write SQL for PostgreSQL. Put the reasoning a \
 reviewer needs into the rationale fields, briefly.
@@ -146,7 +160,10 @@ kind person_id, because only the resulting integer person_id is stored.
 - Constant concept ids must come from the reference concept list, or be 0.
 - Use kind concept_map for local codes, labels and free-text categories. Name the \
 vocabulary 'SRC_<NAME>' (for example 'SRC_DRUG') and set target_domain to the OMOP domain of \
-the concepts they should map to; the codes are mapped to standard concepts in a later step.
+the concepts they should map to; the codes are mapped to standard concepts in a later step. For \
+the main concept field of an event table this is the table's own domain: the mapper also accepts \
+the other domains listed above for it. Give every field its own source vocabulary unless the \
+fields mean the same codes: one concept is chosen per code for every field that shares one.
 - Use kind vocab_code for codes that already belong to an OMOP vocabulary (ICD10, ICD10CM, \
 LOINC, RxNorm, SNOMED, ...). The expression must produce the code exactly as it appears in \
 concept.concept_code, so normalise the format in SQL when the profile shows it differs (for \
@@ -158,7 +175,8 @@ that every other table links through, so they are never auto_id: an auto_id pers
 follow row order and attach every event to the wrong person. Other tables' own primary keys \
 (condition_occurrence_id, drug_exposure_id, measurement_id, ...) use kind auto_id.
 - Use where to keep only the rows that belong in this table when one source table feeds \
-several CDM tables.
+several CDM tables, by what a row records (a visit type, a form), never by the domain of its \
+code: the build moves records by domain.
 - A correlated subquery ({src}.<table> inside an expression) runs once per source row, which is \
 slow on large tables; prefer a join. Observation period episodes never need one: the build merges \
 them.
@@ -401,7 +419,8 @@ their events), otherwise 'from_events'.
 4. tables: one entry per table mapping, in load order (person first). For each, the CDM \
 target table and its source tables (the first one provides the rows; any others are joined). \
 A CDM table may appear more than once when several source tables feed it. Only plan tables \
-the data supports.
+the data supports. Do not plan mappings that only split a source table by the domain of its \
+codes: the build moves each record to the table of its concept's domain.
 5. unmapped_source_tables: source tables you leave out, with the reason in open_questions.
 6. assumptions you made and open_questions for the data owner.
 

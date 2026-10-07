@@ -39,10 +39,14 @@ A full compile yields ordered steps. Each step has a sort key ``slot`` = (load i
 table, band, sequence), and the steps are stably sorted on it: the id maps come first; then,
 table by table in CDM load order (``cdm.spec.LOAD_ORDER``), the table's writers (band 0: its
 mappings in spec order, then its custom SQL; custom SQL of a table without a mapping runs at
-that table's place too, not after everything) and the steps generated for it (band 1); the
-derived observation period follows every spec writer of observation_period, and the
-``cdm_source`` row comes last. After the last writer of observation_period (and so after death)
-the ``observation_period_merge`` step replaces the loaded periods (residency episodes, or the
+that table's place too, not after everything) and the steps generated for it (band 1); after
+the last writer of the event tables (specimen, band 2) the route block moves records to the table
+of their concept's domain (``etl.routing``: ``route_prepare``, then one non-blocking
+``route_<table>`` step per routed table), before payer_plan_period, cost, the observation periods
+and the eras, which read or refer to the records where they end up; the derived observation
+period follows every spec writer of observation_period, and the ``cdm_source`` row comes last.
+After the last writer of observation_period (and so after death) the
+``observation_period_merge`` step replaces the loaded periods (residency episodes, or the
 periods derived from events) by each person's merged periods: open episodes end at the source
 release date (``cdm_source.source_release_date``, or one derived robustly from the exit dates and
 stored in ``{etl}.build_facts`` for the cdm_source row) or at death, real exits are never clipped,
@@ -85,6 +89,7 @@ from .policies import (
     partial_policy,
     required_null_policy,
 )
+from .routing import ROUTE_PREPARE, route_prepare_sql, route_sources, route_sql, route_targets
 from .tolerant import LexError, Rewrite, kind_of, lex, rewrite, tolerant_value
 
 StepKind = Literal["id_map", "insert", "custom", "prune", "route", "merge", "derived", "metadata"]
@@ -1170,6 +1175,18 @@ def step_label(name: str) -> str:
     return m.group(1) if m else name
 
 
+def mapping_labels(spec: ETLSpec) -> list[str]:
+    """The step label of each table mapping, in spec order: its table, and ``<table>_<n>`` for the
+    n-th mapping into one table."""
+    seen: dict[str, int] = {}
+    out = []
+    for tm in spec.table_mappings:
+        t = tm.target_table.lower()
+        seen[t] = seen.get(t, 0) + 1
+        out.append(t if seen[t] == 1 else f"{t}_{seen[t]}")
+    return out
+
+
 def _indent(lines: list[str], n: int = 4) -> list[str]:
     return [" " * n + line for line in lines]
 
@@ -1714,14 +1731,21 @@ def _is_cdm_table(name: str) -> bool:
     return spec.has_table(name) and spec.table(name).schema_class == "CDM"
 
 
+def _in_load_order(names: set[str] | list[str]) -> list[str]:
+    """The CDM tables of ``names`` in load order."""
+    return sorted({n for n in names if _is_cdm_table(n)}, key=lambda n: (_load_index(n), n))
+
+
 def target_tables(spec: ETLSpec) -> list[str]:
-    """Every CDM table the compiled spec writes (incl. observation_period, cdm_source), in load order."""
+    """Every CDM table the compiled spec writes (incl. observation_period, cdm_source), in load
+    order. The tables only the route steps write are not in it (``etl.routing.route_targets``): a
+    route destination that received no record is not a populated table."""
     names = {tm.target_table.lower() for tm in spec.table_mappings}
     names |= {cs.target_table.lower() for cs in spec.custom_sql}
     if spec.observation_period == "from_events":
         names.add("observation_period")
     names.add("cdm_source")
-    return sorted((n for n in names if _is_cdm_table(n)), key=lambda n: (_load_index(n), n))
+    return _in_load_order(names)
 
 
 def _safe_name(s: str) -> str:
@@ -1734,10 +1758,13 @@ def compile_spec(
     cdm_source: CdmSourceConfig | None = None,
     *,
     etl: EtlConfig | None = None,
+    vocab_indexed: bool = True,
     strict: bool = True,
 ) -> list[CompiledStep]:
     """Compile the whole spec into ordered steps (see the module docstring for the order).
-    ``etl`` (``ProjectConfig.etl``) gives the partial-date rule of the tolerant conversions.
+    ``etl`` (``ProjectConfig.etl``) gives the partial-date rule of the tolerant conversions;
+    ``vocab_indexed`` (``etl.routing.vocab_indexed``) says whether the route steps can look the
+    concepts up by id or must join the concept table.
 
     With ``strict=False`` a table mapping that does not compile yields a step with ``error``
     set (and empty SQL) instead of raising, so the other tables can still be loaded.
@@ -1763,10 +1790,9 @@ def compile_spec(
 
     # 2. the spec's writers, each at its table's slot: the mappings in spec order, then the custom SQL
     seen_count: dict[str, int] = {}
-    for i, tm in enumerate(spec.table_mappings):
+    for i, (tm, label) in enumerate(zip(spec.table_mappings, mapping_labels(spec))):
         t = tm.target_table.lower()
         seen_count[t] = seen_count.get(t, 0) + 1
-        label = t if seen_count[t] == 1 else f"{t}_{seen_count[t]}"
         slot = (_load_index(t), 0, i)
         try:
             c = _compile(tm, spec, etl)
@@ -1798,11 +1824,26 @@ def compile_spec(
         steps.append(CompiledStep("visit_map_prune", None, "prune", "\n".join(vp), statements=tuple(vp),
                                   slot=(_load_index("visit_occurrence"), 1, 0)))
 
+    # the route block, after every writer of the event tables (specimen is the last of them) and
+    # before payer_plan_period, cost, the observation periods and the eras, which read or refer to
+    # the records where they end up. Not blocking: on an error the records stay where they were loaded
+    sources = route_sources(spec)
+    if sources:
+        route_index = _load_index("specimen")
+        rp = route_prepare_sql()
+        steps.append(CompiledStep(ROUTE_PREPARE, None, "route", "\n".join(rp), statements=tuple(rp), blocking=False,
+                                  slot=(route_index, 2, 0)))
+        for i, src in enumerate(sources, start=1):
+            steps.append(CompiledStep(f"route_{src}", src, "route", route_sql(src, vocab_indexed), blocking=False,
+                                      requires=ROUTE_PREPARE, returns="rows", slot=(route_index, 2, i)))
+
     # observation periods: from the events (after every spec writer of observation_period), then the
     # merge of each person's periods after the last writer (and after death, which ends open
-    # episodes); with 'table_mapping' the fill for persons left without a period
+    # episodes); with 'table_mapping' the fill for persons left without a period. Both read the
+    # event tables as routed (the route destinations too)
     op_index = _load_index("observation_period")
-    loaded = [t for t in target_tables(spec) if t != "observation_period"]
+    loaded = [t for t in _in_load_order(set(target_tables(spec)) | set(route_targets(spec)))
+              if t != "observation_period"]
     if spec.observation_period == "from_events":
         op = _observation_period_sql(spec, loaded)
         if op is not None:

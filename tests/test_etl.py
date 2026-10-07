@@ -78,28 +78,36 @@ def test_step_order_and_targets():
         "08_drug_exposure",
         "09_measurement",
         "10_death",
-        "11_observation_period",
-        "12_observation_period_merge",
-        "13_observation_period_fill",
-        "14_cdm_source",
+        "11_route_prepare",
+        "12_route_condition_occurrence",
+        "13_route_drug_exposure",
+        "14_route_measurement",
+        "15_observation_period",
+        "16_observation_period_merge",
+        "17_observation_period_fill",
+        "18_cdm_source",
     ]
-    assert [s.kind for s in steps] == ["id_map", "id_map", "insert", "prune", "insert", "prune"] + ["insert"] * 5 + [
-        "merge", "derived", "metadata"
-    ]
-    # pruning, the merge and the fill run after a failed load too
-    assert [s.requires for s in steps if s.requires] == []
+    assert [s.kind for s in steps] == ["id_map", "id_map", "insert", "prune", "insert", "prune"] + ["insert"] * 4 + [
+        "route"] * 4 + ["insert", "merge", "derived", "metadata"]
+    # pruning, the merge and the fill run after a failed load too; the route steps need route_prepare
+    assert [(s.label, s.requires) for s in steps if s.requires] == [
+        ("route_condition_occurrence", "route_prepare"), ("route_drug_exposure", "route_prepare"),
+        ("route_measurement", "route_prepare")]
     # sort keys: (load index of the table, band, sequence); id maps first, cdm_source last
     assert [s.slot for s in steps] == sorted(s.slot for s in steps)
     assert steps[0].slot[0] == steps[1].slot[0] == -1 and steps[-1].slot[0] > len(LOAD_ORDER) - 1
     assert step(steps, "person_map_prune").slot == (LOAD_ORDER.index("person"), 1, 0)
     assert [s.label for s in steps][:3] == ["person_map", "visit_map", "person"]
-    # every step is blocking and reads a row count, except the tables that keep one row per key,
-    # whose statement returns its statistics; its SQL is its statements (two for the id maps and
-    # the visit pruning); the spec kinds. The inserts count the required values they complete or
-    # drop (per field, and the dropped rows), the generated steps count nothing
-    assert all(s.blocking for s in steps)
+    # every step but the route steps is blocking and reads a row count, except the tables that keep
+    # one row per key, whose statement returns its statistics, and the route steps, which return
+    # the records they moved; its SQL is its statements (two for the id maps, the visit pruning and
+    # route_prepare); the spec kinds. The inserts count the required values they complete or drop
+    # (per field, and the dropped rows), the generated steps count nothing
+    assert [s.label for s in steps if not s.blocking] == [
+        "route_prepare", "route_condition_occurrence", "route_drug_exposure", "route_measurement"]
     assert [s.label for s in steps if s.returns != "rowcount"] == [
-        "person", "visit_occurrence", "death", "observation_period_merge", "observation_period_fill"]
+        "person", "visit_occurrence", "death", "route_condition_occurrence", "route_drug_exposure",
+        "route_measurement", "observation_period_merge", "observation_period_fill"]
     assert {s.returns for s in steps if s.label in ("person", "visit_occurrence", "death")} == {"row"}
     assert all(s.count_sites == () for s in steps if s.kind != "insert")
     # and the tolerant conversions count the values they cannot read, per field
@@ -108,7 +116,7 @@ def test_step_order_and_targets():
     assert step(steps, "death").count_sites == ("death_date", "row")
     assert all("\n".join(s.statements) == s.sql for s in steps)
     assert [s.label for s in steps if len(s.statements) > 1] == [
-        "person_map", "visit_map", "visit_map_prune", "observation_period_merge"]
+        "person_map", "visit_map", "visit_map_prune", "route_prepare", "observation_period_merge"]
     assert {s.kind for s in steps if s.kind in SPEC_KINDS} == {"id_map", "insert"}
     assert target_tables(spec) == [
         "person", "visit_occurrence", "condition_occurrence", "drug_exposure",
@@ -337,8 +345,10 @@ def test_where_joins_and_custom_sql():
     names = [s.name for s in steps]
     assert names.index("09_custom_drop_orphans") == names.index("08_drug_exposure") + 1
     # custom SQL of a table without a mapping runs at that table's place in the load order
-    assert names[-6:] == ["11_death", "12_custom_note", "13_observation_period", "14_observation_period_merge",
-                          "15_observation_period_fill", "16_cdm_source"]
+    assert names[10:12] == ["11_death", "12_custom_note"]  # before the route block, which follows specimen
+    assert names[12:] == ["13_route_prepare", "14_route_condition_occurrence", "15_route_drug_exposure",
+                          "16_route_measurement", "17_observation_period", "18_observation_period_merge",
+                          "19_observation_period_fill", "20_cdm_source"]
     de = step(steps, "drug_exposure")
     # the joins and the filter apply to the source rows (layer 1), before the id-map joins' rows
     # are counted and before the required-field policies
@@ -387,15 +397,16 @@ def test_custom_sql_runs_at_its_tables_load_order_slot():
     assert labels == [
         "person_map", "visit_map", "custom_sites", "person", "person_map_prune", "visit_occurrence",
         "visit_map_prune", "condition_occurrence", "drug_exposure", "measurement", "death", "custom_va_deaths",
-        "custom_specimens", "custom_more_specimens", "observation_period", "custom_dates",
+        "custom_specimens", "custom_more_specimens", "route_prepare", "route_condition_occurrence",
+        "route_drug_exposure", "route_measurement", "observation_period", "custom_dates",
         "observation_period_merge", "observation_period_fill", "custom_eras", "custom_other", "cdm_source",
     ]
     # a derived observation period follows every spec writer of observation_period, the merge follows it
     spec = spec.model_copy(update={"observation_period": "from_events"})
     spec.table_mappings = [tm for tm in spec.table_mappings if tm.target_table != "observation_period"]
     labels = [s.label for s in compile_spec(spec, S)]
-    assert labels[labels.index("custom_specimens"):labels.index("custom_eras")] == [
-        "custom_specimens", "custom_more_specimens", "custom_dates", "observation_period", "observation_period_merge"]
+    assert labels[labels.index("route_measurement") + 1:labels.index("custom_eras")] == [
+        "custom_dates", "observation_period", "observation_period_merge"]
     assert step_label("05_person_2") == "person_2" and step_label("person") == "person"
 
 
@@ -441,7 +452,11 @@ def test_from_events_and_cdm_source_steps():
     for col in ("visit_start_date", "visit_end_date", "condition_start_date", "drug_exposure_end_date",
                 "measurement_date", "death_date"):
         assert col in op.sql
-    assert "procedure_date" not in op.sql  # procedure_occurrence is not loaded
+    assert "visit_detail_start_date" not in op.sql  # visit_detail is not loaded
+    # the route destinations: their records were moved there from the loaded tables
+    assert "procedure_date" in op.sql and "observation_date" in op.sql
+    off = step(compile_spec(spec.model_copy(update={"route_by_domain": False}), S), "observation_period")
+    assert "procedure_date" not in off.sql  # procedure_occurrence is not loaded
     assert "32817" in op.sql
     cs = steps[-1]
     assert cs.name.endswith("_cdm_source") and cs.kind == "metadata"
@@ -643,7 +658,7 @@ def test_run_reference_spec(staged):
     no_discharge = int(scalar(conn, f"SELECT COUNT(*) FROM {src}.clinic_visits WHERE discharge_date IS NULL"))
     assert 0 < no_discharge < visits
     assert count(conn, schemas, "person") == 400 and count(conn, schemas, "visit_occurrence") == visits
-    by_table = {s.target_table: s for s in result.steps if s.kind not in ("merge", "derived")}
+    by_table = {s.target_table: s for s in result.steps if s.kind not in ("merge", "derived", "route")}
     vo = by_table["visit_occurrence"]
     assert vo.value_counts == {"defaulted": {"visit_end_date": no_discharge}}
     assert (vo.source_rows, vo.id_retained_rows, vo.retained_rows, vo.rows_inserted) == (visits,) * 4
@@ -680,6 +695,12 @@ def test_run_reference_spec(staged):
     fill = next(s for s in result.steps if s.step.endswith("_observation_period_fill"))
     assert fill.error is None and fill.rows_inserted == 0
     assert scalar(conn, f"SELECT source_release_date FROM {schemas.cdm}.cdm_source") == date(2023, 12, 31)
+    # the demo's codes map to concepts of their tables' domains: the route steps move nothing
+    routes = [s for s in result.steps if s.kind == "route"]
+    assert [(s.step, s.error, s.moved) for s in routes] == [
+        ("11_route_prepare", None, []), ("12_route_condition_occurrence", None, []),
+        ("13_route_drug_exposure", None, []), ("14_route_measurement", None, [])]
+    assert result.rows_moved() == 0 and count(conn, schemas, "observation") == 0
     audit = [e for e in ws.read_audit() if e["event"] == "etl_step" and e["step"] == vo.step]
     assert audit[0]["value_counts"] == vo.value_counts and audit[0]["retained_rows"] == visits
     assert [e["retained_rows"] for e in ws.read_audit() if e.get("step") == "09_measurement"] == [m.retained_rows]
@@ -794,7 +815,7 @@ def test_auto_id_with_two_mappings_into_one_table(staged):
 
     result = run_etl(conn, schemas, spec, cfg)
     assert result.ok
-    parts = [s for s in result.steps if s.target_table == "measurement"]
+    parts = [s for s in result.steps if s.target_table == "measurement" and s.kind == "insert"]
     assert len(parts) == 2 and all(p.rows_inserted > 0 for p in parts)
     total = count(conn, schemas, "measurement")
     assert total == sum(p.rows_inserted for p in parts)
@@ -1484,7 +1505,7 @@ def test_steps_run_under_the_etl_role(staged):
         assert fetch_all(conn, f"SELECT value_as_string FROM {schemas.cdm}.metadata") == [{"value_as_string": role}]
         assert count(conn, schemas, "person") == 400 and count(conn, schemas, "visit_occurrence") > 0
         assert len(id_map(conn, schemas, "visit_map_retired")) > 0
-        by_table = {s.target_table: s for s in result.steps}
+        by_table = {s.target_table: s for s in result.steps if s.kind != "route"}
         no_discharge = int(scalar(conn, f"""SELECT COUNT(*) FROM {schemas.src}.clinic_visits
             WHERE visit_type <> 'EMERG' AND discharge_date IS NULL"""))
         hb = int(scalar(conn, f"""SELECT COUNT(*) FROM {schemas.src}.lab_results r

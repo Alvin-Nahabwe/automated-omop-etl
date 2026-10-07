@@ -29,6 +29,14 @@ which the build does), or whose end date has a fallback (the build date, the sta
 literal, a constant: an open episode must stay NULL so that the build ends it at the release date
 or at death), gets a warning.
 
+Routing by domain (``ETLSpec.route_by_domain``): the build moves each event record to the table
+of its concept's domain, so a mapping into an event table that routes by hand (a filter or inner
+join on the domain of {vocab}.concept / concept_relationship), and two mappings of one source table
+into two event tables that read the same codes from the same rows, are warnings: such records are
+loaded twice (``etl.routing.hand_routed``; the build reports them as etlHandRouting). So is a
+source vocabulary shared by fields that accept concepts of different domains
+(``etl.routing.vocabulary_domains``): one concept is chosen per code for all of them.
+
 Keys can come from several sources: every person and visit_occurrence mapping adds the keys of
 its rows to the id map (``compiler.key_sources``). Keys written in another form than the
 person_key / visit_key over the key table, unprefixed keys from another table, and records whose
@@ -71,6 +79,7 @@ from ..etl.compiler import (
     source_ref,
 )
 from ..etl.policies import OPEN_ENDS
+from ..etl.routing import hand_routing_issue, route_sources, shared_codes, vocab_indexed, vocabulary_domains
 from ..etl.session import apply_session
 from ..etl.tolerant import DATE_KINDS, LexError, lex, rewrite, without_conversions
 from ..models import CustomSQL, ETLSpec, KeySpec, SourceProfile, TableMapping
@@ -513,6 +522,13 @@ def observation_period_end_issue(tm: TableMapping) -> str | None:
     return f"{reason}; {_OPEN_END}" if reason else None
 
 
+def shared_code_issues(spec: ETLSpec) -> list[SpecIssue]:
+    """Warnings for two mappings of one source table into two event tables that read the same codes
+    from the same rows while the build routes by domain (``etl.routing.shared_codes``)."""
+    return [SpecIssue(severity="warning", target_table=spec.table_mappings[p.index].target_table, message=p.message)
+            for p in shared_codes(spec)]
+
+
 def _observation_period_issues(tm: TableMapping, aliases: dict[str, str]) -> list[tuple[str | None, str]]:
     """Warnings for an observation_period mapping that does the build's work itself: an expression
     that reads another table (a correlated subquery that merges or filters episodes; slow, and the
@@ -716,6 +732,9 @@ def _static_mapping(
     if tt == "observation_period":
         for field, msg in _observation_period_issues(tm, aliases):
             warn(msg, field)
+    routing = hand_routing_issue(tm, spec)
+    if routing:
+        warn(routing)
     return issues
 
 
@@ -761,6 +780,10 @@ def _static_spec(spec: ETLSpec, cat: _SourceCatalog) -> list[SpecIssue]:
             )
         )
     issues += _key_source_issues(spec)
+    issues += shared_code_issues(spec)
+    for vd in vocabulary_domains(spec).values():
+        if vd.conflict:
+            issues.append(SpecIssue(severity="warning", message=vd.conflict))
     for cs in spec.custom_sql:
         if not cdm.has_table(cs.target_table) or cdm.table(cs.target_table).schema_class != "CDM":
             issues.append(
@@ -1087,7 +1110,8 @@ def _explain_generated(
     is not (it is reported and skipped). Steps that run the SQL of a mapping with errors, or of a
     key whose probe failed, are left out: those errors are reported already."""
     steps = compile_spec(spec, schemas, cfg.cdm_source if cfg is not None else None,
-                         etl=cfg.etl if cfg is not None else None, strict=False)
+                         etl=cfg.etl if cfg is not None else None,
+                         vocab_indexed=vocab_indexed(conn, schemas) if route_sources(spec) else True, strict=False)
     out: list[SpecIssue] = []
     for s in steps:
         if s.kind not in _EXPLAINED_KINDS or s.error:

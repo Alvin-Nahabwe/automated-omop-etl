@@ -20,15 +20,16 @@ import hashlib
 import io
 import re
 from pathlib import Path
-from typing import get_args
+from typing import Mapping, get_args
 
 import psycopg
 
 from ..db import Schemas
+from ..etl.routing import VocabularyDomains
 from ..fsutil import atomic_write_text, file_lock
 from ..models import Equivalence, MappingDecision, MappingStatus
 from ..workspace import Workspace
-from .mapper import check_concept
+from .mapper import accepted_domains, check_concept
 
 REVIEW_COLUMNS = [
     "status",
@@ -231,7 +232,7 @@ def _apply_cells(
         return d
     known = next((c for c in d.candidates if c.concept_id == new_id), None)
     if conn is not None and schemas is not None:
-        known, why = check_concept(conn, schemas, new_id, d.target_domain)
+        known, why = check_concept(conn, schemas, new_id, accepted_domains(d))
         if known is None:
             d.status = "FLAGGED"
             d.rationale = f"Reviewer's target_concept_id rejected: {why}."
@@ -251,15 +252,24 @@ def _apply_cells(
 
 
 def import_review(
-    ws: Workspace, conn: psycopg.Connection | None = None, schemas: Schemas | None = None
+    ws: Workspace,
+    conn: psycopg.Connection | None = None,
+    schemas: Schemas | None = None,
+    *,
+    domains: Mapping[str, VocabularyDomains] | None = None,
 ) -> list[MappingDecision]:
     """``decisions.json`` with the reviewer's CSV edits applied (matched on vocabulary + code).
+
+    ``domains`` (``vocab.mapper.source_vocabulary_domains`` of the current spec) first refreshes
+    each decision's ``target_domain`` and ``accepted_domains``, so the edits are checked against
+    the domains the spec accepts now (the spec may have changed since the terms were mapped).
 
     * a changed ``status`` is taken as is;
     * a changed ``target_concept_id`` sets method ``manual``, confidence 1.0 and, unless the
       status was changed too, status APPROVED. With a connection, the concept is looked up to
       refresh its name, domain and vocabulary. An id that does not exist, is not standard and
-      valid, or is outside the term's target domain is FLAGGED.
+      valid, or is outside the term's accepted domains (its target domain, plus the other
+      domains of a table routed by domain) is FLAGGED.
 
     Only ``mappings/<source_vocabulary_id>.csv`` files are read; rows whose code is not in
     ``decisions.json`` are ignored, and an unknown status value FLAGs the term. Nothing is
@@ -269,6 +279,12 @@ def import_review(
     if not path.exists():
         raise FileNotFoundError(f"{path} not found: run the mapping step first")
     decisions = ws.load_json_list(path, MappingDecision)
+    if domains:
+        decisions = [
+            d.model_copy(update={"target_domain": vd.target_domain, "accepted_domains": list(vd.accepted)})
+            if (vd := domains.get(d.source_vocabulary_id)) is not None else d
+            for d in decisions
+        ]
     edits: dict[tuple[str, str], dict[str, str]] = {}
     for svid in sorted({d.source_vocabulary_id for d in decisions}):
         csv_path = ws.mappings_dir / _csv_name(svid)  # only the files export_review wrote

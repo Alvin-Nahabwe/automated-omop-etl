@@ -170,6 +170,64 @@ the merged periods, which a fix of an episode's dates can join).
 `withinObservationPeriod` (characterization, 5%) counts the records of each event and era table
 whose start date lies in no period of their person.
 
+**Routing by domain.** The CDM puts a record in the table of its standard concept's domain, but a
+spec maps each source table to one table (an ICD-10 diagnosis list also holds observations such
+as Z34.9 and procedures). With `route_by_domain: true` (the default) the build moves the
+records after every writer of the event tables, in a block of generated steps after `specimen`
+and before `payer_plan_period`, `cost`, the observation periods and the eras, which read or refer
+to the records where they end up (`etl/routing.py`):
+
+* `route_prepare` stores the largest id of each of the six event tables in `etl.id_high_water`;
+  then one `route_<table>` step per table the spec loads among `condition_occurrence`,
+  `procedure_occurrence`, `drug_exposure`, `device_exposure` and `measurement` deletes the
+  records whose standard concept (`*_concept_id`, not 0) belongs to another of the event domains
+  Condition, Procedure, Drug, Device, Measurement and Observation, and inserts them into that
+  domain's table, in one statement. `observation` is a destination only (DQD has no `fkDomain`
+  on `observation_concept_id`). A concept of any other domain (Meas Value, Unit, Type Concept,
+  ...) is never moved, so `fkDomain` keeps reporting it, and neither is a record with concept 0;
+* fields are carried by role (`cdm.spec.EVENT_FIELD_ROLES`: start date, type, source value,
+  visit, ...). `drug_exposure_end_date` takes the start date when the record has no end; a
+  quantity becomes an integer only when it is one (`CASE WHEN q = trunc(q) AND q BETWEEN ...`,
+  so a fraction, NaN or overflow gives NULL instead of failing the step). A value the
+  destination has no place for (a measurement's range or operator, a drug's days_supply) is
+  dropped and the moved rows that had one are counted. A measurement with a result
+  (`value_as_number`, `value_as_concept_id` or `value_source_value`) whose concept is a
+  condition, procedure, drug or device goes to `observation`, which keeps the result;
+* a moved record gets an id after the larger of its destination's largest id and the one stored
+  before routing, so an id that a move freed is never given to another record;
+* the misplaced concepts are found from the distinct concepts of the table: by an indexed lookup
+  when `vocab.concept` has an index on `concept_id` (the runner probes it; `load_vocabulary`
+  creates the vocabulary indexes also when the vocabulary was loaded by someone else), else by a
+  hash join of the concept table.
+
+Each route step returns one row per destination and domain (`TableLoadResult.moved`); the report
+lists them ("Records moved to the table of their concept's domain"), and `etlDomainRouting`
+(characterization, never failed) reports them per step. Route steps are not blocking: when one
+fails, the records stay where they were loaded and the error is reported (`etlStepError`,
+convention, not sent to the repair agent), and the table's `fkDomain` failure is not sent to the
+repair agent either. A mapping that routes by hand (a WHERE or inner join testing
+`{vocab}.concept` `domain_id` against an event domain, or the same codes of the same rows as
+another mapping of its source table into another event table) loads records twice: the
+validator warns, the repair agent may not add one, and each build reports it as a failed
+`etlHandRouting` (convention, not repairable). Every table the route steps can write is emptied
+before each build, and a destination counts as populated for the checks only when records were
+moved there. Concept lookups for the main concept field of a routed table accept the other
+domains of the table (`cdm.spec.ACCEPTED_DOMAINS`: a condition code may map to an Observation,
+Procedure or Measurement concept, a procedure code to an Observation or Measurement concept, a
+measurement to an Observation concept, a drug and a device to each other's domain): the mapper
+finds the target domain's candidates as before and shows the best three of each other accepted
+domain on top of them (one trigram retrieval per term serves all its domains), its exact and
+lexical shortcuts pick only concepts of the target domain, and a model's choice of another domain
+is never approved automatically. Fields that share a source vocabulary share one set (the union
+over routed fields, the intersection over the others); the validator warns when a field can get
+a concept of a domain it does not accept, and when the fields of one vocabulary expect different
+target domains (then no concept of it is approved without a reviewer), when a mapping routes by
+hand (a WHERE or inner join testing the domain of `vocab.concept` against an event domain), and
+when two mappings of one source table read the same codes from the same rows into two event
+tables, and the repair agent may not add either. Not
+routed (by design): records out of `observation`, concept-0 records by their source concept,
+and the value of a 'Maps to value' relationship.
+
 Concept lookups yield `0` when the source value exists but has no mapping. When the source
 value is NULL they yield NULL, or 0 if the CDM field is required. `varchar(n)` targets are
 truncated to `n` characters. The `cdm_source` row is generated from `cdm_source` in the config;
@@ -316,7 +374,11 @@ and `etlVisitLinkLoss` fails fatally when more than 100 - `min_record_retention_
 name a key that no visit mapping reads. Two checks re-verify
 after the load what custom SQL could break (fatal, threshold 0, not repairable):
 `measureDuplicateDeaths` (one death per person) and `fkVisitPerson` (a record's visit belongs to
-its person). DQD checks the
+its person). `etlDomainRouting` (characterization) reports the records each route step moved to
+the table of their concept's domain, and those that lost a value on the way. A route destination
+that no mapping loads (its records were all moved there) usually fails
+`measurePersonCompleteness`; that result is not sent to the repair agent, and a repair after which
+such a table receives no records is not treated as data loss. DQD checks the
 built-in engine doesn't implement are listed as not applicable, and so is each empty table, as a
 single summary row. The run passes when no check with a
 blocking severity (default `fatal`) fails, no check listed in `quality.blocking_checks` fails
@@ -344,9 +406,11 @@ repair agent gets the failures and a set of tools:
   makes a record's visit key NULL where it was not (a blank or NA-marker key aside) is refused
   too: it would hide records that lost their visit from `etlVisitLinkage`.
 
-Errors of steps the build generates (id-map pruning, ...) and errors a spec change cannot fix (a
-missing privilege of the ETL role: the error names the GRANT to run) are never sent to the
-repair agent.
+Errors of steps the build generates (id-map pruning, routing, ...) and errors a spec change cannot
+fix (a missing privilege of the ETL role: the error names the GRANT to run) are never sent to the
+repair agent. Neither is an edit that routes records by hand while the build routes them (a filter
+or join on the domain of `vocab.concept`, or a second mapping of the same codes into another
+event table): it is refused, because it would load those records twice.
 
 The ETL is rebuilt and re-checked, up to `quality.max_repair_iterations` times. Each build is
 scored: losing data (a CDM table keeping under 95% of the rows an earlier build loaded, or of

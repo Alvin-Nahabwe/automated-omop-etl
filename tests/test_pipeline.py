@@ -98,9 +98,16 @@ def test_remap_keeps_review_edits(demo_project):
         w = csv.DictWriter(fh, fieldnames=header)
         w.writeheader()
         w.writerows(rows)
+    # decisions of an older version (or of an earlier spec): no accepted domains of their own
+    stale = json.loads(p.ws.decisions_json.read_text())
+    for d in stale:
+        d["accepted_domains"] = []
+    p.ws.decisions_json.write_text(json.dumps(stale))
     decisions = p.map_vocabulary()  # re-run: keeps the manual decision, calls no LLM
     quinine = next(d for d in decisions if d.source_code == "Quinine inj 600mg")
     assert quinine.target_concept_id == 2000003010 and quinine.method == "manual"
+    # the kept decisions take the domains the spec accepts now (drug_exposure is routed by domain)
+    assert {tuple(d.accepted_domains) for d in decisions if d.source_vocabulary_id == "SRC_DRUG"} == {("Drug", "Device")}
     p.close()
 
 

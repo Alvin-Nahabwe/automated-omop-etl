@@ -18,7 +18,10 @@ turn. An error of a non-blocking step (``blocking=False``) is reported but does 
 build (``ETLRunResult.ok``). A step that fails for a missing privilege is marked not repairable
 (``TableLoadResult.repairable``), and its error names the grants to run: the repair agent cannot
 fix it in the spec. After the id maps, and after every step that wrote rows, the written tables
-are ANALYZEd, so the next steps are planned with fresh statistics.
+are ANALYZEd, so the next steps are planned with fresh statistics. The route steps
+(``etl.routing``) report the records they moved (``moved``) under the name of the table they
+moved them from, which they never mark as failed or loaded; whether the vocabulary's concept
+table is indexed on concept_id decides the form of their concept lookup.
 
 The spec's SQL is written by an LLM (and possibly edited by people), so before anything runs
 each step's fragments are checked again by ``design.validate.sql_safety_issues``; unsafe steps
@@ -27,7 +30,8 @@ that role (``SET LOCAL ROLE``), which needs USAGE and SELECT on the staging and 
 schemas, SELECT/INSERT/DELETE on the CDM and ETL schemas (DELETE for retiring and restoring
 id-map keys, and for custom SQL), and membership of the connecting user. ETL tables the build
 creates (such as those a new version adds) are granted to the role. The CDM tables are emptied
-before the steps run, and ANALYZEd, as the connecting user; the facts an earlier build derived
+before the steps run (with every table the route steps can write, and every table an earlier
+build moved records to), and ANALYZEd, as the connecting user; the facts an earlier build derived
 (``{etl}.build_facts``: the release date the observation-period merge stores for cdm_source) are
 deleted in the same transaction.
 """
@@ -50,6 +54,7 @@ from ..models import ETLRunResult, ETLSpec, RoutedRows, TableLoadResult
 from ..workspace import Workspace, utcnow
 from .compiler import CompiledStep, compile_spec, target_tables
 from .policies import ROW_SITE
+from .routing import route_sources, route_targets, vocab_indexed
 from .session import apply_session, session_sql
 
 # Value counters a step can report per site (a CDM field or 'where'); the site ROW_SITE has one
@@ -312,13 +317,15 @@ def run_etl(
 
     create_cdm_tables(conn, schemas, include_vocab=False)
     create_etl_tables(conn, schemas, cfg.target.etl_role)
-    tables = sorted(set(target_tables(spec)) | _previous_tables(ws))
+    # the route destinations too, and the tables an earlier build moved records to
+    tables = sorted(set(target_tables(spec)) | set(route_targets(spec)) | _previous_tables(ws))
     truncate_cdm_tables(conn, schemas, tables)
     # what an earlier build derived (the release date) goes with the rows it was derived from
     execute(conn, f"DELETE FROM {qi(schemas.etl)}.build_facts")
     conn.commit()
 
-    steps = compile_spec(spec, schemas, cfg.cdm_source, etl=cfg.etl, strict=False)
+    indexed = vocab_indexed(conn, schemas) if route_sources(spec) else True
+    steps = compile_spec(spec, schemas, cfg.cdm_source, etl=cfg.etl, vocab_indexed=indexed, strict=False)
     _refuse_unsafe(steps)
     if ws is not None:
         _write_sql(ws, steps, cfg)
@@ -378,8 +385,9 @@ def run_etl(
             errors=[f"{r.step}: {r.error}" for r in result.errors()],
             rows={r.step: r.rows_inserted for r in result.steps},
             totals={
-                "rows_inserted": sum(r.rows_inserted for r in result.steps if r.error is None),
-                "moved_rows": sum(m.moved_rows for r in result.steps for m in r.moved),
+                # route steps move rows (moved_rows); route_prepare's count is ETL bookkeeping
+                "rows_inserted": sum(r.rows_inserted for r in result.steps if r.error is None and r.kind != "route"),
+                "moved_rows": result.rows_moved(),
                 "errors": len(result.errors()),
                 "blocking_errors": len(result.blocking_errors()),
                 "skipped": sum(1 for r in result.steps if r.skipped),

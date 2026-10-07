@@ -220,7 +220,8 @@ def test_merge_placement():
     steps = compile_spec(spec, S)
     labels = [s.label for s in steps]
     assert labels[labels.index("custom_deaths"):] == [
-        "custom_deaths", "custom_specimens", "observation_period", "custom_more_periods", "observation_period_merge",
+        "custom_deaths", "custom_specimens", "route_prepare", "route_condition_occurrence", "route_drug_exposure",
+        "route_measurement", "observation_period", "custom_more_periods", "observation_period_merge",
         "observation_period_fill", "cdm_source"]
     assert "cdm.death" in step(steps, "observation_period_merge").sql
     # from_events: the derived periods, then the merge (it renumbers them and derives the release

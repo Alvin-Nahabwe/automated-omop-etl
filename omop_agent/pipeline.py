@@ -215,7 +215,7 @@ class Pipeline:
         return ann  # type: ignore[return-value]
 
     def load_vocabulary(self, force: bool = False) -> None:
-        from .vocab.loader import load_athena, vocab_loaded
+        from .vocab.loader import ensure_indexes, load_athena, vocab_loaded
 
         def run() -> None:
             create_cdm_tables(self.conn, self.schemas, include_vocab=True)
@@ -229,6 +229,14 @@ class Pipeline:
                     "No vocabulary loaded. Download vocabularies from https://athena.ohdsi.org and set "
                     "vocabulary.athena_dir, or load them into the vocab schema yourself."
                 )
+            else:  # loaded by someone else: add the indexes the mapping and the build rely on
+                skipped = ensure_indexes(self.conn, self.schemas)
+                if skipped:
+                    self.log(f"  vocabulary indexes not created (the vocabulary tables belong to another role, are "
+                             f"views or are read-only): {', '.join(skipped)}"
+                             + ("; the build finds the concepts to route by domain with a join of the concept table"
+                                if "idx_concept_concept_id" in skipped else ""))
+                    self.ws.audit("vocab_indexes_not_created", indexes=skipped)
 
         self._run_stage("vocab_load", run)
 
@@ -284,6 +292,7 @@ class Pipeline:
             map_terms,
             mapping_summary,
             pii_concept_fields,
+            source_vocabulary_domains,
             write_source_to_concept_map,
         )
         from .vocab.review import export_review, import_review
@@ -307,9 +316,14 @@ class Pipeline:
             terms = collect_terms(self.conn, self.schemas, spec, profile, self.cfg.privacy, self.ws, cfg=self.cfg)
             prior: dict[tuple[str, str], MappingDecision] = {}
             if not remap and self.ws.decisions_json.exists():
-                prior = {(d.source_vocabulary_id, d.source_code): d for d in import_review(self.ws, self.conn, self.schemas)}
-            freq = {(t.source_vocabulary_id, t.source_code): t.frequency for t in terms}
-            kept = [d.model_copy(update={"frequency": freq[k]}) for k, d in prior.items() if k in freq]
+                # the domains the spec accepts now, before the reviewer's edits are checked against them
+                domains = source_vocabulary_domains(spec, profile, self.cfg.privacy)
+                prior = {(d.source_vocabulary_id, d.source_code): d
+                         for d in import_review(self.ws, self.conn, self.schemas, domains=domains)}
+            by_key = {(t.source_vocabulary_id, t.source_code): t for t in terms}
+            kept = [d.model_copy(update={"frequency": by_key[k].frequency, "target_domain": by_key[k].target_domain,
+                                         "accepted_domains": list(by_key[k].accepted_domains)})
+                    for k, d in prior.items() if k in by_key]
             new_terms = [t for t in terms if (t.source_vocabulary_id, t.source_code) not in prior]
             if kept:
                 self.log(f"  kept {len(kept)} earlier/reviewed decisions; mapping {len(new_terms)} new terms")
@@ -338,11 +352,16 @@ class Pipeline:
         return decisions  # type: ignore[return-value]
 
     def apply_reviewed_mappings(self) -> int:
-        """Re-import edited mapping CSVs into source_to_concept_map."""
-        from .vocab.mapper import write_source_to_concept_map
+        """Re-import edited mapping CSVs into source_to_concept_map. The edits are checked against
+        the domains the current spec accepts for each source vocabulary."""
+        from .vocab.mapper import source_vocabulary_domains, write_source_to_concept_map
         from .vocab.review import import_review
 
-        decisions = import_review(self.ws, self.conn, self.schemas)
+        domains = None
+        if self.ws.spec_yaml.exists():
+            profile = self.load_profile() if self.ws.profile_json.exists() else None
+            domains = source_vocabulary_domains(self.load_spec(), profile, self.cfg.privacy)
+        decisions = import_review(self.ws, self.conn, self.schemas, domains=domains)
         n = write_source_to_concept_map(
             self.conn, self.schemas, decisions, include_unchecked=self.cfg.mapping.use_unchecked_in_etl
         )
@@ -374,9 +393,10 @@ class Pipeline:
 
         def run() -> ETLRunResult:
             result = run_etl(self.conn, self.schemas, spec or self.validated_spec(), self.cfg, self.ws)
-            derived = result.rows_derived()
+            derived, moved = result.rows_derived(), result.rows_moved()
             self.log(f"  {len(result.steps)} steps, {result.rows_loaded()} rows loaded"
                      + (f" ({derived} derived by the build: observation periods)" if derived else "")
+                     + (f", {moved} records moved to the table of their concept's domain" if moved else "")
                      + f", {len(result.errors())} errors")
             for s in result.errors():
                 self.log(f"  ✗ {s.step}: {s.error}")
@@ -608,6 +628,7 @@ class _BuildHistory:
         self.rows: dict[str, int] = {}
         self.links: dict[str, tuple[int, int]] = {}  # table -> (records with a visit key, linked to a visit)
         self.applicable: set[str] = set()
+        self.route_only: set[str] = set()  # tables that received records moved by domain and nothing else
 
     @staticmethod
     def _rows(etl: ETLRunResult) -> dict[str, int]:
@@ -616,7 +637,8 @@ class _BuildHistory:
         (episodes, or event periods, less those dropped because they end before they start) plus the
         fill's periods. Not the merged periods: a repair that fixes an episode's dates can join two
         periods into one, and must not count as a loss; this number grows whenever more episodes are
-        valid (a person the fill covered who now has a valid episode adds at least as many)."""
+        valid (a person the fill covered who now has a valid episode adds at least as many). The route
+        steps move records between tables after they were counted here, so moves change no total."""
         from .cdm.spec import load_cdm_spec
         from .etl.compiler import step_label
 
@@ -648,7 +670,14 @@ class _BuildHistory:
                                        linked + int(links.get("linked") or 0))
         return out
 
+    @staticmethod
+    def _route_only(etl: ETLRunResult) -> set[str]:
+        """Tables that received records moved by domain but that no mapping or custom SQL loaded."""
+        moved = {m.to_table for s in etl.steps if not s.error for m in s.moved}
+        return moved - {s.target_table for s in etl.steps if s.kind in (None, "insert", "custom")}
+
     def add(self, etl: ETLRunResult, report: DQReport | None) -> None:
+        self.route_only |= self._route_only(etl)
         for table, n in self._rows(etl).items():
             self.rows[table] = max(self.rows.get(table, 0), n)
         for table, (with_key, linked) in self._links(etl).items():
@@ -672,7 +701,12 @@ class _BuildHistory:
             elif linked > 0 and now_linked < LOSS_TOLERANCE * linked:
                 out.append(f"{table} has {now_linked} records linked to their visit, {linked} before")
         if report is not None:
-            blanked = sorted(r.key for r in report.results if r.not_applicable and r.key in self.applicable)
+            # a table that only received records moved by domain empties when a repair maps their codes
+            # to concepts of the loaded tables' domains: that is not data lost
+            written = {s.target_table for s in etl.steps if s.kind in (None, "insert", "custom")}
+            exempt = (self.route_only | self._route_only(etl)) - written
+            blanked = sorted(r.key for r in report.results
+                             if r.not_applicable and r.key in self.applicable and r.table not in exempt)
             if blanked:
                 out.append(f"{len(blanked)} check(s) no longer apply, e.g. {blanked[0]} (a field or table emptied)")
         return out

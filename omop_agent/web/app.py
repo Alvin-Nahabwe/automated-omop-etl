@@ -236,6 +236,27 @@ def create_app(
         finally:
             conn.close()
 
+    def spec_domains(proj: Project) -> dict | None:
+        """Per source vocabulary, the domains the project's current spec accepts (``import_review``
+        refreshes the decisions with them first, as the command line does, so an edit is checked
+        against the spec as it is now); None without a readable spec."""
+        from ..models import SourceAnnotations, SourceProfile
+        from ..privacy import apply_overrides
+        from ..vocab.mapper import source_vocabulary_domains
+
+        ws = proj.ws
+        if not ws.spec_yaml.exists():
+            return None
+        try:
+            spec = ws.load_yaml(ws.spec_yaml, ETLSpec)
+            profile = None
+            if ws.profile_json.exists():
+                ann = ws.load_json(ws.annotations_json, SourceAnnotations) if ws.annotations_json.exists() else None
+                profile = apply_overrides(ws.load_json(ws.profile_json, SourceProfile), proj.cfg.privacy, ann)  # type: ignore[union-attr]
+            return source_vocabulary_domains(spec, profile, proj.cfg.privacy)  # type: ignore[union-attr]
+        except (OSError, ValueError, yaml.YAMLError):  # pydantic's ValidationError is a ValueError
+            return None
+
     def redirect(url: str) -> RedirectResponse:
         return RedirectResponse(url, status_code=303)
 
@@ -469,8 +490,9 @@ def create_app(
         schemas = Schemas.from_config(proj.cfg.target)  # type: ignore[union-attr]
         search_results = None
         search_error = None
+        domains = spec_domains(proj)
         with vocab_conn(proj) as conn:
-            decisions = import_review(ws, conn, schemas) if conn is not None else import_review(ws)
+            decisions = import_review(ws, conn, schemas, domains=domains)
             vocabs = sorted({d.source_vocabulary_id for d in decisions})
             in_vocab = [d for d in decisions if not vocab or d.source_vocabulary_id == vocab]
             counts = _counts(in_vocab)
@@ -489,7 +511,8 @@ def create_app(
                     from ..vocab.mapper import search_candidates
 
                     try:
-                        found = search_candidates(conn, schemas, q.strip()[:200], open_term.target_domain, limit=15)
+                        found = search_candidates(conn, schemas, q.strip()[:200], open_term.target_domain, limit=15,
+                                                  also=open_term.accepted_domains)
                         search_results = [c for c in found if c.score >= SEARCH_MIN_SCORE]
                     except Exception as e:  # e.g. the vocabulary is not loaded yet
                         search_error = f"Search failed: {type(e).__name__}"
@@ -534,8 +557,9 @@ def create_app(
     def _save_decision(request, proj: Project, user: User, form: dict, svid: str, code: str, action: str, back: str):
         ws = proj.ws
         schemas = Schemas.from_config(proj.cfg.target)  # type: ignore[union-attr]
+        domains = spec_domains(proj)
         with vocab_conn(proj) as conn:
-            decisions = import_review(ws, conn, schemas) if conn is not None else import_review(ws)
+            decisions = import_review(ws, conn, schemas, domains=domains)
             d = next((x for x in decisions if x.source_vocabulary_id == svid and x.source_code == code), None)
             if d is None:
                 raise HTTPException(404, "That source code is not in the mappings.")
@@ -560,9 +584,9 @@ def create_app(
                     else:
                         concept = next((c for c in d.candidates if c.concept_id == target), None)
                         if conn is not None:
-                            from ..vocab.mapper import check_concept
+                            from ..vocab.mapper import accepted_domains, check_concept
 
-                            concept, why = check_concept(conn, schemas, target, d.target_domain)
+                            concept, why = check_concept(conn, schemas, target, accepted_domains(d))
                             if concept is None:
                                 flash(request, "error", f"Not saved: {why}.")
                                 return redirect(back)
