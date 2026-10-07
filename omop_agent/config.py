@@ -90,7 +90,8 @@ class TargetConfig(_Base):
         description="Optional least-privilege role for running the generated ETL SQL (SET LOCAL ROLE). It "
         "needs USAGE and SELECT on the staging and vocabulary schemas, USAGE plus SELECT, INSERT and DELETE on "
         "the CDM and ETL schemas, EXECUTE on the functions in the ETL schema (granted to PUBLIC by default), "
-        "and the connecting user must be a member of it. Tables are emptied as the connecting user, not this role.",
+        "and the connecting user must be a member of it. Tables are emptied as the connecting user, not this role; "
+        "ETL tables the build creates are granted to it.",
     )
 
     @model_validator(mode="after")

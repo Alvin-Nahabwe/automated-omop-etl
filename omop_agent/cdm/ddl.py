@@ -82,6 +82,11 @@ def add_primary_keys(conn: psycopg.Connection, schemas: Schemas, tables: list[st
         execute(conn, f"ALTER TABLE {qi(schema)}.{qi(table)} ADD CONSTRAINT {qi(cname)} PRIMARY KEY ({qi(col)})")
 
 
+# The id maps give each source key its CDM id. A key that did not become a row is moved to the
+# matching *_retired table with its id, and gets that id back when it returns, so ids are never
+# reused or lost. id_high_water keeps the largest id a table had before records were moved out of
+# it, and build_facts holds values that one build step derives for later steps (both emptied or
+# rewritten by the steps that use them).
 ETL_TABLES = {
     "person_map": """
         CREATE TABLE IF NOT EXISTS {etl}.person_map (
@@ -93,6 +98,27 @@ ETL_TABLES = {
             source_value text PRIMARY KEY,
             visit_occurrence_id integer NOT NULL UNIQUE,
             person_source_value text
+        )""",
+    "person_map_retired": """
+        CREATE TABLE IF NOT EXISTS {etl}.person_map_retired (
+            source_value text PRIMARY KEY,
+            person_id integer NOT NULL UNIQUE
+        )""",
+    "visit_map_retired": """
+        CREATE TABLE IF NOT EXISTS {etl}.visit_map_retired (
+            source_value text PRIMARY KEY,
+            visit_occurrence_id integer NOT NULL UNIQUE,
+            person_source_value text
+        )""",
+    "id_high_water": """
+        CREATE TABLE IF NOT EXISTS {etl}.id_high_water (
+            table_name text PRIMARY KEY,
+            max_id bigint NOT NULL
+        )""",
+    "build_facts": """
+        CREATE TABLE IF NOT EXISTS {etl}.build_facts (
+            name text NOT NULL,
+            value text
         )""",
     "source_to_concept_map": """
         CREATE TABLE IF NOT EXISTS {etl}.source_to_concept_map (
@@ -110,10 +136,23 @@ ETL_TABLES = {
 }
 
 
-def create_etl_tables(conn: psycopg.Connection, schemas: Schemas) -> None:
+def create_etl_tables(conn: psycopg.Connection, schemas: Schemas, role: str | None = None) -> list[str]:
+    """Create any missing ETL working tables. Returns the tables created.
+
+    With ``role`` (``target.etl_role``), the role gets SELECT, INSERT and DELETE on the tables this
+    call creates, so a table that a new version adds does not fail the next build run under the
+    role. Grants on existing tables are left to the administrator."""
     ensure_schema(conn, schemas.etl)
-    for stmt in ETL_TABLES.values():
-        execute(conn, schemas.render(stmt))
+    created = []
+    for table, stmt in ETL_TABLES.items():
+        if not table_exists(conn, schemas.etl, table):
+            execute(conn, schemas.render(stmt))
+            created.append(table)
+    # a role that does not exist fails every step with a clear error when the build sets it
+    if role and created and scalar(conn, "SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)):
+        for table in created:
+            execute(conn, f"GRANT SELECT, INSERT, DELETE ON {qi(schemas.etl)}.{qi(table)} TO {qi(role)}")
+    return created
 
 
 def truncate_cdm_tables(conn: psycopg.Connection, schemas: Schemas, tables: list[str]) -> None:

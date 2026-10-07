@@ -22,9 +22,10 @@ The spec's SQL is written by an LLM (and possibly edited by people), so before a
 each step's fragments are checked again by ``design.validate.sql_safety_issues``; unsafe steps
 are refused and reported as errors. With ``target.etl_role`` set, every step also runs under
 that role (``SET LOCAL ROLE``), which needs USAGE and SELECT on the staging and vocabulary
-schemas, SELECT/INSERT/DELETE on the CDM and ETL schemas (DELETE for id-map pruning and custom
-SQL), and membership of the connecting user. The CDM tables are emptied before the steps run,
-and ANALYZEd, as the connecting user.
+schemas, SELECT/INSERT/DELETE on the CDM and ETL schemas (DELETE for retiring and restoring
+id-map keys, and for custom SQL), and membership of the connecting user. ETL tables the build
+creates (such as those a new version adds) are granted to the role. The CDM tables are emptied
+before the steps run, and ANALYZEd, as the connecting user.
 """
 
 from __future__ import annotations
@@ -54,7 +55,8 @@ VALUE_COUNT_CATEGORIES = (
 ROW_SITE = "row"
 # Steps after which the tables they wrote are ANALYZEd.
 _ANALYZED_KINDS = {"insert", "custom", "route", "merge", "derived"}
-_ID_MAPS = ("person_map", "visit_map")
+# The id maps and the keys they retired, ANALYZEd after the last id-map step and after pruning.
+_ID_MAPS = ("person_map", "visit_map", "person_map_retired", "visit_map_retired")
 
 
 def _is_cdm_table(name: str | None) -> bool:
@@ -281,7 +283,7 @@ def run_etl(
     result = ETLRunResult(started_at=utcnow())
 
     create_cdm_tables(conn, schemas, include_vocab=False)
-    create_etl_tables(conn, schemas)
+    create_etl_tables(conn, schemas, cfg.target.etl_role)
     tables = sorted(set(target_tables(spec)) | _previous_tables(ws))
     truncate_cdm_tables(conn, schemas, tables)
     conn.commit()
@@ -295,7 +297,7 @@ def run_etl(
     failed: set[str] = set()  # CDM tables and step labels whose steps failed or were skipped
     for i, step in enumerate(steps):
         skipped = _skip_reason(step, failed)
-        if skipped:  # e.g. id-map pruning after a failed person load: keep the stable ids
+        if skipped:  # e.g. a route step after a failed route_prepare
             res = _new_result(step)
             res.skipped = skipped
         else:

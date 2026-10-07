@@ -163,8 +163,19 @@ Health data is sensitive, so these rules are enforced in code rather than left t
 * **LLM-written SQL is checked before it runs.** Spec expressions must be single expressions
   over the staged source and vocabulary. Statement separators and file, network or session
   functions are rejected. They are `EXPLAIN`ed before they are accepted. For defence in depth,
-  set `target.etl_role` to a least-privilege role (SELECT on staging/vocabulary,
-  INSERT/TRUNCATE on CDM/ETL) and the build runs under it.
+  set `target.etl_role` to a least-privilege role and the build runs under it. Grant it these
+  privileges once `omop-agent vocab-load` has created the tables (shown for the default
+  schemas; add your vocabulary schema if it is not `cdm`):
+
+  ```sql
+  GRANT USAGE ON SCHEMA src, cdm, etl TO omop_etl;
+  GRANT SELECT ON ALL TABLES IN SCHEMA src TO omop_etl;
+  GRANT SELECT, INSERT, DELETE ON ALL TABLES IN SCHEMA cdm, etl TO omop_etl;
+  GRANT omop_etl TO omop;  -- the user in target.url
+  ```
+
+  ETL tables that the build creates later (a new version can add some) are granted to the
+  role automatically.
 * **Nothing Claude produces is trusted blindly.** Concept ids must exist in your vocabulary
   as valid standard concepts in the right domain. Person and visit ids always come from the id
   maps, so events can't attach to the wrong patient. The repair agent may not filter out
@@ -232,8 +243,12 @@ runs the demo inside it.
   are treated as reference data and are not suppressed.
 
 * The target database is PostgreSQL only. Source databases can be anything SQLAlchemy reads.
-* Person and visit ids are kept stable across re-runs (the id maps are append-only). Filtered-out
-  people and visits are pruned from the maps after each load.
+* Person and visit ids are kept stable across re-runs and are never given to another key.
+  People and visits that a load filtered out are retired from the id maps with their ids
+  (`etl.person_map_retired`, `etl.visit_map_retired`) and get the same ids back when they return.
+  Versions before the retired tables deleted such keys: after an upgrade, a deleted key that
+  returns gets a new id, and the id of a deleted key above the largest id still in the map can
+  be given to a new key once.
 * Records are not yet re-routed by domain: a source code that maps to a concept in another
   domain stays in the table the spec chose, and DQD flags it.
 * The eras (`condition_era`, `drug_era`), `visit_detail`, `note`/NLP and `cost` tables are not

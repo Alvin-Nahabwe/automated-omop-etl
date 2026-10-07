@@ -612,7 +612,7 @@ def _etl_section(run: ETLRunResult) -> dict[str, Any]:
         "finished_at": fmt_dt(run.finished_at),
         "duration": (end - start).total_seconds() if start and end else None,
         "steps": steps,
-        "total_rows": sum(s.rows_inserted for s in run.steps if s.error is None),
+        "total_rows": run.rows_loaded(),
         "n_errors": len(run.errors()),
         "ok": run.ok,
     }

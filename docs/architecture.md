@@ -89,11 +89,17 @@ a Rabbit-in-a-Hat document, and it compiles directly to SQL. Each `TableMapping`
 | `concept_map` | `LEFT JOIN etl.source_to_concept_map` on code+`source_vocabulary_id` |
 | `null` | `NULL` |
 
-The id maps are append-only, so a person keeps the same `person_id` across re-runs. After
-`person` and `visit_occurrence` load, map entries for people or visits that the mappings
-filtered out are pruned, so events can't point at them. The build re-validates the spec first,
-because it may have been edited by hand. Retention is measured before vocabulary fan-out
-(`TableLoadResult.retained_rows`), so one-to-many mappings can't hide dropped records.
+The id maps are kept across re-runs, so a person keeps the same `person_id`, and no id is
+given to another key. After `person` and `visit_occurrence` load, map entries for people or
+visits that did not become a row (filtered out by the mappings, or a failed load) are retired
+to `etl.person_map_retired` / `etl.visit_map_retired`, so events can't point at them; a retired
+key that returns gets its old id back, and new keys are numbered after the largest id in the
+map or retired. (Versions before the retired tables deleted such keys, so the first build after
+an upgrade can give a deleted key's id to a new key once.) The visit pruning step also records
+the person each loaded visit belongs to (`visit_map.person_source_value`). The build
+re-validates the spec first, because it may have been edited by hand. Retention is measured
+before vocabulary fan-out (`TableLoadResult.retained_rows`), so one-to-many mappings can't hide
+dropped records.
 
 Concept lookups yield `0` when the source value exists but has no mapping. When the source
 value is NULL they yield NULL, or 0 if the CDM field is required. `varchar(n)` targets are

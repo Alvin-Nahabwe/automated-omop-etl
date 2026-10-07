@@ -579,11 +579,12 @@ def etl_checks(etl_result: ETLRunResult, min_retention_pct: float = 50.0) -> lis
 
     Every result carries the step label. The error of a non-blocking step is a convention-level
     failure, and the repair agent only gets the errors of steps that run spec SQL. When a person
-    load failed, the other steps' retention is left out: its error is the cause of their drops.
+    load (a mapping or custom SQL) failed, the other steps' retention is left out: its error is
+    the cause of their drops, since the id-map pruning retires the keys of people not loaded.
     """
     out: list[CheckResult] = []
     person_failed = any(
-        s.error and s.target_table == "person" and s.kind in (None, "insert") for s in etl_result.steps
+        s.error and s.target_table == "person" and s.kind in (None, "insert", "custom") for s in etl_result.steps
     )
     for s in etl_result.steps:
         label = step_label(s.step)

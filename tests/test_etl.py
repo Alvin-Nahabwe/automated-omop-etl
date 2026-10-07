@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omop_agent.cdm.ddl import create_etl_tables
 from omop_agent.cdm.spec import LOAD_ORDER
 from omop_agent.db import Schemas, execute, fetch_all, scalar
 from omop_agent.etl.compiler import (
@@ -81,15 +82,17 @@ def test_step_order_and_targets():
     assert [s.kind for s in steps] == ["id_map", "id_map", "insert", "prune", "insert", "prune"] + ["insert"] * 5 + [
         "metadata"
     ]
-    assert [s.requires for s in steps if s.requires] == ["person", "visit_occurrence"]
+    assert [s.requires for s in steps if s.requires] == []  # pruning runs after a failed load too
     # sort keys: (load index of the table, band, sequence); id maps first, cdm_source last
     assert [s.slot for s in steps] == sorted(s.slot for s in steps)
     assert steps[0].slot[0] == steps[1].slot[0] == -1 and steps[-1].slot[0] > len(LOAD_ORDER) - 1
     assert step(steps, "person_map_prune").slot == (LOAD_ORDER.index("person"), 1, 0)
     assert [s.label for s in steps][:3] == ["person_map", "visit_map", "person"]
-    # every generated step is blocking, reads a row count and is one statement; the spec kinds
+    # every generated step is blocking and reads a row count; its SQL is its statements (two for
+    # the id maps and the visit pruning); the spec kinds
     assert all(s.blocking and s.returns == "rowcount" and s.count_sites == () for s in steps)
-    assert all(s.statements == (s.sql,) for s in steps)
+    assert all("\n".join(s.statements) == s.sql for s in steps)
+    assert [s.label for s in steps if len(s.statements) > 1] == ["person_map", "visit_map", "visit_map_prune"]
     assert {s.kind for s in steps if s.kind in SPEC_KINDS} == {"id_map", "insert"}
     assert target_tables(spec) == [
         "person", "visit_occurrence", "condition_occurrence", "drug_exposure",
@@ -102,31 +105,59 @@ def test_step_order_and_targets():
 def test_id_maps():
     spec = load_ref()
     steps = compile_spec(spec, S)
-    pm = steps[0].sql
-    # stable across runs: never truncated; only new keys, numbered after the largest existing id
-    assert "TRUNCATE" not in pm
-    assert "SELECT DISTINCT (individual_id)::text AS source_value" in pm
-    assert "FROM src.individuals" in pm and "WHERE (individual_id) IS NOT NULL" in pm
+    pm = steps[0]
+    # stable across runs: never truncated; retired keys that are back get their old id, then only
+    # new keys are added, numbered after the largest id ever given out (map or retired)
+    assert "TRUNCATE" not in pm.sql
+    restore, new = pm.statements
+    keys = "    SELECT DISTINCT (individual_id)::text AS source_value\n    FROM src.individuals\n" \
+           "    WHERE (individual_id) IS NOT NULL\n"
+    assert f"WITH k AS (\n{keys})," in restore and f"FROM (\n{keys}) k" in new
     assert (
-        "((SELECT COALESCE(MAX(person_id), 0) FROM etl.person_map) + ROW_NUMBER() OVER (ORDER BY k.source_value))"
-        in pm
-    )
-    assert "WHERE NOT EXISTS (SELECT 1 FROM etl.person_map pm WHERE pm.source_value = k.source_value)" in pm
-    assert pm.rstrip().endswith("ON CONFLICT DO NOTHING;")
-    assert steps[0].origins == (spec.person_key,)
-    vm = steps[1].sql
-    assert "TRUNCATE" not in vm
-    assert "INSERT INTO etl.visit_map (source_value, visit_occurrence_id, person_source_value)" in vm
-    assert "MIN((v.individual_id)::text)" in vm  # person column taken from the visit mapping
-    assert "FROM src.clinic_visits v" in vm
-    assert "(SELECT COALESCE(MAX(visit_occurrence_id), 0) FROM etl.visit_map)" in vm
-    assert steps[1].origins == (spec.visit_key, spec.mapping_for("visit_occurrence"))
-    # pruning after the person / visit loads
+        "back AS (\n    DELETE FROM etl.person_map_retired r USING k\n    WHERE r.source_value = k.source_value\n"
+        "    RETURNING r.source_value, r.person_id\n)\nINSERT INTO etl.person_map (source_value, person_id)\n"
+        "SELECT source_value, person_id FROM back\nON CONFLICT DO NOTHING;"
+    ) in restore
+    assert (
+        "    (GREATEST((SELECT COALESCE(MAX(person_id), 0) FROM etl.person_map),\n"
+        "              (SELECT COALESCE(MAX(person_id), 0) FROM etl.person_map_retired))\n"
+        "     + ROW_NUMBER() OVER (ORDER BY k.source_value))::integer\n"
+    ) in new
+    assert "WHERE NOT EXISTS (SELECT 1 FROM etl.person_map pm WHERE pm.source_value = k.source_value)" in new
+    assert new.rstrip().endswith("ON CONFLICT DO NOTHING;")  # the step's row count: the new keys
+    assert pm.origins == (spec.person_key,)
+    vm = steps[1]
+    assert "TRUNCATE" not in vm.sql and len(vm.statements) == 2
+    restore, new = vm.statements
+    assert "INSERT INTO etl.visit_map (source_value, visit_occurrence_id, person_source_value)" in new
+    assert "MIN((v.individual_id)::text)" in new  # person column taken from the visit mapping
+    assert "FROM src.clinic_visits v" in restore and "FROM src.clinic_visits v" in new
+    # a restored visit takes the person the visit table gives it now
+    assert "DELETE FROM etl.visit_map_retired r USING k" in restore
+    assert ("RETURNING r.source_value, r.visit_occurrence_id, "
+            "COALESCE(k.person_source_value, r.person_source_value) AS person_source_value") in restore
+    assert "(SELECT COALESCE(MAX(visit_occurrence_id), 0) FROM etl.visit_map_retired)" in new
+    assert vm.origins == (spec.visit_key, spec.mapping_for("visit_occurrence"))
+    # pruning after the person / visit loads retires keys (never deletes them) and requires nothing:
+    # it runs after a failed load too
     prune = step(steps, "person_map_prune")
-    assert prune.target_table is None and prune.requires == "person"
-    assert "DELETE FROM etl.person_map pm\nWHERE NOT EXISTS (SELECT 1 FROM cdm.person p WHERE p.person_id = pm.person_id);" in prune.sql
+    assert (prune.kind, prune.target_table, prune.requires) == ("prune", None, None)
+    assert (
+        "WITH gone AS (\n    DELETE FROM etl.person_map pm\n"
+        "    WHERE NOT EXISTS (SELECT 1 FROM cdm.person p WHERE p.person_id = pm.person_id)\n"
+        "    RETURNING pm.source_value, pm.person_id\n)\n"
+        "INSERT INTO etl.person_map_retired (source_value, person_id)\nSELECT source_value, person_id FROM gone\n"
+    ) in prune.sql
     vprune = step(steps, "visit_map_prune")
-    assert "DELETE FROM etl.visit_map vm" in vprune.sql and "FROM cdm.visit_occurrence v" in vprune.sql
+    assert (vprune.kind, vprune.requires) == ("prune", None)
+    refresh, retire = vprune.statements
+    # 1) each loaded visit's person is recorded (DELETE + INSERT: the ETL role has no UPDATE)
+    assert "USING cdm.visit_occurrence v, etl.person_map pm" in refresh
+    assert "AND vm.person_source_value IS DISTINCT FROM pm.source_value" in refresh
+    assert "UPDATE" not in strip_literals(refresh)
+    # 2) then the keys without a visit are retired with their person
+    assert "DELETE FROM etl.visit_map vm" in retire and "FROM cdm.visit_occurrence v" in retire
+    assert "INSERT INTO etl.visit_map_retired (source_value, visit_occurrence_id, person_source_value)" in retire
     # no visit key, no visit map and no visit pruning
     spec = load_ref().model_copy(update={"visit_key": None})
     spec.table_mappings = [tm for tm in spec.table_mappings if tm.target_table == "person"]
@@ -423,12 +454,15 @@ def test_run_reference_spec(staged):
     assert by_table["person_map"].rows_inserted == 400
     assert by_table["person_map_prune"].rows_inserted == 0 and by_table["person_map_prune"].error is None
     assert count(conn, schemas, "cdm_source") == 1
-    # the visit load failed: its id map is not pruned (the ids stay stable for the next run)
+    # the visit load failed: pruning retires every visit key with its id (the ids stay stable for
+    # the next run), and the events get no visit instead of one missing from visit_occurrence
     prune = next(s for s in result.steps if s.step.endswith("visit_map_prune"))
-    assert prune.error is None and prune.rows_inserted == 0
-    assert scalar(conn, f"SELECT COUNT(*) FROM {schemas.etl}.visit_map") == errors[0].source_rows
+    assert prune.error is None and prune.rows_inserted == errors[0].source_rows
+    assert scalar(conn, f"SELECT COUNT(*) FROM {schemas.etl}.visit_map") == 0
+    assert scalar(conn, f"SELECT COUNT(*) FROM {schemas.etl}.visit_map_retired") == errors[0].source_rows
+    assert count(conn, schemas, "condition_occurrence", "visit_occurrence_id IS NOT NULL") == 0
     audit = [e for e in ws.read_audit() if e["event"] == "etl_step" and e["step"] == prune.step]
-    assert audit[0]["skipped"] == "a step loading visit_occurrence failed"
+    assert "skipped" not in audit[0] and audit[0]["rows_inserted"] == prune.rows_inserted
     assert [e["retained_rows"] for e in ws.read_audit() if e.get("step") == "09_measurement"] == [m.retained_rows]
 
     files = sorted(p.name for p in ws.sql_dir.glob("*.sql"))
@@ -585,7 +619,8 @@ def test_compile_error_does_not_stop_other_tables(staged, tmp_path):
 
 
 def id_map(conn, schemas, name: str) -> dict[str, int]:
-    col = "person_id" if name == "person_map" else "visit_occurrence_id"
+    """source key -> id of an id map (person_map, visit_map) or of the keys it retired (*_retired)."""
+    col = "person_id" if name.startswith("person_map") else "visit_occurrence_id"
     return {r["source_value"]: r[col] for r in fetch_all(conn, f"SELECT source_value, {col} FROM {schemas.etl}.{name}")}
 
 
@@ -604,6 +639,27 @@ def orphans(conn, schemas) -> dict[str, int]:
             conn, schemas, t, f"visit_occurrence_id NOT IN (SELECT visit_occurrence_id FROM {schemas.cdm}.visit_occurrence)"
         )
     return out
+
+
+@pytest.mark.postgres
+def test_etl_tables(staged):
+    conn, schemas, _ = staged
+
+    def columns(table: str) -> list[str]:
+        rows = fetch_all(conn, "SELECT column_name FROM information_schema.columns WHERE table_schema = %s "
+                               "AND table_name = %s ORDER BY ordinal_position", (schemas.etl, table))
+        return [r["column_name"] for r in rows]
+
+    assert columns("person_map_retired") == ["source_value", "person_id"]
+    assert columns("visit_map_retired") == ["source_value", "visit_occurrence_id", "person_source_value"]
+    assert columns("id_high_water") == ["table_name", "max_id"]
+    assert columns("build_facts") == ["name", "value"]
+    assert create_etl_tables(conn, schemas) == []  # all there
+    # a missing table is created; a role that does not exist is not granted anything (the build
+    # reports it when it sets the role)
+    execute(conn, f"DROP TABLE {schemas.etl}.build_facts")
+    assert create_etl_tables(conn, schemas, f"{schemas.cdm}_no_such_role") == ["build_facts"]
+    conn.commit()
 
 
 @pytest.mark.postgres
@@ -644,6 +700,10 @@ def test_id_maps_are_pruned_to_loaded_people_and_visits(staged):
     assert by_step["person_map_prune"].rows_inserted == 400 - kept
     assert int(scalar(conn, f"SELECT COUNT(*) FROM {schemas.etl}.person_map")) == kept
     assert int(scalar(conn, f"SELECT COUNT(*) FROM {schemas.etl}.visit_map")) == count(conn, schemas, "visit_occurrence")
+    # the pruned keys are retired with their ids, not deleted
+    retired, visits_retired = id_map(conn, schemas, "person_map_retired"), id_map(conn, schemas, "visit_map_retired")
+    assert len(retired) == 400 - kept and not set(retired) & set(id_map(conn, schemas, "person_map"))
+    assert len(visits_retired) == by_step["visit_map_prune"].rows_inserted > 0
     # nothing points at a person or visit that was filtered out ...
     assert set(orphans(conn, schemas).values()) == {0}
     # ... events of the unknown-sex people are dropped, and links to emergency visits are NULL
@@ -653,29 +713,127 @@ def test_id_maps_are_pruned_to_loaded_people_and_visits(staged):
         WHERE NOT EXISTS (SELECT 1 FROM {src}.individuals i WHERE i.individual_id = d.individual_id AND i.sex <> '9')"""))
     assert co.source_rows - co.retained_rows == dropped > 0 and co.rows_inserted == co.retained_rows
 
-    # without the filter, the pruned people come back with new ids after the largest; the rest keep theirs
-    before = person_ids(conn, schemas)
-    assert run_etl(conn, schemas, fixed_ref(), cfg).ok
+    # without the filter, the pruned people and visits come back with their old ids; the rest keep theirs
+    before, visits = person_ids(conn, schemas), id_map(conn, schemas, "visit_map")
+    result = run_etl(conn, schemas, fixed_ref(), cfg)
+    assert result.ok and next(s for s in result.steps if s.target_table == "person_map").rows_inserted == 0
     after = person_ids(conn, schemas)
-    assert len(after) == 400 and {k: after[k] for k in before} == before
-    assert min(v for k, v in after.items() if k not in before) > max(before.values())
+    assert len(after) == 400 and after == before | retired
+    assert id_map(conn, schemas, "visit_map") == visits | visits_retired
+    assert id_map(conn, schemas, "person_map_retired") == id_map(conn, schemas, "visit_map_retired") == {}
 
 
 @pytest.mark.postgres
 def test_failed_person_load_keeps_the_id_map(staged, tmp_path):
     conn, schemas, cfg = staged
     assert run_etl(conn, schemas, fixed_ref(), cfg).ok
-    people = id_map(conn, schemas, "person_map")
+    people, visits = id_map(conn, schemas, "person_map"), id_map(conn, schemas, "visit_map")
     broken = set_field(fixed_ref(), "person", "year_of_birth", expression="i.sex::int / 0")
     ws = Workspace(tmp_path / "ws")
     result = run_etl(conn, schemas, broken, cfg, ws)
     assert [e.target_table for e in result.errors()] == ["person"] and "division by zero" in result.errors()[0].error
+    # pruning still runs: everyone is retired with their id (none is lost), so no event points at
+    # a person who is not in person
     prune = next(s for s in result.steps if s.step.endswith("person_map_prune"))
-    assert prune.error is None and prune.rows_inserted == 0
-    assert id_map(conn, schemas, "person_map") == people  # not wiped although person is empty
-    assert any(e.get("skipped") for e in ws.read_audit() if e.get("step") == prune.step)
+    assert prune.error is None and prune.skipped is None and prune.rows_inserted == 400
+    assert id_map(conn, schemas, "person_map") == {} and id_map(conn, schemas, "person_map_retired") == people
+    assert not any(e.get("skipped") for e in ws.read_audit() if e.get("step") == prune.step)
+    assert set(orphans(conn, schemas).values()) == {0} and count(conn, schemas, "condition_occurrence") == 0
+    assert id_map(conn, schemas, "visit_map") == {} and id_map(conn, schemas, "visit_map_retired") == visits
+    # the next good build restores every id
     assert run_etl(conn, schemas, fixed_ref(), cfg).ok
-    assert id_map(conn, schemas, "person_map") == people
+    assert id_map(conn, schemas, "person_map") == people and id_map(conn, schemas, "visit_map") == visits
+    assert id_map(conn, schemas, "person_map_retired") == id_map(conn, schemas, "visit_map_retired") == {}
+
+
+@pytest.mark.postgres
+def test_ids_never_reused_and_restored(staged):
+    conn, schemas, cfg = staged
+    src = schemas.src
+
+    def build(filtered: bool):
+        spec = fixed_ref().model_copy(deep=True)
+        if filtered:  # the person and the visit with the largest keys (and ids) are not loaded
+            spec.mapping_for("person").where = "i.individual_id <> 'KH000400'"
+            spec.mapping_for("visit_occurrence").where = "v.visit_id <> 'V0000890'"
+        result = run_etl(conn, schemas, spec, cfg)
+        assert result.ok, [(e.step, e.error) for e in result.errors()]
+        return {s.step.split("_", 1)[1]: s.rows_inserted for s in result.steps}
+
+    def source(person: str, visit: str, add: bool = True) -> None:
+        if add:
+            execute(conn, f"INSERT INTO {src}.individuals (individual_id, sex, dob) VALUES ('{person}', '1', '01/02/1990')")
+            execute(conn, f"INSERT INTO {src}.clinic_visits (visit_id, individual_id, visit_date, visit_type) "
+                          f"VALUES ('{visit}', '{person}', '2020-01-01', 'OPD')")
+        else:
+            execute(conn, f"DELETE FROM {src}.clinic_visits WHERE visit_id = '{visit}'")
+            execute(conn, f"DELETE FROM {src}.individuals WHERE individual_id = '{person}'")
+        conn.commit()
+
+    def maps(name: str) -> tuple[dict[str, int], dict[str, int]]:
+        return id_map(conn, schemas, name), id_map(conn, schemas, f"{name}_retired")
+
+    # 1) the largest keys are filtered out: retired with their ids
+    build(filtered=True)
+    people, people_retired = maps("person_map")
+    visits, visits_retired = maps("visit_map")
+    assert people_retired == {"KH000400": 400} and max(people.values()) == 399
+    assert visits_retired["V0000890"] == 890 and max(visits.values()) < 890
+    # 2) new keys are numbered after every id ever given out: the retired ids are not reused
+    source("KH000401", "V0000891")
+    assert build(filtered=True)["person_map"] == 1
+    assert maps("person_map") == (people | {"KH000401": 401}, people_retired)
+    assert maps("visit_map") == (visits | {"V0000891": 891}, visits_retired)
+    # 3) without the filter the retired keys come back with their old ids; the newest keys leave
+    #    the source and are retired in turn
+    source("KH000401", "V0000891", add=False)
+    build(filtered=False)
+    assert maps("person_map") == (people | people_retired, {"KH000401": 401})
+    assert maps("visit_map") == (visits | visits_retired, {"V0000891": 891})
+    assert person_ids(conn, schemas)["KH000400"] == 400
+    assert count(conn, schemas, "visit_occurrence", "visit_occurrence_id = 890 AND person_id = 400") == 1
+    # 4) a new key gets the next id, not the one of the retired key at the top (the old maps,
+    #    which deleted pruned keys, gave it out again)
+    source("KH000402", "V0000892")
+    assert build(filtered=False)["person_map"] == 1
+    assert maps("person_map") == (people | people_retired | {"KH000402": 402}, {"KH000401": 401})
+    assert maps("visit_map") == (visits | visits_retired | {"V0000892": 892}, {"V0000891": 891})
+    # 5) a key that returns gets its old id, and is not counted as a new key
+    source("KH000401", "V0000891")
+    assert build(filtered=False)["person_map"] == 0
+    assert maps("person_map") == (people | people_retired | {"KH000401": 401, "KH000402": 402}, {})
+    assert maps("visit_map") == (visits | visits_retired | {"V0000891": 891, "V0000892": 892}, {})
+    assert {k: person_ids(conn, schemas)[k] for k in ("KH000401", "KH000402")} == {"KH000401": 401, "KH000402": 402}
+
+
+@pytest.mark.postgres
+def test_visit_person_follows_the_source_between_runs(staged):
+    conn, schemas, cfg = staged
+    assert run_etl(conn, schemas, fixed_ref(), cfg).ok
+    visits = id_map(conn, schemas, "visit_map")
+    persons = person_ids(conn, schemas)
+
+    def visit_people() -> dict[str, str]:
+        rows = fetch_all(conn, f"SELECT source_value, person_source_value FROM {schemas.etl}.visit_map")
+        return {r["source_value"]: r["person_source_value"] for r in rows}
+
+    assert visit_people()["V0000001"] == "KH000001"
+    # the extract now gives the visit to another person; maps written by older versions may hold
+    # no person at all
+    execute(conn, f"UPDATE {schemas.src}.clinic_visits SET individual_id = 'KH000002' WHERE visit_id = 'V0000001'")
+    execute(conn, f"UPDATE {schemas.etl}.visit_map SET person_source_value = NULL WHERE source_value <> 'V0000001'")
+    conn.commit()
+    assert run_etl(conn, schemas, fixed_ref(), cfg).ok
+    # the visit keeps its id; the map records the person it was loaded for
+    assert id_map(conn, schemas, "visit_map") == visits
+    people = visit_people()
+    assert people["V0000001"] == "KH000002"
+    loaded = fetch_all(conn, f"SELECT v.visit_occurrence_id, p.person_source_value FROM {schemas.cdm}.visit_occurrence v "
+                             f"JOIN {schemas.cdm}.person p ON p.person_id = v.person_id")
+    by_id = {v: k for k, v in visits.items()}
+    assert {by_id[r["visit_occurrence_id"]]: r["person_source_value"] for r in loaded} == people
+    assert count(conn, schemas, "visit_occurrence",
+                 f"visit_occurrence_id = {visits['V0000001']} AND person_id = {persons['KH000002']}") == 1
 
 
 @pytest.mark.postgres
@@ -705,10 +863,17 @@ def test_steps_run_under_the_etl_role(staged):
     execute(conn, f"GRANT SELECT, INSERT, DELETE ON ALL TABLES IN SCHEMA {schemas.cdm}, {schemas.etl} TO {role}")
     execute(conn, f"CREATE SCHEMA {schemas.results}")
     execute(conn, f"CREATE TABLE {schemas.results}.secret AS SELECT 1 AS x")
+    # an ETL schema of an older version, granted before the upgrade: the build creates the tables
+    # added since then and grants them to the role
+    new_tables = ["person_map_retired", "visit_map_retired", "id_high_water", "build_facts"]
+    for t in new_tables:
+        execute(conn, f"DROP TABLE {schemas.etl}.{t}")
     conn.commit()
     try:
         cfg = cfg.model_copy(update={"target": cfg.target.model_copy(update={"etl_role": role})})
         spec = fixed_ref().model_copy(deep=True)
+        # filtered visits are retired under the role: the grants cover the retired-key tables
+        spec.mapping_for("visit_occurrence").where = "v.visit_type <> 'EMERG'"
         spec.custom_sql = [
             CustomSQL(name="who", target_table="metadata", sql=(
                 "INSERT INTO {cdm}.metadata (metadata_id, metadata_concept_id, metadata_type_concept_id, name, "
@@ -721,6 +886,9 @@ def test_steps_run_under_the_etl_role(staged):
         assert len(errors) == 1 and errors[0][0].endswith("custom_peek") and "permission denied" in errors[0][1], errors
         assert fetch_all(conn, f"SELECT value_as_string FROM {schemas.cdm}.metadata") == [{"value_as_string": role}]
         assert count(conn, schemas, "person") == 400 and count(conn, schemas, "visit_occurrence") > 0
+        assert len(id_map(conn, schemas, "visit_map_retired")) > 0
+        for t in new_tables:
+            assert scalar(conn, "SELECT has_table_privilege(%s, %s, 'SELECT, INSERT, DELETE')", (role, f"{schemas.etl}.{t}"))
         assert scalar(conn, "SELECT current_user") == scalar(conn, "SELECT session_user")  # SET LOCAL only
         # the same spec without the role reads the other schema
         cfg = cfg.model_copy(update={"target": cfg.target.model_copy(update={"etl_role": None})})
@@ -742,7 +910,8 @@ def test_runner_refuses_unsafe_spec_sql(staged):
     assert set(errors) == {"person", "death"}
     assert errors["person"].startswith("refused: unsafe SQL in the spec: person.gender_source_value:")
     assert "pg_read_file()" in errors["person"] and "DROP" in errors["death"]
-    assert count(conn, schemas, "person") == 0 and count(conn, schemas, "death") > 0  # the table still exists
+    assert count(conn, schemas, "person") == 0
+    assert scalar(conn, f"SELECT to_regclass('{schemas.cdm}.death') IS NOT NULL")  # the table still exists
 
 
 # --------------------------------------------------------------------------------------
@@ -758,12 +927,13 @@ def test_analyze_policy():
     assert _analyzed_after(insert, res(rows_inserted=3), S, last_id_map=False) == ["cdm.condition_occurrence"]
     assert _analyzed_after(insert, res(error="boom"), S, last_id_map=False) == []
     assert _analyzed_after(insert, res(skipped="a step loading person failed"), S, last_id_map=False) == []
-    # the id maps: after the last id-map step and after each prune
+    # the id maps and their retired keys: after the last id-map step and after each prune
     id_map = CompiledStep("02_visit_map", None, "id_map", "INSERT ...")
-    assert _analyzed_after(id_map, res(), S, last_id_map=True) == ["etl.person_map", "etl.visit_map"]
+    maps = ["etl.person_map", "etl.visit_map", "etl.person_map_retired", "etl.visit_map_retired"]
+    assert _analyzed_after(id_map, res(), S, last_id_map=True) == maps
     assert _analyzed_after(id_map, res(), S, last_id_map=False) == []
-    prune = CompiledStep("04_person_map_prune", None, "prune", "DELETE ...")
-    assert _analyzed_after(prune, res(), S, last_id_map=False) == ["etl.person_map", "etl.visit_map"]
+    prune = CompiledStep("04_person_map_prune", None, "prune", "WITH gone AS (DELETE ...")
+    assert _analyzed_after(prune, res(), S, last_id_map=False) == maps
     # a route step: its source table and the destinations of what it moved
     route = CompiledStep("12_route_measurement", "measurement", "route", "WITH ...", returns="rows")
     moved = res(moved=[{"from_table": "measurement", "to_table": "observation", "domain_id": "Observation",

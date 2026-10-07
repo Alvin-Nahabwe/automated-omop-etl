@@ -210,6 +210,24 @@ def test_a_failed_person_load_hides_the_retention_it_causes():
     etl.steps[0] = etl.steps[0].model_copy(update={"error": None, "rows_inserted": 400})
     assert [r.key for r in etl_checks(etl)] == ["etlRecordRetention.person", "etlRecordRetention.condition_occurrence",
                                                "etlRecordLoss.condition_occurrence"]
+    # person custom SQL that fails: the pruning retires everyone it did not load, so likewise
+    custom = TableLoadResult(target_table="person", step="04_custom_persons", kind="custom", error="division by zero")
+    etl.steps[1:1] = [custom]
+    assert [r.key for r in etl_checks(etl)] == ["etlStepError.person.custom_persons"]
+    # a failed step of another table does not hide them
+    etl.steps[1] = custom.model_copy(update={"target_table": "death", "step": "10_custom_deaths"})
+    assert "etlRecordLoss.condition_occurrence" in [r.key for r in etl_checks(etl)]
+
+
+def test_rows_loaded_leaves_out_the_id_maps():
+    etl = ETLRunResult(started_at=NOW, steps=[
+        TableLoadResult(target_table="person_map", step="01_person_map", kind="id_map", rows_inserted=400),
+        TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=390),
+        TableLoadResult(target_table="person_map_prune", step="04_person_map_prune", kind="prune", rows_inserted=10),
+        TableLoadResult(target_table="death", step="10_death", kind="insert", error="boom"),
+        TableLoadResult(target_table="cdm_source", step="20_cdm_source", kind="metadata", rows_inserted=1),
+    ])
+    assert etl.rows_loaded() == 391  # the keys the maps added or retired are not CDM rows
 
 
 def test_repairable():
@@ -301,6 +319,9 @@ def test_redact_error():
     assert redact_error('relation "cdm_x.person" does not exist', known={"cdm_x"}) == 'relation "cdm_x.person" does not exist'
     assert redact_error('relation "KH01.person" does not exist') == 'relation "<value withheld>" does not exist'
     assert redact_error('relation "visit_occurrence" does not exist') == 'relation "visit_occurrence" does not exist'
+    # ETL tables are known by name; the generic column names of the build's bookkeeping tables are not
+    assert redact_error('relation "person_map_retired" does not exist') == 'relation "person_map_retired" does not exist'
+    assert redact_error('relation "value" does not exist') == 'relation "<value withheld>" does not exist'
     assert redact_error('column "sex" does not exist', known={"sex"}) == 'column "sex" does not exist'
     assert redact_error('column "Sex" does not exist', known={"sex"}) == 'column "<value withheld>" does not exist'
     # HINT text is redacted the same way
@@ -682,6 +703,8 @@ def test_count_records_refusals(repair_env):
     # the id maps are never counted; the source_to_concept_map is
     refused({"table": "etl.person_map"}, "etl.person_map")
     refused({"table": "etl.visit_map", "group_by": ["person_source_value"]})
+    refused({"table": "etl.person_map_retired"}, "etl.person_map_retired")
+    refused({"table": "etl.visit_map_retired"})
     assert count({"table": "etl.source_to_concept_map"}).startswith("etl.source_to_concept_map: n")
     # only known tables, as <schema>.<table>
     assert count({"table": "individuals"}).startswith("ERROR: table must be '<schema>.<table>'")

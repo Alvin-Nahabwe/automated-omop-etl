@@ -14,11 +14,13 @@ mappings in spec order, then its custom SQL; custom SQL of a table without a map
 that table's place too, not after everything) and the steps generated for it (band 1); the
 derived observation period follows every spec writer of observation_period, and the
 ``cdm_source`` row comes last. After the person (and visit_occurrence) writers an id-map pruning
-step removes keys that did not become a row, so events of people or visits that a mapping
+step retires the keys that did not become a row, so events of people or visits that a mapping
 filtered out are dropped (or get a NULL visit) instead of pointing at rows that do not exist.
-The id maps are never truncated: ids are kept across runs so stored cohorts stay valid, and new
-keys get ids after the largest existing one. The generated SQL is written to ``sql/*.sql`` for
-humans to review, so it is laid out one field per line with the field kind as a trailing comment.
+The id maps are never truncated, and ids are never reused or lost: they are kept across runs so
+stored cohorts stay valid; a retired key moves to ``person_map_retired`` / ``visit_map_retired``
+with its id and gets that id back when it returns; new keys get ids after the largest id in the
+map or retired. The generated SQL is written to ``sql/*.sql`` for humans to
+review, so it is laid out one field per line with the field kind as a trailing comment.
 """
 
 from __future__ import annotations
@@ -67,9 +69,9 @@ class CompiledStep:
     # joins (which can fan out 1-to-many): source - retained = records dropped
     retained_count_sql: str | None = None
     # skip this step when a step loading this CDM table, or the step with this label (its name
-    # without the number), failed or was skipped (id-map pruning must not discard the ids of rows
-    # whose load merely errored). A skip is not an error, so a blocking step must never require a
-    # non-blocking one: the build would pass without it (tests check this for generated steps)
+    # without the number), failed or was skipped. A skip is not an error, so a blocking step must
+    # never require a non-blocking one: the build would pass without it (tests check this for
+    # generated steps). Id-map pruning requires nothing: retiring a key is undone when it returns
     requires: str | None = None
     # the spec objects (TableMapping, KeySpec, CustomSQL) whose SQL this step executes, so the
     # runner can re-check them before running anything
@@ -392,43 +394,84 @@ def step_label(name: str) -> str:
     return m.group(1) if m else name
 
 
-def _person_map_sql(key: KeySpec) -> str:
+def _indent(lines: list[str], n: int = 4) -> list[str]:
+    return [" " * n + line for line in lines]
+
+
+def _id_map_statements(id_map: str, id_col: str, keys: list[str], header: str) -> list[str]:
+    """The two statements of an id-map step over ``keys`` (a query with one row per key): retired
+    keys that are back get their old id again; then the new keys are numbered in key order after
+    the largest id ever given out (in the map or retired), so an id is never reused. The step's
+    row count is that of the last statement: the new keys."""
+    a = "pm" if id_map == "person_map" else "vm"
+    person = id_map == "visit_map"  # the visit map also records the person of each visit
+    cols = ", ".join(["source_value", id_col] + (["person_source_value"] if person else []))
+    restore = [
+        _comment(header + "\n1) retired keys that are back get their old id again"),
+        "WITH k AS (",
+        *_indent(keys),
+        "),",
+        "back AS (",
+        f"    DELETE FROM {{etl}}.{id_map}_retired r USING k",
+        "    WHERE r.source_value = k.source_value",
+        f"    RETURNING r.source_value, r.{id_col}"
+        + (", COALESCE(k.person_source_value, r.person_source_value) AS person_source_value" if person else ""),
+        ")",
+        f"INSERT INTO {{etl}}.{id_map} ({cols})",
+        f"SELECT {cols} FROM back",
+        "ON CONFLICT DO NOTHING;",
+    ]
+    new = [
+        _comment(
+            "2) new keys, numbered in key order after the largest id ever given out (in the map or\n"
+            "   retired), so an id is never reused"
+        ),
+        f"INSERT INTO {{etl}}.{id_map} ({cols})",
+        "SELECT k.source_value,",
+        f"    (GREATEST((SELECT COALESCE(MAX({id_col}), 0) FROM {{etl}}.{id_map}),",
+        f"              (SELECT COALESCE(MAX({id_col}), 0) FROM {{etl}}.{id_map}_retired))",
+        "     + ROW_NUMBER() OVER (ORDER BY k.source_value))::integer" + ("," if person else ""),
+        *(["    k.person_source_value"] if person else []),
+        "FROM (",
+        *_indent(keys),
+        ") k",
+        f"WHERE NOT EXISTS (SELECT 1 FROM {{etl}}.{id_map} {a} WHERE {a}.source_value = k.source_value)",
+        "ON CONFLICT DO NOTHING;",
+    ]
+    return ["\n".join(restore), "\n".join(new)]
+
+
+def _person_map_sql(key: KeySpec) -> list[str]:
+    """The statements of the person id-map step."""
     expr = _p(key.expression)
-    return "\n".join(
-        [
-            _comment(
-                f"person id map: one person_id per distinct {key.table}.{_norm(key.expression)}.\n"
-                "The map is kept across runs, so a person keeps their person_id on every rebuild (stored\n"
-                "cohorts stay valid): only keys not yet in the map are added, numbered after the largest\n"
-                "existing person_id in key order. Keys that do not become a person are removed by the\n"
-                "pruning step after the person load."
-            ),
-            "INSERT INTO {etl}.person_map (source_value, person_id)",
-            "SELECT k.source_value,",
-            "    ((SELECT COALESCE(MAX(person_id), 0) FROM {etl}.person_map)"
-            " + ROW_NUMBER() OVER (ORDER BY k.source_value))::integer",
-            "FROM (",
-            f"    SELECT DISTINCT {expr}::text AS source_value",
-            f"    FROM {source_ref(key.table)}",
-            f"    WHERE {expr} IS NOT NULL",
-            ") k",
-            "WHERE NOT EXISTS (SELECT 1 FROM {etl}.person_map pm WHERE pm.source_value = k.source_value)",
-            "ON CONFLICT DO NOTHING;",
-        ]
-    )
+    keys = [f"SELECT DISTINCT {expr}::text AS source_value", f"FROM {source_ref(key.table)}",
+            f"WHERE {expr} IS NOT NULL"]
+    return _id_map_statements("person_map", "person_id", keys, (
+        f"person id map: one person_id per distinct {key.table}.{_norm(key.expression)}.\n"
+        "The map is kept across runs, so a person keeps their person_id on every rebuild (stored\n"
+        "cohorts stay valid). Keys that do not become a person are retired, with their id, by the\n"
+        "pruning step after the person load."
+    ))
 
 
 def _person_map_prune_sql() -> str:
     return "\n".join(
         [
             _comment(
-                "person id map: drop the keys that did not become a person (the person mapping's WHERE or\n"
-                "joins filtered them out), so the INNER JOIN on person_map drops their events instead of\n"
-                "loading rows whose person_id is not in person. The ids of everyone kept are unchanged.\n"
-                "Skipped by the runner when a person load failed."
+                "person id map: retire the keys that did not become a person (the person mapping's WHERE or\n"
+                "joins filtered them out, or the person load failed), so the INNER JOIN on person_map drops\n"
+                "their events instead of loading rows whose person_id is not in person. A retired key keeps\n"
+                "its id in person_map_retired and gets it back when it becomes a person again; the ids of\n"
+                "everyone kept are unchanged."
             ),
-            "DELETE FROM {etl}.person_map pm",
-            "WHERE NOT EXISTS (SELECT 1 FROM {cdm}.person p WHERE p.person_id = pm.person_id);",
+            "WITH gone AS (",
+            "    DELETE FROM {etl}.person_map pm",
+            "    WHERE NOT EXISTS (SELECT 1 FROM {cdm}.person p WHERE p.person_id = pm.person_id)",
+            "    RETURNING pm.source_value, pm.person_id",
+            ")",
+            "INSERT INTO {etl}.person_map_retired (source_value, person_id)",
+            "SELECT source_value, person_id FROM gone",
+            "ON CONFLICT DO NOTHING;",
         ]
     )
 
@@ -459,51 +502,65 @@ def _visit_person_expr(spec: ETLSpec) -> tuple[str, str] | None:
     return tm.source.alias, pf.expression  # type: ignore[return-value]
 
 
-def _visit_map_sql(spec: ETLSpec) -> str:
+def _visit_map_sql(spec: ETLSpec) -> list[str]:
+    """The statements of the visit id-map step."""
     vk = spec.visit_key
     assert vk is not None
     person = _visit_person_expr(spec)
     alias = qi(person[0]) if person else "v"
     person_sql = f"MIN({_p(person[1])}::text)" if person else "NULL::text"
-    return "\n".join(
-        [
-            _comment(
-                f"visit id map: one visit_occurrence_id per distinct {vk.table}.{_norm(vk.expression)}.\n"
-                "Kept across runs like the person id map: only new keys are added, numbered after the\n"
-                "largest existing visit_occurrence_id in key order; keys that do not become a visit are\n"
-                "removed by the pruning step after the visit_occurrence load."
-            ),
-            "INSERT INTO {etl}.visit_map (source_value, visit_occurrence_id, person_source_value)",
-            "SELECT k.source_value,",
-            "    ((SELECT COALESCE(MAX(visit_occurrence_id), 0) FROM {etl}.visit_map)"
-            " + ROW_NUMBER() OVER (ORDER BY k.source_value))::integer,",
-            "    k.person_source_value",
-            "FROM (",
-            f"    SELECT {_p(vk.expression)}::text AS source_value, {person_sql} AS person_source_value",
-            f"    FROM {source_ref(vk.table)} {alias}",
-            f"    WHERE {_p(vk.expression)} IS NOT NULL",
-            "    GROUP BY 1",
-            ") k",
-            "WHERE NOT EXISTS (SELECT 1 FROM {etl}.visit_map vm WHERE vm.source_value = k.source_value)",
-            "ON CONFLICT DO NOTHING;",
-        ]
-    )
+    keys = [
+        f"SELECT {_p(vk.expression)}::text AS source_value, {person_sql} AS person_source_value",
+        f"FROM {source_ref(vk.table)} {alias}",
+        f"WHERE {_p(vk.expression)} IS NOT NULL",
+        "GROUP BY 1",
+    ]
+    return _id_map_statements("visit_map", "visit_occurrence_id", keys, (
+        f"visit id map: one visit_occurrence_id per distinct {vk.table}.{_norm(vk.expression)}.\n"
+        "Kept across runs like the person id map; keys that do not become a visit are retired, with\n"
+        "their id, by the pruning step after the visit_occurrence load. person_source_value is a first\n"
+        "guess from the visit table: that step records the person each visit was loaded for."
+    ))
 
 
-def _visit_map_prune_sql() -> str:
-    return "\n".join(
-        [
-            _comment(
-                "visit id map: drop the keys that did not become a visit (filtered out by the\n"
-                "visit_occurrence mapping, or visits of people who were not loaded), so events that refer\n"
-                "to them get a NULL visit_occurrence_id instead of an id missing from visit_occurrence.\n"
-                "Skipped by the runner when a visit_occurrence load failed."
-            ),
-            "DELETE FROM {etl}.visit_map vm",
-            "WHERE NOT EXISTS (SELECT 1 FROM {cdm}.visit_occurrence v"
-            " WHERE v.visit_occurrence_id = vm.visit_occurrence_id);",
-        ]
-    )
+def _visit_map_prune_sql() -> list[str]:
+    """The statements of the visit id-map pruning step."""
+    refresh = [
+        _comment(
+            "visit id map: 1) record the person each loaded visit belongs to, so links follow the\n"
+            "   source when a visit key moves to another person between extracts (the entry is\n"
+            "   replaced: the ETL role has no UPDATE)"
+        ),
+        "WITH moved AS (",
+        "    DELETE FROM {etl}.visit_map vm",
+        "    USING {cdm}.visit_occurrence v, {etl}.person_map pm",
+        "    WHERE v.visit_occurrence_id = vm.visit_occurrence_id",
+        "      AND pm.person_id = v.person_id",
+        "      AND vm.person_source_value IS DISTINCT FROM pm.source_value",
+        "    RETURNING vm.source_value, vm.visit_occurrence_id, pm.source_value AS person_source_value",
+        ")",
+        "INSERT INTO {etl}.visit_map (source_value, visit_occurrence_id, person_source_value)",
+        "SELECT source_value, visit_occurrence_id, person_source_value FROM moved;",
+    ]
+    retire = [
+        _comment(
+            "2) retire the keys that did not become a visit (filtered out by the visit_occurrence\n"
+            "   mapping, visits of people who were not loaded, or a failed load), so events that refer\n"
+            "   to them get a NULL visit_occurrence_id instead of an id missing from visit_occurrence.\n"
+            "   A retired key keeps its id in visit_map_retired and gets it back when it becomes a visit\n"
+            "   again."
+        ),
+        "WITH gone AS (",
+        "    DELETE FROM {etl}.visit_map vm",
+        "    WHERE NOT EXISTS (SELECT 1 FROM {cdm}.visit_occurrence v"
+        " WHERE v.visit_occurrence_id = vm.visit_occurrence_id)",
+        "    RETURNING vm.source_value, vm.visit_occurrence_id, vm.person_source_value",
+        ")",
+        "INSERT INTO {etl}.visit_map_retired (source_value, visit_occurrence_id, person_source_value)",
+        "SELECT source_value, visit_occurrence_id, person_source_value FROM gone",
+        "ON CONFLICT DO NOTHING;",
+    ]
+    return ["\n".join(refresh), "\n".join(retire)]
 
 
 def _observation_period_sql(spec: ETLSpec, loaded: list[str]) -> str | None:
@@ -624,11 +681,14 @@ def compile_spec(
     steps: list[CompiledStep] = []  # names are assigned at the end
 
     # 1. the id maps, before every insert
-    steps.append(CompiledStep("person_map", None, "id_map", _person_map_sql(spec.person_key),
+    pm = _person_map_sql(spec.person_key)
+    steps.append(CompiledStep("person_map", None, "id_map", "\n".join(pm), statements=tuple(pm),
                               source_table=spec.person_key.table, origins=(spec.person_key,), slot=(-1, 0, 0)))
     if spec.visit_key is not None:
         person_from = _visit_person_mapping(spec)
-        steps.append(CompiledStep("visit_map", None, "id_map", _visit_map_sql(spec), source_table=spec.visit_key.table,
+        vm = _visit_map_sql(spec)
+        steps.append(CompiledStep("visit_map", None, "id_map", "\n".join(vm), statements=tuple(vm),
+                                  source_table=spec.visit_key.table,
                                   origins=(spec.visit_key,) + ((person_from,) if person_from else ()), slot=(-1, 0, 1)))
 
     # 2. the spec's writers, each at its table's slot: the mappings in spec order, then the custom SQL
@@ -656,14 +716,16 @@ def compile_spec(
         steps.append(_custom_step(cs, slot=(_load_index(t), 0, seq)))
 
     # 3. the steps the build generates: prune each id map after the last writer of its table,
-    #    before the events
+    #    before the events. Pruning always runs, also after a failed load: it only retires keys,
+    #    and they get their ids back on the next build that loads them
     written = {s.target_table for s in steps if s.kind in ("insert", "custom")}
     if "person" in written:
-        steps.append(CompiledStep("person_map_prune", None, "prune", _person_map_prune_sql(), requires="person",
+        steps.append(CompiledStep("person_map_prune", None, "prune", _person_map_prune_sql(),
                                   slot=(_load_index("person"), 1, 0)))
     if spec.visit_key is not None and "visit_occurrence" in written:
-        steps.append(CompiledStep("visit_map_prune", None, "prune", _visit_map_prune_sql(),
-                                  requires="visit_occurrence", slot=(_load_index("visit_occurrence"), 1, 0)))
+        vp = _visit_map_prune_sql()
+        steps.append(CompiledStep("visit_map_prune", None, "prune", "\n".join(vp), statements=tuple(vp),
+                                  slot=(_load_index("visit_occurrence"), 1, 0)))
 
     if spec.observation_period == "from_events":
         loaded = [t for t in target_tables(spec) if t != "observation_period"]

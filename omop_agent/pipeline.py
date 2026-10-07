@@ -219,7 +219,7 @@ class Pipeline:
 
         def run() -> None:
             create_cdm_tables(self.conn, self.schemas, include_vocab=True)
-            create_etl_tables(self.conn, self.schemas)
+            create_etl_tables(self.conn, self.schemas, self.cfg.target.etl_role)
             self.conn.commit()
             if self.cfg.vocabulary.athena_dir:
                 counts = load_athena(self.conn, self.schemas, self.cfg.vocabulary.athena_dir, self.ws, force=force)
@@ -370,8 +370,7 @@ class Pipeline:
 
         def run() -> ETLRunResult:
             result = run_etl(self.conn, self.schemas, spec or self.validated_spec(), self.cfg, self.ws)
-            loaded = sum(s.rows_inserted for s in result.steps if s.error is None)
-            self.log(f"  {len(result.steps)} steps, {loaded} rows loaded, {len(result.errors())} errors")
+            self.log(f"  {len(result.steps)} steps, {result.rows_loaded()} rows loaded, {len(result.errors())} errors")
             for s in result.errors():
                 self.log(f"  ✗ {s.step}: {s.error}")
             return result
@@ -604,7 +603,7 @@ class _BuildHistory:
 
     @staticmethod
     def _rows(etl: ETLRunResult) -> dict[str, int]:
-        """Rows loaded per CDM table (the id maps are append-only, so a rebuild adds none to them)."""
+        """Rows loaded per CDM table (the id-map and pruning steps write no CDM table and are left out)."""
         from .cdm.spec import load_cdm_spec
 
         cdm = load_cdm_spec()

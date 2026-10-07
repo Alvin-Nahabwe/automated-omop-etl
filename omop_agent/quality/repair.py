@@ -453,7 +453,10 @@ def cdm_column_denial(state: RepairState, table: str, column: str) -> str | None
 
 LOGICAL_SCHEMAS = ("src", "cdm", "vocab", "etl")
 ETL_COUNTABLE = ("source_to_concept_map",)
-ETL_DENIED = ("person_map", "visit_map")
+ETL_DENIED = ("person_map", "visit_map", "person_map_retired", "visit_map_retired")
+# ETL tables that only generated steps use. Their columns are generic words ('name', 'value') that
+# spec SQL never names, so redact_error does not treat them as identifiers.
+_ETL_BOOKKEEPING = ("id_high_water", "build_facts")
 
 
 @lru_cache(maxsize=1)
@@ -675,8 +678,11 @@ def _static_identifiers() -> frozenset[str]:
     names = {t.name for t in cdm.tables.values()} | {f.name for t in cdm.tables.values() for f in t.fields}
     names |= {f"xpk_{t.name}" for t in cdm.tables.values()}  # official primary key constraint names
     for table, ddl in ETL_TABLES.items():
-        names |= {table, f"{table}_pkey"} | set(re.findall(r"^\s+(\w+)\s", ddl, re.M))
-    names |= {"person_map_person_id_key", "visit_map_visit_occurrence_id_key"}
+        names |= {table, f"{table}_pkey"}
+        if table not in _ETL_BOOKKEEPING:
+            names |= set(re.findall(r"^\s+(\w+)\s", ddl, re.M))
+    names |= {"person_map_person_id_key", "visit_map_visit_occurrence_id_key",
+              "person_map_retired_person_id_key", "visit_map_retired_visit_occurrence_id_key"}
     return frozenset(n.lower() for n in names)
 
 

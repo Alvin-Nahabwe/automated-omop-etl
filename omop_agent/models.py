@@ -484,6 +484,11 @@ class ETLRunResult(BaseModel):
         """The failed steps that fail the build."""
         return [s for s in self.steps if s.error and s.blocking]
 
+    def rows_loaded(self) -> int:
+        """Rows the steps without an error wrote to the CDM. The id-map and pruning steps write only
+        the id maps (new and retired keys) and are left out."""
+        return sum(s.rows_inserted for s in self.steps if s.error is None and s.kind not in ("id_map", "prune"))
+
 
 class RepairAction(BaseModel):
     iteration: int
