@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -94,8 +95,9 @@ def test_step_order_and_targets():
     # or drop (per field, and the dropped rows), the generated steps count nothing
     assert all(s.blocking and s.returns == "rowcount" for s in steps)
     assert all(s.count_sites == () for s in steps if s.kind != "insert")
+    # and the tolerant conversions count the values they cannot read, per field
     assert step(steps, "visit_occurrence").count_sites == (
-        "visit_concept_id", "visit_start_date", "visit_end_date", "visit_type_concept_id", "row")
+        "visit_concept_id", "visit_start_date", "visit_start_datetime", "visit_end_date", "visit_type_concept_id", "row")
     assert step(steps, "death").count_sites == ("death_date", "row")
     assert all("\n".join(s.statements) == s.sql for s in steps)
     assert [s.label for s in steps if len(s.statements) > 1] == ["person_map", "visit_map", "visit_map_prune"]
@@ -192,8 +194,14 @@ def test_casts_and_person_join():
     assert "INSERT INTO cdm.person (" in sql
     assert "INNER JOIN etl.person_map pm1 ON pm1.source_value = (i.individual_id)::text" in sql
     assert "(pm1.person_id)::integer AS person_id,  -- person_id" in sql
-    assert "(CASE i.sex WHEN '1' THEN 8507 WHEN '2' THEN 8532 ELSE 0 END)::integer AS gender_concept_id" in sql
-    assert "(to_date(i.dob, 'DD/MM/YYYY')::timestamp)::timestamp AS birth_datetime" in sql
+    # expression values convert to the CDM type tolerantly (an integer converts as itself), and so
+    # do the casts and to_date calls inside them; a constant keeps its cast
+    assert ("etl.omop_as_integer_at('gender_concept_id', 'reject', (CASE i.sex WHEN '1' THEN 8507 WHEN '2' THEN 8532"
+            " ELSE 0 END)) AS gender_concept_id") in sql
+    assert ("etl.omop_as_timestamp_at('birth_datetime', 'birth', etl.omop_as_date_at('birth_datetime', 'birth', i.dob,"
+            " 'DD/MM/YYYY')) AS birth_datetime") in sql
+    assert ("etl.omop_as_integer_at('year_of_birth', 'year', (EXTRACT(YEAR FROM etl.omop_as_date_at('year_of_birth',"
+            " 'year', i.dob, 'DD/MM/YYYY'))::int)) AS year_of_birth") in sql
     assert "LEFT((i.individual_id)::text, 50) AS person_source_value" in sql
     assert "(0)::integer AS race_concept_id,  -- constant" in sql
     # unmapped CDM fields are left out of the column list
@@ -211,7 +219,7 @@ def test_visit_joins_and_auto_id():
         " + ROW_NUMBER() OVER ())::integer AS condition_occurrence_id" in co
     )
     de = compile_table(spec.mapping_for("drug_exposure"), spec, S)
-    assert "(p.qty::numeric)::numeric AS quantity" in de
+    assert "etl.omop_as_number_at('quantity', 'reject', p.qty) AS quantity" in de
 
 
 def test_vocab_code_lookup_and_null_semantics():
@@ -411,7 +419,7 @@ def test_trailing_comment_in_expression_is_safe():
     spec = set_field(load_ref(), "person", "year_of_birth",
                      expression="EXTRACT(YEAR FROM to_date(i.dob, 'DD/MM/YYYY'))::int -- day-first dates")
     sql = compile_table(spec.mapping_for("person"), spec, S)
-    assert "-- day-first dates\n)::integer AS year_of_birth" in sql
+    assert "::int -- day-first dates\n)) AS year_of_birth" in sql
 
 
 def test_compiled_insert_shape():
@@ -423,8 +431,12 @@ def test_compiled_insert_shape():
     one, two = sql.index("-- 1) the source rows"), sql.index("-- 2) required values that are NULL")
     assert sql.index("INSERT INTO cdm.visit_occurrence (") < sql.index("\nSELECT\n    s.visit_occurrence_id,") < two < one
     assert sql.count("OFFSET 0") == 2 and sql.rstrip().endswith(") s;")
-    # layer 1 computes every value from the source once, with today's casts
-    assert "            (v.discharge_date::date)::date AS visit_end_date,  -- expression\n" in sql
+    # layer 1 computes every value from the source once, with tolerant conversions (a start date
+    # reads an unknown day as the first, an end date as the last); a constant keeps its cast
+    assert ("            etl.omop_as_date_at('visit_start_date', 'first', v.visit_date) AS visit_start_date,"
+            "  -- expression\n") in sql
+    assert ("            etl.omop_as_date_at('visit_end_date', 'last', v.discharge_date) AS visit_end_date,"
+            "  -- expression\n") in sql
     assert "            (32817)::integer AS visit_type_concept_id,  -- constant\n" in sql
     # layer 2: a NULL required concept becomes 0, a NULL end the start, and a NULL start drops the
     # row; each counted, and only on the NULL branch
@@ -437,7 +449,8 @@ def test_compiled_insert_shape():
             "    OFFSET 0\n) s;") in sql
     # optional fields, id-map values and the lookups' codes pass through
     assert "        v.visit_start_datetime,\n" in sql and "        v.person_id,\n" in sql
-    assert vo.count_sites == ("visit_concept_id", "visit_start_date", "visit_end_date", "visit_type_concept_id", "row")
+    assert vo.count_sites == (
+        "visit_concept_id", "visit_start_date", "visit_start_datetime", "visit_end_date", "visit_type_concept_id", "row")
 
     # an end date without a start date to take is dropped instead
     tm = set_field(spec, "drug_exposure", "drug_exposure_start_date", kind="null").mapping_for("drug_exposure")
@@ -461,7 +474,7 @@ def test_compiled_insert_shape():
     # the observation period end ('open') is left as written until periods are merged
     op = _compile(spec.mapping_for("observation_period"), spec)
     assert "observation_period_end_date" not in op.required and op.count_sites == (
-        "observation_period_start_date", "period_type_concept_id", "row")
+        "observation_period_start_date", "observation_period_end_date", "period_type_concept_id", "row")
     assert "        v.observation_period_end_date,\n" in op.insert
 
     # no required field computed from the source: no layer 2
@@ -471,6 +484,38 @@ def test_compiled_insert_shape():
     c = _compile(loc, spec)
     assert (c.required, c.count_sites) == ({}, ()) and "-- 2)" not in c.insert and c.insert.count("OFFSET 0") == 1
     assert "    s.city\nFROM (\n    -- 1) the source rows" in c.insert
+
+
+def test_conversions_in_the_compiled_sql():
+    from omop_agent.config import EtlConfig
+
+    spec = load_ref()
+    steps = compile_spec(spec, S)
+    person = step(steps, "person")
+    # key and lookup expressions stay as written (join keys); constants keep their cast
+    assert "INNER JOIN etl.person_map pm1 ON pm1.source_value = (i.individual_id)::text" in person.sql
+    assert "(0)::integer AS race_concept_id,  -- constant" in person.sql
+    # THEMIS for the birth fields, the widest interval for start / end dates, the 15th elsewhere
+    assert "etl.omop_as_date_at('month_of_birth', 'month', i.dob, 'DD/MM/YYYY')" in person.sql
+    assert "etl.omop_as_date_at('day_of_birth', 'reject', i.dob, 'DD/MM/YYYY')" in person.sql
+    op = step(steps, "observation_period")
+    assert "etl.omop_as_date_at('observation_period_start_date', 'first', r.start_date)" in op.sql
+    assert "etl.omop_as_date_at('observation_period_end_date', 'last', r.end_date)" in op.sql
+    assert "etl.omop_as_date_at('measurement_date', 'mid', r.test_date)" in step(steps, "measurement").sql
+    # etl.partial_dates: reject leaves only the birth and death rules
+    strict = compile_spec(spec, S, etl=EtlConfig(partial_dates="reject"))
+    assert "etl.omop_as_date_at('observation_period_start_date', 'reject', r.start_date)" in step(strict,
+                                                                                                  "observation_period").sql
+    assert "etl.omop_as_date_at('month_of_birth', 'month', i.dob, 'DD/MM/YYYY')" in step(strict, "person").sql
+    # a strftime template never reads right: the mapping does not compile
+    bad = set_field(spec, "person", "birth_datetime", expression="to_date(i.dob, '%d/%m/%Y')::timestamp")
+    with pytest.raises(CompileError, match="person.birth_datetime: unsupported date template '%d/%m/%Y'"):
+        compile_spec(bad, S)
+    bad = spec.model_copy(deep=True)
+    bad.mapping_for("death").where = "to_date(x.dod, '%Y') IS NOT NULL"
+    with pytest.raises(CompileError, match="death where: unsupported date template"):
+        compile_spec(bad, S)
+    assert any(s.error and "strftime" in s.error for s in compile_spec(bad, S, strict=False))
 
 
 def test_required_null_policy_follows_the_cdm():
@@ -1076,6 +1121,194 @@ def test_counters_are_per_source_row(staged):
 
 
 @pytest.mark.postgres
+def test_bad_value_does_not_abort_table(staged):
+    from omop_agent.quality.checks import etl_checks
+
+    conn, schemas, cfg = staged
+    src = schemas.src
+    # unreadable values: a visit date that is no date, a lab date with a day that does not exist, a
+    # quantity with text in it, a days_supply that is not a number
+    execute(conn, f"UPDATE {src}.clinic_visits SET visit_date = '2019-13-01' WHERE visit_id IN "
+                  f"(SELECT visit_id FROM {src}.clinic_visits ORDER BY visit_id LIMIT 3)")
+    execute(conn, f"UPDATE {src}.lab_results SET test_date = '2019-02-30' WHERE ctid IN "
+                  f"(SELECT ctid FROM {src}.lab_results WHERE individual_id IN (SELECT individual_id FROM "
+                  f"{src}.individuals) ORDER BY test_date LIMIT 4)")
+    execute(conn, f"UPDATE {src}.prescriptions SET qty = '2 tabs', days = 'NaN' WHERE ctid IN "
+                  f"(SELECT ctid FROM {src}.prescriptions ORDER BY date_prescribed LIMIT 5)")
+    conn.commit()
+    result = run_etl(conn, schemas, fixed_ref(), cfg)
+    assert result.ok and result.errors() == [], [(e.step, e.error) for e in result.errors()]
+    by = {step_label(r.step): r for r in result.steps}
+    vo, m, de = by["visit_occurrence"], by["measurement"], by["drug_exposure"]
+    visits = int(scalar(conn, f"SELECT COUNT(*) FROM {src}.clinic_visits"))
+    # the visits without a readable start date are dropped and counted; the others load
+    assert vo.value_counts["invalid"]["visit_start_date"] == 3 and vo.value_counts["row"] == {"dropped": 3}
+    assert vo.value_counts["required_null"] == {"visit_start_date": 3}
+    assert count(conn, schemas, "visit_occurrence") == vo.rows_inserted == visits - 3 == vo.retained_rows
+    assert m.value_counts["invalid"] == {"measurement_date": 4} and m.value_counts["row"] == {"dropped": 4}
+    # optional values are loaded as NULL; the end date computed from an unreadable days is the start date
+    assert de.value_counts["invalid"] == {"quantity": 5, "days_supply": 5, "drug_exposure_end_date": 5}
+    assert count(conn, schemas, "drug_exposure", "quantity IS NULL") == 5
+    assert count(conn, schemas, "drug_exposure", "days_supply IS NULL") == 5
+    checks = {r.key: r for r in etl_checks(result)}
+    assert checks["etlInvalidValue.visit_occurrence.visit_start_date"].severity == "convention"
+    assert checks["etlInvalidValue.drug_exposure.quantity"].severity == "characterization"
+    assert checks["etlInvalidValue.measurement.measurement_date"].num_violated_rows == 4
+
+
+@pytest.mark.postgres
+def test_where_is_counted_in_the_insert_and_not_in_the_counts(staged):
+    conn, schemas, cfg = staged
+    src = schemas.src
+    execute(conn, f"UPDATE {src}.clinic_visits SET visit_date = 'unknown' WHERE visit_id IN "
+                  f"(SELECT visit_id FROM {src}.clinic_visits ORDER BY visit_id LIMIT 2)")
+    conn.commit()
+    spec = fixed_ref().model_copy(deep=True)
+    spec.mapping_for("visit_occurrence").where = "v.visit_date::date >= DATE '2015-01-01'"
+    steps = compile_spec(spec, schemas, etl=cfg.etl)
+    vo = next(s for s in steps if s.label == "visit_occurrence")
+    # counted at site 'where' in the INSERT; uncounted (parallel safe) in the count queries
+    assert f"WHERE ({schemas.etl}.omop_as_date_at('where', 'mid', v.visit_date) >= DATE '2015-01-01')" in vo.sql
+    assert vo.source_count_sql.endswith(f"WHERE ({schemas.etl}.try_date(v.visit_date, 'ISO', 'mid') >= DATE '2015-01-01')")
+    assert "omop_as" not in vo.retained_count_sql and "where" in vo.count_sites
+    result = run_etl(conn, schemas, spec, cfg)
+    assert result.ok, [(e.step, e.error) for e in result.errors()]
+    r = next(s for s in result.steps if s.target_table == "visit_occurrence")
+    # the WHERE read the two values as unknown and left the rows out; the counts use the same filter
+    assert r.value_counts == {"invalid": {"where": 2}}
+    visits = int(scalar(conn, f"SELECT COUNT(*) FROM {src}.clinic_visits"))
+    assert r.source_rows == r.retained_rows == r.rows_inserted == visits - 2
+    # but those rows are lost records, not filtered ones: the retention checks count them
+    from omop_agent.quality.checks import etl_checks, gate
+
+    checks = {c.key: c for c in etl_checks(result, etl=cfg.etl)}
+    kept = checks["etlRecordRetention.visit_occurrence"]
+    assert (kept.num_violated_rows, kept.num_denominator_rows) == (2, visits)
+    # a WHERE that can read none of its values empties the table: the gate fails
+    execute(conn, f"UPDATE {src}.clinic_visits SET visit_date = to_char(visit_date::date, 'DD/MM/YYYY') "
+                  "WHERE visit_date <> 'unknown'")
+    conn.commit()
+    result = run_etl(conn, schemas, spec, cfg)
+    r = next(s for s in result.steps if s.target_table == "visit_occurrence")
+    assert r.rows_inserted == 0 and r.source_rows == 0
+    checks = list(etl_checks(result, cfg.quality.min_record_retention_pct, cfg.etl))
+    assert any(c.key == "etlRecordLoss.visit_occurrence" and c.failed for c in checks)
+    passed, blocking = gate(checks, cfg, result)
+    assert not passed and any("etlRecordLoss.visit_occurrence" in b for b in blocking)
+    # the vocabulary stage reads the same rows
+    from omop_agent.vocab.evaluate import source_from_sql
+
+    assert "WHERE ({etl}.try_date(v.visit_date, 'ISO', 'mid') >= DATE '2015-01-01')" in source_from_sql(
+        spec.mapping_for("visit_occurrence"))
+
+
+@pytest.mark.postgres
+def test_invalid_values_are_counted_per_source_row(staged):
+    conn, schemas, cfg = staged
+    src = schemas.src
+    # 'HB' maps to two concepts, so each HB result is inserted twice; the unreadable dates of HB
+    # results are still counted once each
+    execute(conn, f"""INSERT INTO {schemas.etl}.source_to_concept_map (source_code, source_vocabulary_id, target_concept_id)
+        VALUES ('HB', 'SRC_LAB', 2000004001), ('HB', 'SRC_LAB', 2000004002)""")
+    execute(conn, f"UPDATE {src}.lab_results SET test_date = '31/02/2019' WHERE test = 'HB' AND right(individual_id, 1) = '1'")
+    conn.commit()
+    result = run_etl(conn, schemas, fixed_ref(), cfg)
+    assert result.ok
+    bad = int(scalar(conn, f"""SELECT COUNT(*) FROM {src}.lab_results r JOIN {schemas.etl}.person_map pm
+        ON pm.source_value = r.individual_id WHERE r.test_date = '31/02/2019'"""))
+    m = next(s for s in result.steps if s.target_table == "measurement")
+    assert bad > 0 and m.value_counts["invalid"] == {"measurement_date": bad}
+    assert m.value_counts["row"] == {"dropped": bad} and m.retained_rows == m.id_retained_rows - bad
+
+
+@pytest.mark.postgres
+def test_partial_birth_and_death_dates(staged):
+    conn, schemas, cfg = staged
+    src = schemas.src
+    people = [r["individual_id"] for r in fetch_all(conn, f"""SELECT i.individual_id FROM {src}.individuals i
+        WHERE EXISTS (SELECT 1 FROM {src}.deaths d WHERE d.individual_id = i.individual_id)
+        ORDER BY 1 LIMIT 3""")]
+    assert len(people) == 3
+    a, b, c = people
+    execute(conn, f"UPDATE {src}.individuals SET dob = '00/06/1975' WHERE individual_id = %s", (a,))  # month, no day
+    execute(conn, f"UPDATE {src}.individuals SET dob = '00/00/1980' WHERE individual_id = %s", (b,))  # a year only
+    execute(conn, f"UPDATE {src}.deaths SET dod = '2019-00-00' WHERE individual_id = %s", (a,))
+    execute(conn, f"UPDATE {src}.deaths SET dod = '2020-02-00' WHERE individual_id = %s", (b,))
+    execute(conn, f"UPDATE {src}.deaths SET dod = '9999-00-00' WHERE individual_id = %s", (c,))  # nothing known
+    conn.commit()
+    spec = set_field(fixed_ref(), "person", "birth_datetime", expression="to_date(i.dob, 'DD/MM/YYYY')::timestamp")
+    result = run_etl(conn, schemas, spec, cfg)
+    assert result.ok, [(e.step, e.error) for e in result.errors()]
+    rows = {r["person_source_value"]: r for r in fetch_all(conn, f"""SELECT person_source_value, year_of_birth,
+        month_of_birth, day_of_birth, birth_datetime FROM {schemas.cdm}.person WHERE person_source_value = ANY(%s)""",
+        ([a, b],))}
+    # THEMIS: the known year and month are kept, a missing day is the 1st; a year alone gives no birth_datetime
+    from datetime import datetime as dt
+
+    assert (rows[a]["year_of_birth"], rows[a]["month_of_birth"], rows[a]["day_of_birth"]) == (1975, 6, None)
+    assert rows[a]["birth_datetime"] == dt(1975, 6, 1)
+    assert (rows[b]["year_of_birth"], rows[b]["month_of_birth"], rows[b]["day_of_birth"]) == (1980, None, None)
+    assert rows[b]["birth_datetime"] is None
+    person = next(s for s in result.steps if s.target_table == "person")
+    assert person.value_counts["imputed"] == {"birth_datetime": 1}
+    assert person.value_counts["partial_null"] == {"birth_datetime": 1, "day_of_birth": 2, "month_of_birth": 1}
+    # a death date takes the last day of the known period; with nothing known the row is dropped
+    deaths = {r["person_source_value"]: r["death_date"] for r in fetch_all(conn, f"""SELECT p.person_source_value,
+        d.death_date FROM {schemas.cdm}.death d JOIN {schemas.cdm}.person p ON p.person_id = d.person_id""")}
+    assert deaths[a] == date(2019, 12, 31) and deaths[b] == date(2020, 2, 29) and c not in deaths
+    death = next(s for s in result.steps if s.target_table == "death")
+    assert death.value_counts["imputed"] == {"death_date": 2} and death.value_counts["invalid"] == {"death_date": 1}
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("zone", [None, "Africa/Nairobi"])
+def test_offsets_and_the_site_time_zone(staged, zone):
+    from datetime import datetime as dt
+
+    from omop_agent.config import EtlConfig
+
+    conn, schemas, cfg = staged
+    src = schemas.src
+    cfg = cfg.model_copy(update={"etl": EtlConfig(timezone=zone)})
+    v1, v2, v3 = [r["visit_id"] for r in fetch_all(conn, f"SELECT visit_id FROM {src}.clinic_visits ORDER BY 1 LIMIT 3")]
+    execute(conn, f"UPDATE {src}.clinic_visits SET visit_date = '2020-01-01T23:30:00Z' WHERE visit_id = %s", (v1,))
+    execute(conn, f"UPDATE {src}.clinic_visits SET visit_date = '2020-01-01T23:30:00+03:00' WHERE visit_id = %s", (v2,))
+    execute(conn, f"UPDATE {src}.clinic_visits SET visit_date = '2020-01-01 23:30' WHERE visit_id = %s", (v3,))
+    conn.commit()
+    spec = set_field(fixed_ref(), "visit_occurrence", "visit_end_datetime", kind="expression",
+                     expression="(v.visit_date::timestamptz AT TIME ZONE 'Africa/Nairobi')")
+    result = run_etl(conn, schemas, spec, cfg)
+    assert result.ok, [(e.step, e.error) for e in result.errors()]
+    visits = {r["visit_source_value"]: r for r in fetch_all(conn, f"""SELECT m.source_value AS visit_source_value,
+        v.visit_start_date, v.visit_start_datetime, v.visit_end_datetime FROM {schemas.cdm}.visit_occurrence v
+        JOIN {schemas.etl}.visit_map m ON m.visit_occurrence_id = v.visit_occurrence_id WHERE m.source_value = ANY(%s)""",
+        ([v1, v2, v3],))}
+    vo = next(s for s in result.steps if s.target_table == "visit_occurrence")
+    if zone is None:
+        # unset: an offset is ignored, the wall clock kept as written, and counted unless it is the
+        # session zone's own (the server's zone: honouring it would have changed nothing)
+        assert [visits[v]["visit_start_datetime"] for v in (v1, v2, v3)] == [dt(2020, 1, 1, 23, 30)] * 3
+        assert [visits[v]["visit_start_date"] for v in (v1, v2, v3)] == [date(2020, 1, 1)] * 3
+        n = scalar(conn, "SELECT count(*) FROM unnest(ARRAY['2020-01-01T23:30:00Z', '2020-01-01T23:30:00+03:00']) x "
+                         "WHERE x::timestamptz <> x::timestamp::timestamptz")
+        assert n >= 1
+        assert {k: n for k, n in vo.value_counts.get("offset_ignored", {}).items() if k.startswith("visit_start")} == {
+            "visit_start_date": n, "visit_start_datetime": n}
+    else:
+        # set: converted to the site's zone ('Z' 23:30 is 02:30 the next day in Nairobi) and counted;
+        # the zone's own offset (+03:00) changes nothing and is not counted
+        assert [visits[v]["visit_start_datetime"] for v in (v1, v2, v3)] == [
+            dt(2020, 1, 2, 2, 30), dt(2020, 1, 1, 23, 30), dt(2020, 1, 1, 23, 30)]
+        assert [visits[v]["visit_start_date"] for v in (v1, v2, v3)] == [date(2020, 1, 2), date(2020, 1, 1),
+                                                                         date(2020, 1, 1)]
+        assert {k: n for k, n in vo.value_counts["offset_converted"].items() if k.startswith("visit_start")} == {
+            "visit_start_date": 1, "visit_start_datetime": 1}
+    # the AT TIME ZONE idiom reads the instant, whatever the setting: as the hard cast did
+    assert visits[v1]["visit_end_datetime"] == dt(2020, 1, 2, 2, 30)
+    assert visits[v2]["visit_end_datetime"] == dt(2020, 1, 1, 23, 30)
+
+
+@pytest.mark.postgres
 def test_etl_functions_are_installed_once_per_version(staged):
     from datetime import datetime
 
@@ -1256,11 +1489,12 @@ def test_session_sql():
 
     from omop_agent.config import CdmSourceConfig, EtlConfig
 
-    # without a configured zone the session keeps the server's
+    # without a configured zone the session keeps the server's, and offsets are not converted
     assert session_sql() == [
         "SET LOCAL datestyle = 'ISO, YMD';",
         "SET LOCAL standard_conforming_strings = on;",
-        "SELECT set_config('omop_agent.imputation_cap', CURRENT_DATE::text, true);",
+        "SELECT set_config('omop_agent.imputation_cap', CURRENT_DATE::text, true),"
+        " set_config('omop_agent.timezone', '', true);",
     ]
     cfg = make_test_config().model_copy(update={
         "etl": EtlConfig(timezone="Africa/Nairobi"),
@@ -1268,7 +1502,8 @@ def test_session_sql():
     })
     assert session_sql(cfg)[2:] == [
         "SET LOCAL timezone = 'Africa/Nairobi';",
-        "SELECT set_config('omop_agent.imputation_cap', '2023-12-31', true);",
+        "SELECT set_config('omop_agent.imputation_cap', '2023-12-31', true),"
+        " set_config('omop_agent.timezone', 'Africa/Nairobi', true);",
     ]
 
 

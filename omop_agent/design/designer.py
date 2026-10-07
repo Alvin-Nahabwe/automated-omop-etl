@@ -22,7 +22,7 @@ import psycopg
 import yaml
 
 from ..cdm.spec import load_cdm_spec
-from ..config import ProjectConfig
+from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, fetch_all, qi, short_error
 from ..llm import LLMClient, LLMUnavailable
 from ..models import (
@@ -90,9 +90,12 @@ appear in the reference list; anything else must come from a lookup (concept_map
 vocab_code), never from memory.
 - Keep the verbatim source value in the matching *_source_value field, and fill \
 *_source_concept_id from the source vocabulary when a vocab_code lookup is used (0 otherwise).
-- Required fields must never be NULL. When a required date can be missing in the source, \
-derive a sensible fallback (for example an end date equal to the start date) and say so in \
-the rationale.
+- Required fields: when a required value can be missing or unreadable, the build applies the \
+CDM convention and counts it: a required concept becomes 0; visit_end_date, \
+visit_detail_end_date and drug_exposure_end_date fall back to the start date; rows without a \
+required start date, birth year or death date are dropped. Write an explicit fallback when the \
+source offers a better one (for example start + days_supply - 1 for drug_exposure_end_date) \
+and say so in the rationale.
 - Observation periods are the spans during which a person's events would be recorded. Use a \
 source table of enrollment, residency or follow-up episodes when one exists; otherwise derive \
 them from the events.
@@ -106,12 +109,22 @@ reviewer needs into the rationale fields, briefly.
 
 STAGING_CONVENTIONS = """\
 Staging conventions for the SQL you write:
-- Every source table has been copied to schema {src} with all columns typed text. Cast \
-explicitly: ::date or ::timestamp for ISO dates (YYYY-MM-DD), ::integer or ::numeric for \
-numbers. For any other date format the profile shows the PostgreSQL template to use, for \
-example "format %d/%m/%Y (PostgreSQL: to_date(x, 'DD/MM/YYYY'))": write to_date(x, \
-'DD/MM/YYYY'). Never pass a strftime pattern such as '%d/%m/%Y' to to_date or to_timestamp: \
-PostgreSQL does not reject it and silently returns a wrong date.
+- Every source table has been copied to schema {src} with all columns typed text. Convert \
+explicitly: ::date or ::timestamp for ISO dates (YYYY-MM-DD; the year-first YYYYMMDD and \
+YYYY/MM/DD read too), ::integer or ::numeric for numbers. For any other date format the profile \
+shows the PostgreSQL template to use, for example "format %d/%m/%Y (PostgreSQL: to_date(x, \
+'DD/MM/YYYY'))": write to_date(x, 'DD/MM/YYYY'); a ::date cast reads none of the values of such \
+a column. Never pass a strftime pattern such as '%d/%m/%Y' to to_date or to_timestamp: \
+PostgreSQL does not reject it and silently returns a wrong date, so the validator rejects it.
+- The build reads these conversions tolerantly: a value that cannot be read (31/02/2019, \
+'unknown', a number with text in it) becomes NULL and is counted per field, instead of failing \
+the whole table. Do not add regex guards only to avoid cast errors; do guard columns that \
+legitimately mix numbers and text (lab results), so that the text goes to value_as_string. \
+Casts in join conditions and in person_id, visit_id, vocab_code and concept_map expressions are \
+keys and are evaluated as written: where such a value can be unreadable, use \
+{etl}.try_date(x, 'DD/MM/YYYY') (or try_timestamp, try_integer, try_number), which gives NULL.
+- <PARTIAL_DATES>
+- <OFFSETS>
 - Empty source values were loaded as NULL.
 - Refer to columns through the aliases you declare in source.alias and joins[].alias (for \
 example v.visit_date::date). Join other source tables by their bare name, and vocabulary or \
@@ -220,8 +233,35 @@ def _notes_text(annotations: SourceAnnotations | None) -> str:
     return "\n".join(f"- {n}" for n in annotations.notes)
 
 
-def design_system(reference: str, vocabularies: str, annotations: SourceAnnotations | None) -> str:
-    """The system prompt of every design call: instructions plus the shared reference material.
+def staging_conventions(cfg: ProjectConfig | None = None) -> str:
+    """``STAGING_CONVENTIONS`` with the date rules of this project (``cfg.etl``: the site time zone
+    and the partial-date rule; defaults without it)."""
+    etl = cfg.etl if cfg is not None else EtlConfig()
+    if etl.partial_dates == "widest":
+        partial = ("start dates take the first day, end dates the last day (the widest interval), other dates "
+                   "the 15th")
+    else:
+        partial = "they are left NULL (etl.partial_dates: reject)"
+    if etl.timezone:
+        offsets = (f"are converted to the site time zone ({etl.timezone}); write ::timestamptz AT TIME ZONE "
+                   "'<zone>' only when you need another zone")
+    else:
+        offsets = ("keep the time as written (no site time zone is configured, so the offset is ignored and "
+                   "counted); write ::timestamptz AT TIME ZONE '<zone>' only when you need another zone")
+    return STAGING_CONVENTIONS.replace("<PARTIAL_DATES>", (
+        "Dates with an unknown day or month (00/06/1975, 1975-00-00, or a template without DD or MM) are "
+        f"completed by the build and counted: {partial}. Birth and death dates follow THEMIS: year_of_birth and "
+        "month_of_birth keep the known parts, a missing birth day is the 1st and a year alone gives no "
+        "birth_datetime; a death date takes the last day of the known month or year. Write the plain conversion; "
+        "do not handle 00 days yourself."
+    )).replace("<OFFSETS>", f"Timestamps with an offset ('Z', '+03:00') {offsets}.")
+
+
+def design_system(
+    reference: str, vocabularies: str, annotations: SourceAnnotations | None, cfg: ProjectConfig | None = None
+) -> str:
+    """The system prompt of every design call: instructions plus the shared reference material
+    (``cfg`` gives the project's date rules, see ``staging_conventions``).
 
     It is identical for the plan and every table (and revision) call of a run, so the provider
     caches it once; table-specific content goes into the user prompt.
@@ -232,7 +272,7 @@ The reference material below applies to every request in this design.
 FIELD KINDS (TableMapping.fields[].kind)
 {inspect.cleandoc(FieldMapping.__doc__ or '')}
 
-{STAGING_CONVENTIONS}
+{staging_conventions(cfg)}
 VOCABULARIES LOADED: {vocabularies}
 
 NOTES ON THE SOURCE DATA (from the interpretation of the profile; they apply to every table \
@@ -418,7 +458,7 @@ def design_etl(
     max_revisions: int = 2,
 ) -> ETLSpec:
     """Plan, map each table, validate and revise. Returns the spec (also saved to ``ws``)."""
-    system = design_system(reference_concepts_text(conn, schemas), _vocabularies_text(conn, schemas), annotations)
+    system = design_system(reference_concepts_text(conn, schemas), _vocabularies_text(conn, schemas), annotations, cfg)
 
     try:
         plan = llm.structured(

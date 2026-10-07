@@ -158,10 +158,13 @@ class FieldMapping(BaseModel):
                    the id maps so that events link to the right person and visit).
       null         leave the field NULL.
 
-    When a column, expression or constant of a required field yields NULL, the build applies the
-    CDM convention and counts it (``etl.policies``): a concept becomes 0, visit_end_date,
-    visit_detail_end_date and drug_exposure_end_date take the start date, and a row without any
-    other required value (a start date, year_of_birth, death_date) is dropped.
+    The value of a column or expression is converted to the CDM type, and its casts and
+    to_date / to_timestamp calls are read tolerantly (``etl.tolerant``): a value that cannot be
+    read becomes NULL and is counted, instead of failing the whole table. When a column,
+    expression or constant of a required field yields NULL, the build applies the CDM convention
+    and counts it (``etl.policies``): a concept becomes 0, visit_end_date, visit_detail_end_date
+    and drug_exposure_end_date take the start date, and a row without any other required value (a
+    start date, year_of_birth, death_date) is dropped.
     """
 
     model_config = ConfigDict(extra="forbid")

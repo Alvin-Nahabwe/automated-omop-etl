@@ -13,6 +13,9 @@ every one of them, whatever the server or role defaults are:
 * ``TimeZone``: ``etl.timezone`` when it is set, so ``timestamptz`` values and ``AT TIME ZONE``
   are read in the site's zone, whatever the server's is. Unset, the session keeps the server's
   (or role's) zone, as builds always did;
+* ``omop_agent.timezone``: ``etl.timezone``, or empty when it is unset. The tolerant conversions
+  (``etl/functions.sql``) read it: a value with an offset ('Z', '+03:00') is converted to this zone,
+  or, without one, kept at the wall clock as written;
 * ``omop_agent.imputation_cap``: the latest date a partial date may be completed to, the
   configured ``cdm_source.source_release_date`` or else the current date;
 * ``standard_conforming_strings = on`` (the default): a backslash is an ordinary character in
@@ -39,7 +42,8 @@ def session_sql(cfg: ProjectConfig | None = None) -> list[str]:
         "SET LOCAL datestyle = 'ISO, YMD';",
         "SET LOCAL standard_conforming_strings = on;",
         *([f"SET LOCAL timezone = {ql(zone)};"] if zone else []),
-        f"SELECT set_config('omop_agent.imputation_cap', {cap}, true);",
+        f"SELECT set_config('omop_agent.imputation_cap', {cap}, true),"
+        f" set_config('omop_agent.timezone', {ql(zone or '')}, true);",
     ]
 
 

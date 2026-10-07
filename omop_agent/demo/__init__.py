@@ -71,6 +71,9 @@ quality:
   use_r_dqd: ${{OMOP_AGENT_USE_R_DQD:-false}}
   require_r_dqd: ${{OMOP_AGENT_REQUIRE_R_DQD:-false}}
 
+etl:
+  timezone: Africa/Nairobi
+
 cdm_source:
   cdm_source_name: Synthetic HDSS demo
   cdm_source_abbreviation: DEMO

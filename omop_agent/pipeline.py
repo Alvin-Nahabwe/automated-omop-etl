@@ -292,6 +292,10 @@ class Pipeline:
 
         def run() -> list[MappingDecision]:
             spec = self.load_spec()
+            # the mapping's WHERE is read with the ETL helper functions (try_*): install this
+            # version's, as the vocabulary load does (a project mapped again after an upgrade)
+            create_etl_tables(self.conn, self.schemas, self.cfg.target.etl_role)
+            self.conn.commit()
             ev = evaluate_vocabulary(self.conn, self.schemas, spec, self.cfg)
             self.ws.save_json(self.ws.vocab_eval_json, ev)
             (self.ws.root / "vocab_evaluation.md").write_text(render_vocab_evaluation_md(ev))

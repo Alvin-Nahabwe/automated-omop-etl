@@ -52,8 +52,8 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..cdm.spec import load_cdm_spec
-from ..config import ProjectConfig
-from ..db import Schemas, execute, rollback_only, short_error
+from ..config import PrivacyConfig, ProjectConfig
+from ..db import Schemas, execute, fetch_one, rollback_only, short_error
 from ..etl.compiler import LAYER_1_MARKER, SPEC_KINDS
 from ..etl.session import apply_session
 from ..llm.base import AgentTool, LLMClient, LLMError, LLMUnavailable
@@ -100,11 +100,21 @@ with one field mapping per CDM field. Source columns are all text, so cast expli
                source_vocabulary_id, target_domain = the OMOP domain of the targets; concept_role 'source'
                returns the map's source_concept_id
   null         leave the field NULL
-Concept lookups yield 0 when a source value exists but has no mapping. A required value that comes out
-NULL follows the CDM convention automatically and is counted: a required concept becomes 0 and
-visit_end_date, visit_detail_end_date and drug_exposure_end_date take the start date (etlDefaultedValue
-tells you where a better fallback may exist); a row without another required value (a start date,
-year_of_birth, death_date) is dropped (etlRequiredFieldNull). Source and join tables are staged
+Concept lookups yield 0 when a source value exists but has no mapping. Casts (::date, ::numeric, ...)
+and to_date / to_timestamp in column and expression fields and in the filter are tolerant: a value that
+cannot be read as written (31/02/2019, a date in another layout than the template, a number with text in
+it) becomes NULL and is counted per field (etlInvalidValue) instead of failing the whole table. Fix the
+expression when the source holds the value in another form (the to_date template the profile shows; a
+regex guard for a column that mixes numbers and text, so the text goes to value_as_string), never by
+filtering rows, and never by hiding the values: {etl}.try_date and the other try_* functions are counted
+like a cast in a field or the filter, and a regex guard that makes unreadable dates or numbers NULL
+before the cast only hides them. A date with an unknown day or month (00/06/1975) <PARTIAL_DATES> and is
+reported as etlPartialDate. A required value that comes out NULL follows the CDM convention
+automatically and is counted: required concepts default to 0 and visit_end_date, visit_detail_end_date
+and drug_exposure_end_date to the start date (etlDefaultedValue tells you where a better fallback may
+exist); a row without another required value (a start date, year_of_birth, death_date) is dropped
+(etlRequiredFieldNull), and an edit that makes such a field NULL for more rows is refused because it
+would drop those records. Source and join tables are staged
 source table names (or {src}., {vocab}., {etl}.-qualified names). Spec SQL must be a single expression or
 condition: no statement separators, no catalog, file or session functions, and no direct identifiers
 (names, phone numbers, national ids, addresses, GPS): those are never loaded into the CDM.
@@ -831,15 +841,24 @@ def mapping_issues(state: RepairState, tm: TableMapping) -> list[str]:
 
 
 def validate_mapping(
-    tm: TableMapping, spec: ETLSpec, conn: psycopg.Connection, schemas: Schemas, cfg: ProjectConfig | None = None
+    tm: TableMapping,
+    spec: ETLSpec,
+    conn: psycopg.Connection,
+    schemas: Schemas,
+    cfg: ProjectConfig | None = None,
+    old: TableMapping | None = None,
 ) -> str | None:
     """None if ``tm`` compiles and its INSERT EXPLAINs cleanly (under the build's session
-    settings), else the error."""
+    settings), else the error. With ``old`` (the mapping ``tm`` replaces) the edit is also
+    dry-run: a change that makes a required field whose NULL drops the row (a start date,
+    year_of_birth, death_date) NULL for rows where it was not would drop those records, which
+    the repair agent may not do (``drop_guard``)."""
     from ..cdm.ddl import create_etl_tables
     from ..etl.compiler import compile_table
 
+    etl = cfg.etl if cfg is not None else None
     try:
-        sql = compile_table(tm, spec, schemas)
+        sql = compile_table(tm, spec, schemas, etl=etl)
     except Exception as e:  # CompileError, or anything else the compiler trips over
         return f"does not compile: {e}"
     try:
@@ -849,7 +868,69 @@ def validate_mapping(
             execute(conn, "EXPLAIN\n" + sql.rstrip().rstrip(";"))
     except psycopg.Error as e:
         return f"EXPLAIN failed: {redact_error(short_error(e), sql, known_identifiers(None, schemas))}"
+    return drop_guard(old, tm, spec, conn, schemas, cfg) if old is not None else None
+
+
+def repair_system(cfg: ProjectConfig | None = None) -> str:
+    """``REPAIR_SYSTEM`` with the partial-date rule of this project (``cfg.etl.partial_dates``)."""
+    if cfg is not None and cfg.etl.partial_dates == "reject":
+        rule = ("is left NULL (etl.partial_dates: reject; birth and death dates follow THEMIS: the known year and "
+                "month of birth are kept, a death date takes the last day of the known period)")
+    else:
+        rule = ("is completed by a fixed rule (a start date takes the first day, an end date the last, other dates "
+                "the 15th; birth and death dates follow THEMIS)")
+    return REPAIR_SYSTEM.replace("<PARTIAL_DATES>", rule)
+
+
+def drop_guard(
+    old: TableMapping, new: TableMapping, spec: ETLSpec, conn: psycopg.Connection, schemas: Schemas,
+    cfg: ProjectConfig | None = None,
+) -> str | None:
+    """Why the edit ``old`` -> ``new`` may not be applied because it would drop records (None:
+    it may). For each changed required field whose NULL drops the row, the rows where it becomes
+    NULL are counted (``etl.compiler.nulling_count_sql``) under ``COUNT_TIMEOUT_MS``; when the old
+    value does not fit the new mapping's sources (a renamed alias), the NULLs of each mapping over
+    its own rows are compared instead. A count that times out or fails lets the edit through: the
+    build history still reverts a build that lost records."""
+    from ..etl.compiler import nulling_count_sql
+
+    try:
+        counts = nulling_count_sql(old, new, spec, schemas, etl=cfg.etl if cfg is not None else None)
+    except Exception:  # validate_mapping compiled it already; nothing to guard
+        return None
+    k = cfg.privacy.min_cell_count if cfg is not None else PrivacyConfig().min_cell_count
+    for name, sql in counts.items():
+        row = _guard_count(conn, schemas, cfg, sql.rows)
+        if row is not None:
+            n = int(row["n"])
+        else:
+            new_t = _guard_count(conn, schemas, cfg, sql.new_totals)
+            old_t = _guard_count(conn, schemas, cfg, sql.old_totals) if sql.old_totals else None
+            if new_t is None or old_t is None:
+                continue
+            n = (int(new_t["n"]) - int(new_t["v"])) - (int(old_t["n"]) - int(old_t["v"]))
+        if n > 0:
+            return (
+                f"it would drop {_small_count(n, k)} rows of {new.target_table}: the required field "
+                f"{new.target_table}.{name} becomes NULL for them (it is not NULL with the current mapping), and a "
+                "record without it cannot be loaded. Keep the rows: fix the expression so it still gives a value "
+                "for them"
+            )
     return None
+
+
+def _guard_count(conn: psycopg.Connection, schemas: Schemas, cfg: ProjectConfig | None, sql: str) -> dict | None:
+    """One read-only count of ``drop_guard`` under ``COUNT_TIMEOUT_MS`` (None: it failed or timed out)."""
+    from ..cdm.ddl import create_etl_tables
+
+    try:
+        with rollback_only(conn, COUNT_TIMEOUT_MS):
+            create_etl_tables(conn, schemas)  # the count calls the ETL helper functions
+            apply_session(conn, cfg)
+            execute(conn, "SET LOCAL transaction_read_only = on")
+            return dict(fetch_one(conn, sql) or {}) or None
+    except psycopg.Error:
+        return None
 
 
 def _norm_sql(text: str | None) -> str:
@@ -914,7 +995,8 @@ def _apply(
     else:
         mappings[pos] = new_tm
     new_spec = state.spec.model_copy(update={"table_mappings": mappings}, deep=True)
-    error = validate_mapping(new_tm, new_spec, state.conn, state.schemas, state.cfg)
+    old_tm = state.spec.table_mappings[pos] if pos is not None else None
+    error = validate_mapping(new_tm, new_spec, state.conn, state.schemas, state.cfg, old=old_tm)
     if error:
         return f"REJECTED: {error}"
     state.spec = new_spec
@@ -955,7 +1037,7 @@ def build_repair_tools(state: RepairState) -> list[AgentTool]:
         from ..etl.compiler import compile_table
 
         try:
-            text += "\n-- compiled SQL\n" + compile_table(tm, state.spec, state.schemas)
+            text += "\n-- compiled SQL\n" + compile_table(tm, state.spec, state.schemas, etl=state.cfg.etl)
         except Exception as e:
             text += f"\n-- the mapping does not compile: {e}"
         return text
@@ -1285,7 +1367,7 @@ def repair_spec(
         result = llm.run_agent(
             stage="repair",
             key=f"iteration:{iteration}",
-            system=REPAIR_SYSTEM,
+            system=repair_system(cfg),
             prompt=prompt,
             tools=build_repair_tools(state),
             max_iterations=cfg.llm.max_agent_iterations,

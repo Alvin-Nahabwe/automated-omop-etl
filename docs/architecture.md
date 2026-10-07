@@ -81,7 +81,8 @@ a Rabbit-in-a-Hat document, and it compiles directly to SQL. Each `TableMapping`
 
 | kind | SQL |
 |---|---|
-| `column`, `expression`, `constant` | the expression, cast to the CDM column type; a NULL required value follows the CDM convention (see "How a mapping compiles") |
+| `column`, `expression` | the expression, converted to the CDM column type tolerantly, with its own casts and `to_date` / `to_timestamp` calls (see "Tolerant conversion"); a NULL required value follows the CDM convention (see "How a mapping compiles") |
+| `constant` | the literal, cast to the CDM column type (a bad constant fails `EXPLAIN`, so the validator reports it) |
 | `person_id` | `JOIN etl.person_map pm ON pm.source_value = (expr)::text`: unmatched rows are dropped (and counted). Required for every `person_id` field, including `person.person_id` |
 | `visit_id` | `LEFT JOIN etl.visit_map` (INNER when the field is required) |
 | `auto_id` | `max(existing id) + ROW_NUMBER() OVER ()`, so several mappings can feed one table |
@@ -115,7 +116,8 @@ PostgreSQL neither merges them nor evaluates a value twice:
 
 1. **Source rows.** The mapping's `FROM`, joins and `WHERE`, the id-map joins, every
    `column` / `expression` / `constant` / id value, and the code of every lookup (`_k1`, ...).
-   Each value is computed once per source row.
+   Each value is computed once per source row, and the tolerant conversions count, per field,
+   the values they could not read.
 2. **Required values.** A required field that comes out NULL follows the CDM convention
    (`etl/policies.py`, derived from the CDM v5.4 field list) instead of failing the whole table
    on its NOT NULL constraint:
@@ -141,6 +143,65 @@ dropped rows. So `etlRecordRetention` and the fatal `etlRecordLoss` see the drop
 `create_etl_tables` installs the functions with a version stamp: a version change must be
 installed once by their owner, and a build role needs EXECUTE on them (PUBLIC by default). Spec
 SQL may not call them (`sqlguard.py`).
+
+### Tolerant conversion
+
+Source columns are text, so field expressions convert them, and in PostgreSQL one value that
+does not convert fails the whole statement. The compiler (`etl/tolerant.py`) rewrites every
+`::date`, `::timestamp`, `::timestamptz`, `::integer` / `::bigint`, `::numeric` (and `CAST`),
+`to_date(x, 'T')`, `to_timestamp(x, 'T')` and `{etl}.try_*(x, ...)` in `column` and `expression`
+fields and in the mapping's `WHERE` into the counted helper functions
+`omop_as_<kind>_at(field, policy, x[, 'T'])`, and then converts the field's value to its CDM type
+the same way. A value they cannot read becomes NULL and is counted (`invalid`). Dates are read
+strictly (31/02/2019 is invalid); a template separator matches any one separator (as in
+`to_date`), a date-only template also takes a trailing time, ISO dates are read in any template,
+and under ISO the year-first (`YYYYMMDD`, `YYYY/MM/DD`) and month-name (`5 Mar 2019`) forms are
+read too. Words such as `today` are invalid. Floating-point casts are read as `numeric` (a later
+integer conversion rounds halves away from zero, where `float8` rounds them to even).
+
+A date with an unknown day or month (`00`, `97`-`99`, no day in the value such as `06/1975`
+for `DD/MM/YYYY`, or a template without DD or MM) is completed by the field's rule
+(`etl/policies.py`, `partial_policy`) and counted as `imputed`, or left NULL and counted as
+`partial_null`: the start of a DQD start/end pair takes the first day, its end the last day,
+other dates the 15th (`etl.partial_dates: reject` makes them NULL); birth and death dates follow
+THEMIS (year and month of birth are kept, a missing birth day is the 1st and a year alone gives no
+`birth_datetime`; a death date takes the last day). An imputed date is not later than the
+configured `cdm_source.source_release_date` (else the build date). An offset (`Z`, `+03:00`)
+converts the value to `etl.timezone` when it is set (`offset_converted`); unset, the wall clock is
+kept as written (`offset_ignored`). Only offsets that are not the zone's own (unset: the
+session's) are counted, since the zone's own changes nothing. A `::timestamptz` cast, and
+`to_timestamp` with a `TZH` / `OF` template, keep the instant the offset gives; `to_timestamp`
+with another template reads the wall clock as a timestamp does.
+
+Constants keep their cast. Join conditions, keys and the `person_id`, `visit_id`, `vocab_code`
+and `concept_map` expressions are evaluated as written (they are join keys); spec SQL may use the
+uncounted `{etl}.try_date(x, 'T')`, `try_timestamp`, `try_timestamptz`, `try_integer`,
+`try_bigint` and `try_number` there. The build's count queries use them for the `WHERE`, so they
+stay parallel. No helper raises for any input value. Measured on 1M values (one core, as an
+INSERT runs):
+
+| values | time |
+|---|---|
+| ISO dates, or a numeric or month-name template with one-character separators (`DD/MM/YYYY`, `DD/MM/YYYY HH24:MI`, `DD-Mon-YYYY`): SQL fast paths | 1.2-2.7 s |
+| ISO with fractional seconds or an offset (ODK `submitted_at`): SQL, PostgreSQL's own input functions after a strict check | about 6 s |
+| any other template (`DD/MM/YY`, `DDMonYYYY`, `HH12 AM`, `TZH`), and invalid values: the PL/pgSQL parser `omop_walk` | about 13 s |
+| the plain cast it replaces | 0.2-0.5 s |
+
+The fast paths are SQL that PostgreSQL inlines into the statement, which it does only when the
+value converted is cheap and not volatile (a column). For any other operand (one with a
+conversion in it, say) the compiler writes the `*_once` form of the date functions
+(`omop_as_date_once_at`), which reads the value in PL/pgSQL: about 2 s per 1M ISO values, about 13
+s for another template.
+
+The checks `etlInvalidValue` (per field and `where`; convention at 5% for date and required
+fields; characterization for other fields, unless more than half of a field's values are
+unreadable, then convention) and `etlPartialDate` (characterization, never failed) report the
+counts. A row the `WHERE` could not decide because a value in it is unreadable is left out, and
+counted as a dropped record by `etlRecordRetention` and the fatal `etlRecordLoss`. The validator
+warns about a conversion the build has to leave as written, and about casts in joins and keys; an
+ISO cast (or `try_date` without a template) of a column profiled with a day-first or month-first
+format, in a field, join, key or custom SQL, and a strftime template such as `'%d/%m/%Y'`, are
+errors.
 
 ## Quality gate and repair loop
 

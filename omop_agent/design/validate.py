@@ -11,6 +11,17 @@ that load direct identifiers (``privacy.pii_references``) into the CDM. Custom S
 written, so it always gets a review warning. ``sql_safety_issues`` is the subset the ETL
 runner re-checks before it executes a spec.
 
+Conversions of dates and numbers are checked against the source profile: the build reads the
+casts and to_date / to_timestamp calls of column and expression fields and of the WHERE
+tolerantly (``etl.tolerant``), so a conversion it has to leave as written, or one in a join
+condition, key or id / lookup expression (which stay as written), is a warning; an ISO cast
+(``::date``, or try_date without a template) of a column profiled with a day-first or
+month-first format, which reads none of its values under DateStyle 'ISO, YMD', is an error that
+names the to_date template, also in custom SQL (a warning in a branch of a regex guard on the
+column); so is a strftime template ('%d/%m/%Y'). A to_date template that differs from the
+profiled format, and a mapped days_supply that the drug_exposure_end_date does not use, are
+warnings.
+
 With a database connection the validator also checks concept constants against the loaded
 vocabulary, checks that ``vocab_code`` vocabularies are loaded, and ``EXPLAIN``s each compiled
 INSERT inside a transaction that is always rolled back, under the build's session settings
@@ -35,6 +46,7 @@ from ..config import PrivacyConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, list_columns, qi, rollback_only, short_error
 from ..etl.compiler import ID_MAP_KEYS, CompileError, alias_refs, compile_table, source_ref
 from ..etl.session import apply_session
+from ..etl.tolerant import DATE_KINDS, LexError, lex, rewrite, without_conversions
 from ..models import CustomSQL, ETLSpec, KeySpec, SourceProfile, TableMapping
 from ..privacy import pii_columns, pii_references
 from ..sqlguard import fragment_issues, strip_literals
@@ -264,6 +276,126 @@ def _pii_loaded(tm: TableMapping, profile: SourceProfile | None, privacy: Privac
     return pii_references(loading, profile, privacy)
 
 
+# Kinds of field whose expression the build evaluates as written (keys of the id maps and lookups).
+_KEY_KINDS = ("person_id", "visit_id", "vocab_code", "concept_map")
+_TRY_FUNCTION = {"date": "try_date", "timestamp": "try_timestamp", "timestamptz": "try_timestamptz",
+                 "integer": "try_integer", "bigint": "try_bigint", "number": "try_number"}
+
+
+def _iso_readable(date_format: str) -> bool:
+    """True when ``::date`` reads values of this profiled (strftime) format under DateStyle
+    'ISO, YMD': year first, or an English month name with a four-digit year."""
+    return date_format.startswith("%Y") or (("%b" in date_format or "%B" in date_format) and "%Y" in date_format)
+
+
+def _pg_template(date_format: str) -> str | None:
+    from ..profiling.profiler import strftime_to_pg
+
+    try:
+        return strftime_to_pg(date_format)
+    except ValueError:
+        return None
+
+
+def _profiled_formats(operand: str, aliases: dict[str, str], cat: _SourceCatalog) -> list[tuple[str, str]]:
+    """(alias.column, date_format) of the columns in ``operand`` that the profile gives a date format."""
+    if cat.profile is None:
+        return []
+    out: list[tuple[str, str]] = []
+    for alias, column in alias_refs(operand):
+        table = _staged_name(aliases.get(alias, "")) if alias in aliases else None
+        t = cat.profile.table(table) if table else None
+        if t is None:
+            t = next((x for x in cat.profile.tables if table and x.name.lower() == table.lower()), None)
+        col = next((c for c in t.columns if c.name.lower() == column), None) if t is not None else None
+        if col is not None and col.date_format and (f"{alias}.{column}", col.date_format) not in out:
+            out.append((f"{alias}.{column}", col.date_format))
+    return out
+
+
+def _bare_formats(expr: str, table: str, cat: _SourceCatalog) -> list[tuple[str, str]]:
+    """(column, date_format) of the bare column names in a key expression over ``table``."""
+    if cat.profile is None:
+        return []
+    t = next((x for x in cat.profile.tables if x.name.lower() == (_staged_name(table) or "").lower()), None)
+    if t is None:
+        return []
+    words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", strip_literals(expr)))
+    return [(c.name, c.date_format) for c in t.columns if c.date_format and c.name in words]
+
+
+def _conversion_problems(
+    expr: str, where: str, *, hard: bool, formats: list[tuple[str, str]] | None = None,
+    aliases: dict[str, str] | None = None, cat: _SourceCatalog | None = None,
+) -> list[tuple[str, str]]:
+    """(severity, message) for the conversions in one SQL fragment. ``hard``: the build evaluates
+    the fragment as written (a key or join), so every conversion in it can fail the step."""
+    rw = rewrite(expr, "f", "mid")
+    out: list[tuple[str, str]] = []
+    for _, problem in rw.bad_templates:
+        out.append(("error", f"{where}: {problem}"))
+    if not rw.conversions and rw.left_hard:  # the scan could not read the fragment
+        out.append(("warning", f"{where}: the build cannot read this SQL to make its conversions tolerant, so one "
+                               "value that does not convert fails the whole table"))
+    for c in rw.conversions:
+        # the columns the conversion reads as written (not those an inner conversion read first)
+        operand = without_conversions(c.operand)
+        if formats is not None:
+            cols = [(col, fmt) for col, fmt in formats if re.search(rf"\b{re.escape(col)}\b", operand)]
+        else:
+            cols = _profiled_formats(operand, aliases or {}, cat) if cat else []
+        bad = [(col, fmt) for col, fmt in cols if not _iso_readable(fmt)]
+        iso = c.template is None and c.function in (None, f"try_{c.kind}")  # a cast, or try_* without a template
+        if c.kind in DATE_KINDS and iso and bad:
+            col, fmt = bad[0]
+            pg = _pg_template(fmt)
+            fn = "to_date" if c.kind == "date" else "to_timestamp"
+            fix = f": write {fn}({col}, '{pg}'), which reads ISO values too" if pg else ""
+            if re.search(rf"\b{re.escape(col)}\s*(!?~|similar\s+to)", expr, re.I):  # a branch of a regex guard
+                out.append(("warning", f"{where}: {c.text} reads {col}, profiled as {fmt}, as ISO; the values in the "
+                                       f"profiled format are NULL unless the guard keeps them out{fix}"))
+            else:
+                out.append(("error", f"{where}: {c.text} reads {col}, profiled as {fmt}, as ISO, which cannot read "
+                                     f"that format under DateStyle 'ISO, YMD' (those values would be NULL){fix}"))
+            continue
+        if c.template is not None and not (c.note and "%" in c.template):
+            for col, fmt in cols:
+                pg = _pg_template(fmt)
+                t = c.template.upper().replace("FM", "")
+                if pg and t != pg.upper() and not pg.upper().startswith(t):
+                    out.append(("warning", f"{where}: the template '{c.template}' differs from the profiled format "
+                                           f"of {col} ({fmt}, PostgreSQL '{pg}')"))
+        if c.function == f"try_{c.kind}":
+            continue  # gives NULL for a value it cannot read (in a field or the WHERE: counted)
+        if hard or not c.rewritten:
+            if c.template is not None and c.note and "%" in c.template:
+                continue  # reported as an error above
+            why = f" ({c.note})" if c.note else ""
+            fix = (f"use {{etl}}.{_TRY_FUNCTION[c.kind]}(...), which gives NULL for a value it cannot read"
+                   if hard else "write a plain cast, or to_date / to_timestamp with a literal template")
+            place = "is evaluated as written" if hard else "is left as written by the build"
+            out.append(("warning", f"{where}: {c.text} {place}{why}: one value it cannot convert fails the whole "
+                                   f"step; {fix}"))
+    return out
+
+
+def _days_supply_issue(tm: TableMapping) -> str | None:
+    """A drug_exposure mapping whose end date ignores its mapped days_supply."""
+    if tm.target_table != "drug_exposure":
+        return None
+    by = {f.target_field: f for f in tm.fields}
+    days, end = by.get("days_supply"), by.get("drug_exposure_end_date")
+    if days is None or end is None or days.kind not in ("column", "expression") or not days.expression:
+        return None
+    if end.kind not in ("column", "expression") or not end.expression:
+        return None
+    used = set(alias_refs(days.expression))
+    if used and not used & set(alias_refs(end.expression)):
+        return ("days_supply is mapped but drug_exposure_end_date does not use it: when the source has no end "
+                "date, the end is the start + days_supply - 1 (the drug era logic reads the end date)")
+    return None
+
+
 def _static_mapping(
     tm: TableMapping, spec: ETLSpec, cat: _SourceCatalog, privacy: PrivacyConfig | None = None
 ) -> list[SpecIssue]:
@@ -415,6 +547,26 @@ def _static_mapping(
             if cols is not None and column not in cols and (alias, column) not in reported:
                 reported.add((alias, column))
                 err(f"column '{alias}.{column}' does not exist in source table '{src}'", field)
+
+    # conversions: the build makes those of column / expression fields and the WHERE tolerant; keys,
+    # lookups and join conditions are evaluated as written
+    for fm in tm.fields:
+        if not fm.expression or fm.kind not in ("column", "expression", *_KEY_KINDS):
+            continue
+        label = "expression" if fm.kind in ("column", "expression") else f"{fm.kind} expression"
+        for severity, msg in _conversion_problems(fm.expression, label, hard=fm.kind in _KEY_KINDS,
+                                                  aliases=aliases, cat=cat):
+            (err if severity == "error" else warn)(msg, fm.target_field)
+    if tm.where:
+        for severity, msg in _conversion_problems(tm.where, "where", hard=False, aliases=aliases, cat=cat):
+            (err if severity == "error" else warn)(msg)
+    for j in tm.joins:
+        for severity, msg in _conversion_problems(j.on, f"join '{j.alias}' condition", hard=True, aliases=aliases,
+                                                  cat=cat):
+            (err if severity == "error" else warn)(msg)
+    days = _days_supply_issue(tm)
+    if days:
+        warn(days, "drug_exposure_end_date")
     return issues
 
 
@@ -433,6 +585,9 @@ def _static_spec(spec: ETLSpec, cat: _SourceCatalog) -> list[SpecIssue]:
             issues.append(issue)
         elif cat.available and _staged_name(key.table) is not None:
             issues += _key_columns(key, cat, what)
+        for severity, msg in _conversion_problems(key.expression, what, hard=True,
+                                                  formats=_bare_formats(key.expression, key.table, cat)):
+            issues.append(SpecIssue(severity=severity, message=msg))  # type: ignore[arg-type]
     if not spec.mapping_for("person"):
         issues.append(SpecIssue(severity="error", target_table="person", message="no table mapping loads person"))
     has_op_mapping = spec.mapping_for("observation_period") is not None or any(
@@ -469,7 +624,39 @@ def _static_spec(spec: ETLSpec, cat: _SourceCatalog) -> list[SpecIssue]:
             SpecIssue(severity="error", target_table=cs.target_table, message=f"custom SQL '{cs.name}': {x}")
             for x in _custom_sql_problems(cs)
         ]
+        # custom SQL runs as written: its conversions are only checked against the profile
+        issues += [
+            SpecIssue(severity="error", target_table=cs.target_table, message=msg)
+            for severity, msg in _conversion_problems(cs.sql, f"custom SQL '{cs.name}'", hard=True,
+                                                      aliases=_custom_aliases(cs.sql), cat=cat)
+            if severity == "error"
+        ]
     return issues
+
+
+_FROM_ITEM = re.compile(
+    r"\b(?:from|join)\s+((?:\{src\}\s*\.\s*)?(?:\"[^\"]+\"|[a-z_][a-z0-9_]*))(?:\s+(?:as\s+)?([a-z_][a-z0-9_]*))?",
+    re.I,
+)
+_NOT_ALIAS = {"on", "using", "where", "join", "left", "right", "inner", "full", "cross", "natural", "group", "order",
+              "limit", "union", "except", "intersect", "window", "having", "offset", "lateral", "returning"}
+
+
+def _custom_aliases(sql: str) -> dict[str, str]:
+    """alias -> staged table of the FROM and JOIN items of custom SQL (a table without an alias is
+    its own alias)."""
+    out: dict[str, str] = {}
+    try:  # string literals and comments out, quoted names kept
+        text = "".join(" " if t.kind in ("str", "estr", "dollar", "comment") else t.text for t in lex(sql))
+    except LexError:
+        return out
+    for m in _FROM_ITEM.finditer(text):
+        table = re.sub(r"\s+", "", m.group(1))
+        alias = (m.group(2) or "").lower()
+        if not alias or alias in _NOT_ALIAS:
+            alias = table.split(".")[-1].strip('"').lower()
+        out.setdefault(alias, table)
+    return out
 
 
 def _key_columns(key: KeySpec, cat: _SourceCatalog, what: str) -> list[SpecIssue]:
@@ -601,7 +788,7 @@ def _explain_all(
     compiled: list[tuple[TableMapping, str]] = []
     for tm in tables:
         try:
-            compiled.append((tm, compile_table(tm, spec, schemas)))
+            compiled.append((tm, compile_table(tm, spec, schemas, etl=cfg.etl if cfg is not None else None)))
         except CompileError as e:
             issues.append(SpecIssue(severity="error", target_table=tm.target_table, message=f"does not compile: {e}"))
     try:

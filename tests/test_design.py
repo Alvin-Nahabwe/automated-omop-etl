@@ -294,6 +294,7 @@ def test_sqlguard_denies_internal_counters():
 
     # the build's own helper functions keep the counts of values it could not load as written
     for sql in ("{etl}.omop_count('visit_end_date', 'defaulted')", "etl . omop_drop (ARRAY['x'], ARRAY[true])",
+                "{etl}.omop_as_date_at('visit_start_date', 'first', v.d)", "{etl}.omop_walk(v.d, ARRAY['ISO'], 'mid')",
                 'COALESCE(v.d, "etl"."omop_derived_date"(\'visit_end_date\', v.s))', "omop_default_int('x', 0)"):
         assert any("internal function of the build" in x for x in fragment_issues(sql)), sql
     # a quoted name is the function or schema it names
@@ -314,7 +315,8 @@ def test_sqlguard_denies_internal_counters():
         assert any("Unicode-escaped" in x for x in fragment_issues(sql)), sql
     assert fragment_issues("x.u & 1") == []
     # columns, literals and other functions are fine
-    for sql in ("v.omop_count + 1", "'omop_count(1)'", "{etl}.try_date(x.d)", "my_omop_code(x)", '"omop_code"'):
+    for sql in ("v.omop_count + 1", "'omop_count(1)'", "{etl}.try_date(x.d)", "{etl}.try_integer(x.n)",
+                "{etl}.try_timestamp(x.d, 'DD/MM/YYYY HH24:MI', 'first')", "my_omop_code(x)", '"omop_code"'):
         assert fragment_issues(sql) == [], sql
     spec = set_field(load_ref(), "visit_occurrence", "visit_end_date",
                      expression="COALESCE(v.discharge_date::date, {etl}.omop_derived_date('visit_end_date', v.visit_date::date))")
@@ -322,6 +324,130 @@ def test_sqlguard_denies_internal_counters():
     spec = load_ref().model_copy(deep=True)
     spec.custom_sql = [CustomSQL(name="x", target_table="death", sql="SELECT {etl}.omop_drop(ARRAY['a'], ARRAY[true])")]
     assert "omop_drop()" in sql_safety_issues(spec.custom_sql[0])[0]
+
+
+def dated_profile(**formats: str) -> SourceProfile:
+    """The demo profile with the date formats the profiler detects (``table__column=format``
+    overrides one)."""
+    profile = demo_profile()
+    formats = {("individuals", "dob"): "%d/%m/%Y", ("clinic_visits", "visit_date"): "%Y-%m-%d",
+               ("clinic_visits", "discharge_date"): "%Y-%m-%d", ("deaths", "dod"): "%Y-%m-%d",
+               ("prescriptions", "date_prescribed"): "%Y/%m/%d",
+               **{tuple(k.split("__")): v for k, v in formats.items()}}
+    for t in profile.tables:
+        for c in t.columns:
+            c.date_format = formats.get((t.name, c.name))
+    return profile
+
+
+def _issues(spec: ETLSpec, severity: str, table: str | None = None, field: str | None = None,
+            profile: SourceProfile | None = None) -> list[str]:
+    return [i.message for i in validate_spec(spec, profile or dated_profile())
+            if i.severity == severity and (table is None or i.target_table == table)
+            and (field is None or i.target_field == field)]
+
+
+def test_conversion_issues():
+    ref = load_ref()
+    assert errors(validate_spec(ref, dated_profile())) == []
+    # an ISO cast of a day-first column reads none of its values: an error naming the template
+    spec = set_field(ref, "person", "birth_datetime", expression="i.dob::timestamp")
+    (msg,) = _issues(spec, "error", "person", "birth_datetime")
+    assert "profiled as %d/%m/%Y" in msg and "to_timestamp(i.dob, 'DD/MM/YYYY')" in msg
+    two_digit_year = dated_profile(deaths__dod="%d-%b-%y")
+    assert any("to_date(x.dod, 'DD-Mon-YY')" in m
+               for m in _issues(ref, "error", "death", "death_date", profile=two_digit_year))
+    assert _issues(ref, "error", "death", profile=dated_profile(deaths__dod="%d-%b-%Y")) == []  # a month name
+    # also in the WHERE, a join condition and a key
+    spec = ref.model_copy(deep=True)
+    spec.mapping_for("person").where = "i.dob::date > DATE '1900-01-01'"
+    assert any("where: i.dob::date reads i.dob" in m for m in _issues(spec, "error", "person"))
+    spec = ref.model_copy(deep=True)
+    spec.mapping_for("death").joins.append(JoinSpec(table="individuals", alias="i", join_type="left",
+                                                    on="i.individual_id = x.individual_id AND i.dob::date < now()"))
+    assert any("join 'i' condition: i.dob::date reads i.dob" in m for m in _issues(spec, "error", "death"))
+    spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={"expression": "dob::date"})})
+    assert any(m.startswith("person_key: dob::date reads dob") for m in _issues(spec, "error"))
+    # so does try_date without a template, and custom SQL, which runs as written
+    spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={"expression": "{etl}.try_date(dob)"})})
+    assert any(m.startswith("person_key: {etl}.try_date(dob) reads dob") for m in _issues(spec, "error"))
+    spec = ref.model_copy(update={"custom_sql": [CustomSQL(
+        name="deaths_too", target_table="death", sql="INSERT INTO {cdm}.death (person_id, death_date, death_type_concept_id) "
+        "SELECT pm.person_id, d.dod::date, 32879 FROM {src}.\"deaths\" d JOIN {etl}.person_map pm ON pm.source_value = "
+        "d.individual_id")]})
+    assert any(m.startswith("custom SQL 'deaths_too': d.dod::date reads d.dod") and "to_date(d.dod, 'DD/MM/YYYY')" in m
+               for m in _issues(spec, "error", "death", profile=dated_profile(deaths__dod="%d/%m/%Y")))
+    # a branch of a regex guard on the same column: a warning, which says the template reads both
+    spec = set_field(ref, "person", "birth_datetime", expression="CASE WHEN i.dob ~ '^[0-9]{4}-' THEN i.dob::timestamp "
+                     "ELSE to_timestamp(i.dob, 'DD/MM/YYYY') END")
+    assert _issues(spec, "error", "person", "birth_datetime") == []
+    assert any("reads ISO values too" in m for m in _issues(spec, "warning", "person", "birth_datetime"))
+    # year-first and month-name formats an ISO cast reads: fine
+    assert _issues(set_field(ref, "drug_exposure", "drug_exposure_start_date", expression="p.date_prescribed::date"),
+                   "error", "drug_exposure") == []
+    # a strftime template is refused; another template than the profiled one is a warning
+    spec = set_field(ref, "person", "birth_datetime", expression="to_date(i.dob, '%d/%m/%Y')::timestamp")
+    assert any("strftime" in m for m in _issues(spec, "error", "person", "birth_datetime"))
+    spec = set_field(ref, "person", "birth_datetime", expression="to_date(i.dob, 'MM/DD/YYYY')::timestamp")
+    assert any("differs from the profiled format of i.dob (%d/%m/%Y, PostgreSQL 'DD/MM/YYYY')" in m
+               for m in _issues(spec, "warning", "person", "birth_datetime"))
+    assert not any("differs" in m for m in _issues(
+        set_field(ref, "person", "birth_datetime", expression="to_date(i.dob, 'FMDD/FMMM/YYYY')::timestamp"), "warning"))
+    # a conversion the build has to leave as written, and casts in keys and joins, are warnings
+    spec = set_field(ref, "person", "birth_datetime", expression="to_date(i.dob, i.sex)::timestamp")
+    assert any("is left as written by the build (the template is not a literal)" in m
+               for m in _issues(spec, "warning", "person", "birth_datetime"))
+    spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={"expression": "individual_id::int"})})
+    assert any("person_key: individual_id::int is evaluated as written" in m and "{etl}.try_integer" in m
+               for m in _issues(spec, "warning"))
+    spec = ref.model_copy(deep=True)
+    spec.mapping_for("drug_exposure").joins.append(JoinSpec(
+        table="clinic_visits", alias="cv", join_type="left", on="cv.visit_id = p.visit_id AND cv.visit_date::date = "
+        "p.date_prescribed::date"))
+    assert any("cv.visit_date::date is evaluated as written" in m and "{etl}.try_date" in m
+               for m in _issues(spec, "warning", "drug_exposure"))
+    spec = set_field(ref, "condition_occurrence", "condition_concept_id", expression="d.icd10::int")
+    assert any("vocab_code expression: d.icd10::int is evaluated as written" in m
+               for m in _issues(spec, "warning", "condition_occurrence", "condition_concept_id"))
+    # the uncounted functions are the way to write such a key
+    spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={
+        "expression": "{etl}.try_integer(individual_id)"})})
+    assert not any("person_key" in m for m in _issues(spec, "warning") + _issues(spec, "error"))
+    spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={
+        "expression": "{etl}.try_date(dob, 'DD/MM/YYYY')::text"})})
+    assert not any("person_key" in m for m in _issues(spec, "warning") + _issues(spec, "error"))
+    # in a field, try_* is counted like a cast: nothing to warn about
+    spec = set_field(ref, "person", "birth_datetime", expression="{etl}.try_timestamp(i.dob, 'DD/MM/YYYY')")
+    assert _issues(spec, "warning", "person", "birth_datetime") == []
+    # a drug end date that ignores the mapped days_supply
+    spec = set_field(ref, "drug_exposure", "drug_exposure_end_date", expression="p.date_prescribed::date")
+    assert any("days_supply is mapped but drug_exposure_end_date does not use it" in m
+               for m in _issues(spec, "warning", "drug_exposure", "drug_exposure_end_date"))
+    assert not any("days_supply" in m for m in _issues(ref, "warning"))
+
+
+def test_design_prompt_date_rules(tmp_path):
+    from omop_agent.config import EtlConfig
+    from omop_agent.design.designer import design_system, staging_conventions
+
+    # required fields follow the CDM convention; a better fallback is the designer's to write
+    assert "Required fields must never be NULL" not in DESIGN_SYSTEM
+    assert "a required concept becomes 0; visit_end_date" in " ".join(DESIGN_SYSTEM.split())
+    assert "start + days_supply - 1" in DESIGN_SYSTEM
+    cfg = ProjectConfig.model_validate({"name": "t", "source": {"type": "csv", "path": str(tmp_path)},
+                                        "target": {"url": "postgresql://x/y"}})
+    text = " ".join(staging_conventions(cfg).split())
+    assert "<PARTIAL_DATES>" not in text and "<OFFSETS>" not in text
+    assert "start dates take the first day, end dates the last day (the widest interval), other dates the 15th" in text
+    assert "keep the time as written (no site time zone is configured" in text
+    assert "Do not add regex guards only to avoid cast errors" in text and "value_as_string" in text
+    assert "{etl}.try_date(x, 'DD/MM/YYYY')" in text and "Never pass a strftime pattern" in text
+    nairobi = cfg.model_copy(update={"etl": EtlConfig(timezone="Africa/Nairobi", partial_dates="reject")})
+    text = " ".join(staging_conventions(nairobi).split())
+    assert "converted to the site time zone (Africa/Nairobi)" in text and "left NULL (etl.partial_dates: reject)" in text
+    system = design_system("REF", "ICD10", None, nairobi)
+    assert system.startswith(DESIGN_SYSTEM) and "Africa/Nairobi" in system
+    assert design_system("REF", "ICD10", None) == design_system("REF", "ICD10", None, cfg)  # defaults without cfg
 
 
 def test_direct_identifiers_are_not_loaded():

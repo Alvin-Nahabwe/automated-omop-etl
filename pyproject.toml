@@ -51,4 +51,7 @@ omop_agent = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["postgres: needs a PostgreSQL database (set OMOP_AGENT_TEST_DB_URL)"]
+markers = [
+    "postgres: needs a PostgreSQL database (set OMOP_AGENT_TEST_DB_URL)",
+    "slow: a scale measurement, run only with OMOP_AGENT_SLOW_TESTS=1",
+]

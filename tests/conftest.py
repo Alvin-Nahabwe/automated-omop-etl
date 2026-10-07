@@ -1,7 +1,8 @@
 """Shared fixtures.
 
 Tests marked ``postgres`` need a PostgreSQL database; point ``OMOP_AGENT_TEST_DB_URL`` at one
-(the role must be allowed to create schemas). Each test gets its own uniquely named schemas,
+(the role must be allowed to create schemas). Tests marked ``slow`` (scale measurements) run only
+with ``OMOP_AGENT_SLOW_TESTS=1``. Each test gets its own uniquely named schemas,
 which are dropped afterwards, so tests can share one database.
 """
 
@@ -23,12 +24,13 @@ DB_URL = os.environ.get("OMOP_AGENT_TEST_DB_URL")
 
 
 def pytest_collection_modifyitems(config, items):
-    if DB_URL:
-        return
-    skip = pytest.mark.skip(reason="set OMOP_AGENT_TEST_DB_URL to run PostgreSQL tests")
+    skip_pg = pytest.mark.skip(reason="set OMOP_AGENT_TEST_DB_URL to run PostgreSQL tests")
+    skip_slow = pytest.mark.skip(reason="set OMOP_AGENT_SLOW_TESTS=1 to run the slow scale tests")
     for item in items:
-        if "postgres" in item.keywords:
-            item.add_marker(skip)
+        if "postgres" in item.keywords and not DB_URL:
+            item.add_marker(skip_pg)
+        if "slow" in item.keywords and not os.environ.get("OMOP_AGENT_SLOW_TESTS"):
+            item.add_marker(skip_slow)
 
 
 @pytest.fixture(scope="session")

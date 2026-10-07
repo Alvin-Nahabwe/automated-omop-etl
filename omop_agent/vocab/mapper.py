@@ -186,7 +186,7 @@ def _units_by_code(
     k = (privacy or PrivacyConfig()).min_cell_count
     sql = (
         f"SELECT code, unit, COUNT(*) AS n FROM (\nSELECT {paren(expr)}::text AS code, {paren(unit.expression or '')}::text AS unit\n"
-        f"{source_from_sql(tm)}\n) q\nWHERE code IS NOT NULL AND unit IS NOT NULL AND btrim(unit) <> ''\n"
+        f"{source_from_sql(tm, cfg.etl if cfg else None)}\n) q\nWHERE code IS NOT NULL AND unit IS NOT NULL AND btrim(unit) <> ''\n"
         f"GROUP BY code, unit HAVING COUNT(*) >= {int(k)} ORDER BY code, n DESC"
     )
     try:
@@ -248,7 +248,8 @@ def collect_terms(
             if fm.kind != "concept_map" or not expr or not vocab or (i, j) in skip:
                 continue
             sql = (
-                f"SELECT code, COUNT(*) AS n FROM (\nSELECT {paren(expr)}::text AS code\n{source_from_sql(tm)}\n) q\n"
+                f"SELECT code, COUNT(*) AS n FROM (\nSELECT {paren(expr)}::text AS code\n"
+                f"{source_from_sql(tm, cfg.etl if cfg else None)}\n) q\n"
                 "WHERE code IS NOT NULL AND btrim(code) <> '' GROUP BY code"
             )
             if (vocab, sql) in seen_reads:  # the same records, read again for another field

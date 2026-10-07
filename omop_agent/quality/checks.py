@@ -15,7 +15,13 @@ corresponding DQD SQL file, so results line up with the official R package:
   ``etlRequiredFieldNull`` (rows dropped because a required field such as a start date or the
   year of birth was NULL, per field; threshold 0 for person, 5% elsewhere) and
   ``etlDefaultedValue`` (required values the build completed by the CDM convention: a concept 0,
-  an end date equal to the start date; 5%). Each carries the step's label (``step``): a second
+  an end date equal to the start date; 5%), ``etlInvalidValue`` (values a conversion could not read,
+  such as '31/02/2019' or a number with text in it, loaded as NULL; convention at 5% for date and
+  required fields, characterization for other fields unless more than half of the values are
+  unreadable, and for the mapping's WHERE, whose undecided rows etlRecordRetention counts as
+  dropped) and
+  ``etlPartialDate`` (dates with an unknown day or month, completed by the partial-date rule or
+  left NULL; characterization, never failed). Each carries the step's label (``step``): a second
   mapping into one table gets its own key, e.g. ``etlRecordRetention.measurement.measurement_2``.
 
 The other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``, ``plausibleTemporalAfter``,
@@ -44,10 +50,10 @@ import psycopg
 
 from ..cdm.ddl import schema_for
 from ..cdm.spec import RESOURCE_PKG, load_cdm_spec
-from ..config import ProjectConfig
+from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, fetch_one, qi, ql, short_error
 from ..etl.compiler import SPEC_KINDS, step_label, target_tables
-from ..etl.policies import END_FROM_START, required_null_policy
+from ..etl.policies import END_FROM_START, THEMIS_PARTIAL, WHERE_SITE, partial_policy, required_null_policy
 from ..models import CheckResult, DQReport, ETLRunResult, ETLSpec, TableLoadResult
 from ..workspace import utcnow
 
@@ -58,6 +64,25 @@ ETL_RETENTION_THRESHOLD = 5.0
 # birth) takes every record of that person with them, so for person any drop fails.
 ETL_VALUE_THRESHOLD = 5.0
 ETL_PERSON_DROP_THRESHOLD = 0.0
+# Values a conversion could not read (etlInvalidValue), as a share of the step's rows. In an
+# optional field that is not a date it is characterization (a column that mixes numbers and text),
+# unless more than ETL_INVALID_MOSTLY of its values are unreadable: then the expression is wrong.
+ETL_INVALID_THRESHOLD = 5.0
+ETL_INVALID_MOSTLY = 50.0
+# What each partial-date rule (etl.policies.partial_policy) does with an unknown day or month.
+_PARTIAL_RULES = {
+    "first": "took the first day of the known month or year",
+    "last": "took the last day of the known month or year",
+    "mid": "took the 15th of the month (June 15 when the month was unknown)",
+    "birth": "took the 1st of the known month (THEMIS); a year alone gave no value",
+    "month": "kept the known month",
+    "year": "kept the known year",
+    "reject": "were loaded as NULL (etl.partial_dates: reject)",
+}
+_PARTIAL_REJECTED = {
+    "themis": "were loaded as NULL (THEMIS: a birth day that is not known is not completed)",
+    "not_date": "were loaded as NULL (the field is not a date: a value computed from a partial date would be a guess)",
+}
 
 # Field-level checks we implement, in DQD order, with the metadata filter that enables each one
 # (the ``evaluationFilter`` column of the Check_Descriptions file).
@@ -583,11 +608,15 @@ def _not_implemented_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
     return out
 
 
-def etl_checks(etl_result: ETLRunResult, min_retention_pct: float = 50.0) -> list[CheckResult]:
+def etl_checks(
+    etl_result: ETLRunResult, min_retention_pct: float = 50.0, etl: EtlConfig | None = None
+) -> list[CheckResult]:
     """``etlStepError`` for failed steps; ``etlRecordRetention`` for steps that report source rows,
     and the fatal ``etlRecordLoss`` when a step keeps less than ``min_retention_pct`` of them;
     ``etlRequiredFieldNull`` and ``etlDefaultedValue`` per field whose required values a step
-    dropped or completed (``TableLoadResult.value_counts``).
+    dropped or completed, and ``etlInvalidValue`` / ``etlPartialDate`` per field (or the WHERE)
+    with values its conversions could not read or that were partial dates
+    (``TableLoadResult.value_counts``; ``etl`` gives the partial-date rule the build used).
 
     Every result carries the step label. The error of a non-blocking step is a convention-level
     failure, and the repair agent only gets the errors of steps that run spec SQL. When a person
@@ -638,6 +667,7 @@ def etl_checks(etl_result: ETLRunResult, min_retention_pct: float = 50.0) -> lis
                 )
         if not s.error:
             out += _required_value_checks(s, label)
+            out += _conversion_checks(s, label, etl)
     return out
 
 
@@ -672,9 +702,85 @@ def _required_value_checks(s: TableLoadResult, label: str) -> list[CheckResult]:
     return out
 
 
+def _is_date_field(table: str, name: str) -> bool:
+    cdm = load_cdm_spec()
+    f = cdm.table(table).field(name) if cdm.has_table(table) else None
+    return f is not None and f.datatype.strip().lower() in ("date", "datetime", "timestamp")
+
+
+def _is_required_field(table: str, name: str) -> bool:
+    cdm = load_cdm_spec()
+    f = cdm.table(table).field(name) if cdm.has_table(table) else None
+    return f is not None and f.required
+
+
+def _partial_rule(table: str, name: str, etl: EtlConfig | None) -> str:
+    """What the partial-date rule of ``table.name`` did with an unknown day or month."""
+    policy = partial_policy(table, name, etl)
+    if policy != "reject":
+        return _PARTIAL_RULES[policy]
+    if (table, name) in THEMIS_PARTIAL:
+        return _PARTIAL_REJECTED["themis"]
+    if name != WHERE_SITE and not _is_date_field(table, name):
+        return _PARTIAL_REJECTED["not_date"]
+    return _PARTIAL_RULES["reject"]
+
+
+def _conversion_checks(s: TableLoadResult, label: str, etl: EtlConfig | None = None) -> list[CheckResult]:
+    """``etlInvalidValue`` per field (or the WHERE) with values a conversion could not read, and
+    ``etlPartialDate`` per field with partial dates. A field's count can exceed its rows when its
+    expression converts several values (``COALESCE(a::date, b::date)``); the share is capped at 1.
+    The descriptions give counts only as "<n> of <rows> rows", which the repair prompt can suppress
+    below the minimum cell count."""
+    rows = s.id_retained_rows if s.id_retained_rows is not None else int(s.source_rows or 0)
+    t = s.target_table
+    out: list[CheckResult] = []
+    for f, n in sorted(s.value_counts.get("invalid", {}).items()):
+        if f == WHERE_SITE:
+            # the WHERE runs before the rows are counted: the rows it could not decide are not in source_rows
+            denominator = int(s.source_rows or 0) + n
+            out.append(_value_check(
+                s, label, "etlInvalidValue", f, n, denominator, ETL_INVALID_THRESHOLD,
+                f"Values in the WHERE of ETL step '{s.step}' that could not be read as written (an invalid date, a "
+                f"number with text in it): {n} of {denominator} rows. The filter read them as unknown (NULL) and left "
+                f"the rows out of {t}; they are counted as dropped records (etlRecordRetention). Fix the conversion "
+                "if the source has these values in another form.",
+                severity="characterization", category="Conformance",
+            ))
+            continue
+        important = _is_date_field(t, f) or _is_required_field(t, f)
+        mostly = not important and n * 100 > ETL_INVALID_MOSTLY * rows
+        out.append(_value_check(
+            s, label, "etlInvalidValue", f, n, rows, ETL_INVALID_MOSTLY if mostly else ETL_INVALID_THRESHOLD,
+            f"Values of {t}.{f} in ETL step '{s.step}' that could not be read as written (an invalid date such as "
+            f"31/02/2019, a date in another layout than the template, a number with text in it): {n} of {rows} rows, "
+            "loaded as NULL"
+            + (" (a required field then follows the CDM convention: see etlRequiredFieldNull and etlDefaultedValue)"
+               if _is_required_field(t, f) else "")
+            + (f"; more than {ETL_INVALID_MOSTLY:g}% of the values, so the expression is probably wrong for this "
+               "source" if mostly else "")
+            + ". Fix the expression if the source has these values in another form (the to_date template the "
+            "profile shows, a decimal comma, a unit in the value, a guard for a column that mixes numbers and text).",
+            severity="convention" if important or mostly else "characterization", category="Conformance",
+        ))
+    imputed, partial = s.value_counts.get("imputed", {}), s.value_counts.get("partial_null", {})
+    for f in sorted(set(imputed) | set(partial)):
+        n = imputed.get(f, 0) + partial.get(f, 0)
+        policy = partial_policy(t, f, etl)
+        out.append(_value_check(
+            s, label, "etlPartialDate", f, n, rows, 100.0,
+            f"Dates of {t}.{f} in ETL step '{s.step}' with an unknown day or month (00, 97-99, or no day or month "
+            f"in the value): {n} of {rows} rows. The values {_partial_rule(t, f, etl)}"
+            + ("; those the rule could not complete were left NULL" if partial.get(f) and policy != "reject" else "")
+            + ". Reported for review only.",
+            severity="characterization", failed=False,
+        ))
+    return out
+
+
 def _value_check(
     s: TableLoadResult, label: str, name: str, target_field: str, n: int, rows: int, threshold: float,
-    description: str,
+    description: str, *, severity: str = "convention", category: str = "Completeness", failed: bool | None = None,
 ) -> CheckResult:
     return CheckResult(
         check_name=name,
@@ -682,21 +788,25 @@ def _value_check(
         table=s.target_table,
         field=target_field,
         description=description,
-        category="Completeness",
+        category=category,
         subcategory="ETL",
-        severity="convention",
+        severity=severity,  # type: ignore[arg-type]
         num_violated_rows=n,
         num_denominator_rows=rows,
-        pct_violated_rows=n / rows if rows else 0.0,
+        pct_violated_rows=min(n / rows, 1.0) if rows else 0.0,
         threshold_pct=threshold,
-        failed=n * 100 > threshold * rows,
+        failed=n * 100 > threshold * rows if failed is None else failed,
         sql=s.sql,
         step=label,
     )
 
 
 def _retention(s: TableLoadResult) -> CheckResult:
-    source = int(s.source_rows or 0)
+    # rows the mapping's WHERE could not decide because a value in it could not be read: the filter
+    # read it as NULL and left the row out, and source_rows (counted with the same filter) does not
+    # have them; they are records lost, not rows filtered (up to: two such values in one row count twice)
+    undecided = int(s.value_counts.get("invalid", {}).get(WHERE_SITE, 0))
+    source = int(s.source_rows or 0) + undecided
     if s.retained_rows is not None:
         # rows lost before the vocabulary lookups; a code mapped to several concepts inserts
         # several rows, and that fan-out must not hide real drops
@@ -720,7 +830,10 @@ def _retention(s: TableLoadResult) -> CheckResult:
             f"The number and percent of source rows of ETL step '{s.step}' that were not loaded into "
             f"{s.target_table}: {dropped} of {source} records dropped (for example rows whose person or visit key "
             "has no match, or rows dropped because a required value was NULL: see etlRequiredFieldNull). Rows the "
-            f"mapping's own filter or inner joins leave out are not counted here.{extra}"
+            "mapping's own filter or inner joins leave out are not counted here"
+            + (", except the rows its filter could not decide because a value in it could not be read (see "
+               "etlInvalidValue): those are counted as dropped" if undecided else "")
+            + f".{extra}"
         ),
         category="Completeness",
         subcategory="ETL",
@@ -835,6 +948,6 @@ def run_builtin_checks(
                 results.extend(_field_checks(ctx, t))
                 results.extend(_not_implemented_checks(ctx, t))
     if etl_result is not None:
-        results.extend(etl_checks(etl_result, cfg.quality.min_record_retention_pct))
+        results.extend(etl_checks(etl_result, cfg.quality.min_record_retention_pct, cfg.etl))
     passed, blocking = gate(results, cfg, etl_result)
     return DQReport(run_at=utcnow(), engine="builtin", results=results, passed=passed, blocking_failures=blocking)

@@ -288,7 +288,7 @@ def run_etl(
     truncate_cdm_tables(conn, schemas, tables)
     conn.commit()
 
-    steps = compile_spec(spec, schemas, cfg.cdm_source, strict=False)
+    steps = compile_spec(spec, schemas, cfg.cdm_source, etl=cfg.etl, strict=False)
     _refuse_unsafe(steps)
     if ws is not None:
         _write_sql(ws, steps, cfg)

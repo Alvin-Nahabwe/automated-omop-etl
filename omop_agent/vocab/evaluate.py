@@ -16,8 +16,9 @@ from __future__ import annotations
 import psycopg
 from pydantic import BaseModel, Field
 
-from ..config import ProjectConfig
+from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, fetch_all, qi, ql, short_error
+from ..etl.compiler import CompileError, where_sql
 from ..etl.session import apply_session
 from ..models import ETLSpec, FieldMapping, TableMapping, ValueFreq
 from .loader import vocabulary_inventory, vocabulary_version
@@ -104,23 +105,29 @@ def source_ref(table: str) -> str:
     return "{src}." + qi(table)
 
 
-def source_from_sql(tm: TableMapping) -> str:
+def source_from_sql(tm: TableMapping, etl: EtlConfig | None = None) -> str:
     """``FROM <source> <alias> [JOIN ...] [WHERE ...]`` of a table mapping, placeholders unrendered.
 
-    Mirrors the FROM clause the ETL compiler generates, so counts here match what the ETL reads.
+    Mirrors the FROM clause the ETL compiler generates, so counts here match what the ETL reads:
+    the WHERE's casts are the build's tolerant, uncounted conversions (``etl`` gives the
+    partial-date rule), so a value that cannot be read does not fail the query.
     """
     lines = [f"FROM {source_ref(tm.source.table)} {qi(tm.source.alias)}"]
     for j in tm.joins:
         jt = "INNER" if j.join_type == "inner" else "LEFT"
         lines.append(f"{jt} JOIN {source_ref(j.table)} {qi(j.alias)} ON {j.on.strip()}")
-    if tm.where and tm.where.strip():
-        lines.append(f"WHERE {paren(tm.where)}")
+    try:
+        where = where_sql(tm, etl, counted=False)
+    except CompileError:  # a template the build refuses: the validator reports it
+        where = tm.where
+    if where and where.strip():
+        lines.append(f"WHERE {paren(where)}")
     return "\n".join(lines)
 
 
-def code_counts_sql(tm: TableMapping, expression: str) -> str:
+def code_counts_sql(tm: TableMapping, expression: str, etl: EtlConfig | None = None) -> str:
     """``code, n``: frequency of each value of ``expression`` (as text) over the mapping's rows."""
-    return f"SELECT {paren(expression)}::text AS code, COUNT(*) AS n\n{source_from_sql(tm)}\nGROUP BY 1"
+    return f"SELECT {paren(expression)}::text AS code, COUNT(*) AS n\n{source_from_sql(tm, etl)}\nGROUP BY 1"
 
 
 def query_rows(conn: psycopg.Connection, sql: str, cfg: ProjectConfig | None = None) -> list[dict]:
@@ -191,7 +198,7 @@ def _coverage(
     v = "{vocab}"
     sql = f"""
 WITH codes AS (
-{code_counts_sql(tm, fm.expression or "")}
+{code_counts_sql(tm, fm.expression or "", cfg.etl)}
 )
 SELECT k.code, k.n,
        EXISTS (SELECT 1 FROM {v}.concept c
