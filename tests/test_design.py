@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 from omop_agent.config import PrivacyConfig, ProjectConfig
-from omop_agent.db import Schemas, execute, list_columns, list_tables, row_count
+from omop_agent.db import Schemas, execute, list_columns, list_tables, row_count, scalar
 from omop_agent.design.designer import DESIGN_SYSTEM, design_etl, reference_concepts_text
 from omop_agent.design.render import render_spec_md
 from omop_agent.design.validate import SpecIssue, sql_safety_issues, validate_spec, validate_table_mapping
@@ -404,6 +404,22 @@ def test_explain_and_source_table_errors(staged):
     tm_issues = validate_table_mapping(load_ref().mapping_for("measurement"), load_ref(), profile, conn, schemas)
     assert errors(tm_issues) == []
     assert conn.execute("SELECT 1").fetchone()
+
+
+@pytest.mark.postgres
+def test_explain_runs_under_the_build_session_settings(staged):
+    """EXPLAIN folds constants, under the session settings of the build (DateStyle 'ISO, YMD'):
+    a month-first date the server's own DateStyle would accept is an error, as in the build."""
+    conn, schemas, cfg = staged
+    server_style = scalar(conn, "SELECT current_setting('DateStyle')")
+    assert scalar(conn, "SELECT '03/04/2020'::date IS NOT NULL") is True  # the server's DateStyle reads it
+    spec = set_field(load_ref(), "death", "death_date", kind="expression", expression="'03/04/2020'::date")
+    issues = validate_table_mapping(spec.mapping_for("death"), spec, None, conn, schemas, cfg=cfg)
+    assert any("EXPLAIN failed" in i.message and "out of range" in i.message for i in errors(issues)), issues
+    assert has(validate_spec(spec, None, conn, schemas, cfg=cfg), "death", None, "EXPLAIN failed")
+    spec = set_field(load_ref(), "death", "death_date", kind="expression", expression="'2020/03/04'::date")
+    assert errors(validate_table_mapping(spec.mapping_for("death"), spec, None, conn, schemas, cfg=cfg)) == []
+    assert scalar(conn, "SELECT current_setting('DateStyle')") == server_style  # rolled back
 
 
 @pytest.mark.postgres

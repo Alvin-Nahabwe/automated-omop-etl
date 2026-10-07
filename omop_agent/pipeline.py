@@ -300,7 +300,7 @@ class Pipeline:
             profile = self.load_profile() if self.ws.profile_json.exists() else None
             for f in pii_concept_fields(spec, profile, self.cfg.privacy):
                 self.log(f"  skipped {f}: direct identifiers are never mapped or loaded")
-            terms = collect_terms(self.conn, self.schemas, spec, profile, self.cfg.privacy, self.ws)
+            terms = collect_terms(self.conn, self.schemas, spec, profile, self.cfg.privacy, self.ws, cfg=self.cfg)
             prior: dict[tuple[str, str], MappingDecision] = {}
             if not remap and self.ws.decisions_json.exists():
                 prior = {(d.source_vocabulary_id, d.source_code): d for d in import_review(self.ws, self.conn, self.schemas)}
@@ -354,7 +354,7 @@ class Pipeline:
 
         spec = self.load_spec()
         profile = self.load_profile() if self.ws.profile_json.exists() else None
-        issues = validate_spec(spec, profile, self.conn, self.schemas, privacy=self.cfg.privacy)
+        issues = validate_spec(spec, profile, self.conn, self.schemas, privacy=self.cfg.privacy, cfg=self.cfg)
         self.conn.rollback()
         errors = [i for i in issues if i.severity == "error"]
         for i in issues:
@@ -522,18 +522,22 @@ class Pipeline:
 
     def _score(self, etl: ETLRunResult, report: DQReport | None, losses: list[str] | None = None) -> tuple:
         """Higher is better: no records or data lost compared with earlier builds, then gate passed,
-        fewer ETL errors, fewer blocking and repairable failures. Losing data ranks below any
-        failing check, so a repair that drops records or blanks fields to pass is rolled back."""
+        fewer blocking ETL errors, fewer blocking and repairable failures. Losing data ranks below
+        any failing check, so a repair that drops records or blanks fields to pass is rolled back."""
+        from .quality.checks import repairable
+
         no_loss = not losses
         if report is None:
-            return (no_loss, False, -len(etl.errors()), -10**9, -10**9)
+            return (no_loss, False, -len(etl.blocking_errors()), -10**9, -10**9)
         sev = set(self.cfg.quality.repair_severities)
-        repairable = sum((r.failed or bool(r.error)) and r.severity in sev and not r.not_applicable for r in report.results)
-        return (no_loss, report.passed, -len(etl.errors()), -len(report.blocking_failures), -repairable)
+        n_repairable = sum(repairable(r, sev) for r in report.results)
+        return (no_loss, report.passed, -len(etl.blocking_errors()), -len(report.blocking_failures), -n_repairable)
 
     def _repairable(self, report: DQReport) -> bool:
+        from .quality.checks import repairable
+
         sev = set(self.cfg.quality.repair_severities)
-        return any((r.failed or r.error) and r.severity in sev and not r.not_applicable for r in report.results)
+        return any(repairable(r, sev) for r in report.results)
 
     def report(self, shareable: bool = True) -> None:
         """Write the inspection report, and (by default) the shareable copy beside it, so the two

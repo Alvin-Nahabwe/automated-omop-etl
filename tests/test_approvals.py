@@ -89,6 +89,22 @@ def test_design_approval_holds_until_the_spec_changes(ws):
     assert events[-1]["by"] == "alice" and events[-1]["stage"] == "design"
 
 
+def test_design_digest_ignores_fields_added_at_their_default():
+    """New ETLSpec / TableMapping fields must not void the approvals of specs written before them:
+    register each one in models.DIGEST_IGNORED_DEFAULTS. This pins the reference spec's digest."""
+    from omop_agent.approvals import _digest, _spec_payload_of
+
+    text = SPEC.read_text()
+    assert _digest(_spec_payload_of(text))[:16] == "c89d2809a0188caa"
+    data = yaml.safe_load(text)
+    assert _digest(_spec_payload_of(yaml.safe_dump({**data, "derive_eras": True})))[:16] == "c89d2809a0188caa"
+    # a field that is set to something else changes what was approved
+    assert _digest(_spec_payload_of(text + "derive_eras: false\n"))[:16] != "c89d2809a0188caa"
+    assert _digest(_spec_payload_of(text + "route_by_domain: false\n"))[:16] != "c89d2809a0188caa"
+    data["table_mappings"][-1]["dedup_order"] = "x.dod::date DESC"
+    assert _digest(_spec_payload_of(yaml.safe_dump(data)))[:16] != "c89d2809a0188caa"
+
+
 def test_mapping_approval_tracks_targets_and_statuses(ws):
     record_approval(ws, "vocab_map", "bob")
     digest = artifact_digest(ws, "vocab_map")

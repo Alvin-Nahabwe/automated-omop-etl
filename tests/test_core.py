@@ -40,6 +40,57 @@ def test_load_config_resolves_paths(tmp_path, monkeypatch):
     assert cfg.llm.model == "claude-opus-5-5"
 
 
+def test_config_etl_settings_and_release_date(tmp_path, monkeypatch):
+    from datetime import date, timedelta
+
+    from pydantic import ValidationError
+
+    from omop_agent.config import CdmSourceConfig, EtlConfig, ProjectConfig, SourceConfig
+
+    monkeypatch.delenv("RELEASE_DATE", raising=False)
+    (tmp_path / "omop_agent.yaml").write_text(
+        "name: t\nsource: {type: csv, path: ./data}\ntarget: {url: 'postgresql://x@y/z'}\n"
+        "cdm_source: {source_release_date: '${RELEASE_DATE:-}'}\netl: {timezone: Africa/Nairobi}\n"
+    )
+    cfg = load_config(tmp_path / "omop_agent.yaml")
+    assert cfg.cdm_source.source_release_date is None  # an unset ${VAR:-} means "derive it"
+    assert cfg.etl == EtlConfig(timezone="Africa/Nairobi", partial_dates="widest")
+    monkeypatch.setenv("RELEASE_DATE", "2023-12-31")
+    assert load_config(tmp_path / "omop_agent.yaml").cdm_source.source_release_date == date(2023, 12, 31)
+    # defaults: no zone (offsets ignored, wall clock kept), widest partial dates
+    plain = ProjectConfig.model_validate({"name": "t", "source": {"type": "csv", "path": "."},
+                                          "target": {"url": "postgresql://x@y/z"}})
+    assert plain.etl.timezone is None and plain.etl.partial_dates == "widest"
+    with pytest.raises(ValidationError, match="not an IANA time zone"):
+        EtlConfig(timezone="Mars/Olympus_Mons")
+    with pytest.raises(ValidationError):
+        EtlConfig(partial_dates="middle")
+    # a release date after today would fail DQD's plausibleTemporalAfter on cdm_release_date
+    with pytest.raises(ValidationError, match="in the future"):
+        CdmSourceConfig(source_release_date=date.today() + timedelta(days=1))
+    assert CdmSourceConfig(source_release_date=date.today()).source_release_date == date.today()
+
+    # missing-value markers: a CSV default, none for databases, or exactly the configured list
+    csv_src = SourceConfig(type="csv", path=tmp_path)
+    assert csv_src.effective_na_values == ["NA", "NULL", "\\N", "."]
+    assert SourceConfig(type="database", url="postgresql://x@y/z").effective_na_values == []
+    assert SourceConfig(type="csv", path=tmp_path, na_values=[]).effective_na_values == []
+    assert SourceConfig(type="csv", path=tmp_path, na_values=["-99"]).effective_na_values == ["-99"]
+
+
+def test_new_spec_fields_default_to_the_new_behaviour():
+    from omop_agent.models import ETLSpec, MappingDecision, SourceTerm, TableMapping
+
+    spec = ETLSpec.model_validate({"person_key": {"table": "p", "expression": "id"}, "table_mappings": []})
+    assert spec.route_by_domain is True and spec.derive_eras is True
+    tm = TableMapping.model_validate({"target_table": "death", "source": {"table": "d", "alias": "d"}, "fields": []})
+    assert tm.dedup_order is None
+    assert "dedup_order" in TableMapping.model_json_schema()["properties"]
+    term = SourceTerm(source_vocabulary_id="V", source_code="c", source_name="c", frequency=1)
+    decision = MappingDecision(source_vocabulary_id="V", source_code="c", source_name="c", frequency=1)
+    assert term.accepted_domains == [] and decision.accepted_domains == []
+
+
 def test_replay_structured_and_agent(tmp_path):
     ws = Workspace(tmp_path / "work")
     save_recording(tmp_path / "rec", "stage", "a:b", {"kind": "structured", "output": {"value": 3}})

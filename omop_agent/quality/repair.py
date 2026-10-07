@@ -54,6 +54,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ..cdm.spec import load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, execute, rollback_only, short_error
+from ..etl.compiler import SPEC_KINDS
+from ..etl.session import apply_session
 from ..llm.base import AgentTool, LLMClient, LLMError, LLMUnavailable
 from ..models import (
     CheckResult,
@@ -71,6 +73,7 @@ from ..privacy import name_rule, pii_columns, pii_references, profile_prompt_tex
 from ..profiling.profiler import KEY_MAX_LISTED_DISTINCT, _is_key_column
 from ..sqlguard import fragment_issues, strip_literals
 from ..workspace import Workspace, utcnow
+from .checks import repairable
 
 MAX_FAILURES_IN_PROMPT = 30
 COUNT_TIMEOUT_MS = 30_000
@@ -546,6 +549,7 @@ def count_records(state: RepairState, inp: CountRecordsInput) -> str:
     k = state.min_cell_count
     try:
         with _readonly(state.conn):
+            apply_session(state.conn, state.cfg)  # compare dates and times as the build does
             resolved = _resolve_table(state, inp.table)
             if isinstance(resolved, str):
                 return resolved
@@ -816,8 +820,11 @@ def mapping_issues(state: RepairState, tm: TableMapping) -> list[str]:
     return issues
 
 
-def validate_mapping(tm: TableMapping, spec: ETLSpec, conn: psycopg.Connection, schemas: Schemas) -> str | None:
-    """None if ``tm`` compiles and its INSERT EXPLAINs cleanly, else the error."""
+def validate_mapping(
+    tm: TableMapping, spec: ETLSpec, conn: psycopg.Connection, schemas: Schemas, cfg: ProjectConfig | None = None
+) -> str | None:
+    """None if ``tm`` compiles and its INSERT EXPLAINs cleanly (under the build's session
+    settings), else the error."""
     from ..etl.compiler import compile_table
 
     try:
@@ -826,6 +833,7 @@ def validate_mapping(tm: TableMapping, spec: ETLSpec, conn: psycopg.Connection, 
         return f"does not compile: {e}"
     try:
         with rollback_only(conn):
+            apply_session(conn, cfg)
             execute(conn, "EXPLAIN\n" + sql.rstrip().rstrip(";"))
     except psycopg.Error as e:
         return f"EXPLAIN failed: {redact_error(short_error(e), sql, known_identifiers(None, schemas))}"
@@ -894,7 +902,7 @@ def _apply(
     else:
         mappings[pos] = new_tm
     new_spec = state.spec.model_copy(update={"table_mappings": mappings}, deep=True)
-    error = validate_mapping(new_tm, new_spec, state.conn, state.schemas)
+    error = validate_mapping(new_tm, new_spec, state.conn, state.schemas, state.cfg)
     if error:
         return f"REJECTED: {error}"
     state.spec = new_spec
@@ -1080,14 +1088,18 @@ def build_repair_tools(state: RepairState) -> list[AgentTool]:
 def repair_triggers(
     dq: DQReport | None, etl_result: ETLRunResult | None, cfg: ProjectConfig
 ) -> tuple[list[TableLoadResult], list[CheckResult]]:
-    """ETL step errors if there are any; otherwise the DQ failures in ``repair_severities``."""
-    if etl_result is not None and etl_result.errors():
-        return etl_result.errors(), []
+    """The errors of blocking steps that run spec SQL, if there are any; otherwise the repairable DQ
+    failures in ``repair_severities`` (``checks.repairable``). Errors of steps the build generates
+    (id-map pruning, routing, eras, ...) are never given to the agent: its tools cannot change them."""
+    if etl_result is not None:
+        fixable = [s for s in etl_result.blocking_errors() if s.kind is None or s.kind in SPEC_KINDS]
+        if fixable:
+            return fixable, []
     if dq is None:
         return [], []
     severities = set(cfg.quality.repair_severities)
     order = {"fatal": 0, "convention": 1, "characterization": 2}
-    failures = [r for r in dq.results if (r.failed or r.error) and r.severity in severities and not r.not_applicable]
+    failures = [r for r in dq.results if repairable(r, severities)]
     return [], sorted(failures, key=lambda r: (order.get(r.severity, 3), -r.pct_violated_rows))
 
 

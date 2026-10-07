@@ -25,7 +25,14 @@ from omop_agent.models import (
     TableProfile,
 )
 from omop_agent.quality import dqd_r
-from omop_agent.quality.checks import etl_checks, gate, run_builtin_checks, translate_sqlrender
+from omop_agent.quality.checks import (
+    etl_checks,
+    gate,
+    is_listed_check,
+    repairable,
+    run_builtin_checks,
+    translate_sqlrender,
+)
 from omop_agent.quality.repair import (
     RepairState,
     build_repair_prompt,
@@ -33,6 +40,7 @@ from omop_agent.quality.repair import (
     redact_error,
     repair_spec,
     repair_triggers,
+    validate_mapping,
 )
 from omop_agent.workspace import Workspace
 
@@ -135,6 +143,139 @@ def test_etl_checks_and_gate(tmp_path):
     passed, blocking = gate(results[:4], cfg, etl)
     assert not passed and blocking == ["etlStepError.drug_exposure (step 07_drug_exposure): boom"]
     assert gate(results[:4], cfg) == (True, [])
+
+
+def test_etl_check_keys_carry_the_step_label(tmp_path):
+    etl = ETLRunResult(started_at=NOW, steps=[
+        TableLoadResult(target_table="measurement", step="09_measurement", kind="insert", rows_inserted=90,
+                        source_rows=100, retained_rows=90),
+        TableLoadResult(target_table="measurement", step="10_measurement_2", kind="insert", rows_inserted=50,
+                        source_rows=50, retained_rows=50),
+        TableLoadResult(target_table="drug_exposure", step="11_custom_fix_dates", kind="custom", error="boom"),
+    ])
+    results = etl_checks(etl)
+    assert [r.key for r in results] == [
+        "etlRecordRetention.measurement",  # one mapping into a table: the key is unchanged
+        "etlRecordRetention.measurement.measurement_2",
+        "etlStepError.drug_exposure.custom_fix_dates",
+    ]
+    assert [r.step for r in results] == ["measurement", "measurement_2", "custom_fix_dates"]
+    assert len({r.key for r in results}) == len(results)
+    # a check name or a key prefix still selects every step of the table
+    assert all(is_listed_check(r, ["etlRecordRetention.measurement"]) for r in results[:2])
+    # the step label only extends ETL-level keys
+    field = CheckResult(check_name="isRequired", check_level="FIELD", table="person", field="year_of_birth",
+                        description="d", step="person_2")
+    assert field.key == "isRequired.person.year_of_birth"
+
+
+def test_non_blocking_and_generated_step_errors(tmp_path):
+    cfg = plain_config(tmp_path)
+    era = TableLoadResult(target_table="drug_era", step="19_drug_era", kind="derived", blocking=False,
+                          error="relation concept_ancestor does not exist")
+    person = TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=10, source_rows=10)
+    etl = ETLRunResult(started_at=NOW, steps=[person, era])
+    assert etl.ok and etl.errors() == [era] and etl.blocking_errors() == []
+    results = etl_checks(etl)
+    err = next(r for r in results if r.check_name == "etlStepError")
+    assert err.severity == "convention" and err.repairable is False and err.step == "drug_era"
+    assert gate(results, cfg, etl) == (True, [])  # reported, not blocking
+    dq = DQReport(run_at=NOW, passed=True, results=results)
+    assert repair_triggers(dq, etl, cfg) == ([], [])  # never sent to the repair agent
+
+    # a generated step that fails blocks the build, but the agent cannot fix it
+    prune = TableLoadResult(target_table="person_map_prune", step="04_person_map_prune", kind="prune", error="x")
+    etl = ETLRunResult(started_at=NOW, steps=[person, prune])
+    assert not etl.ok and etl.blocking_errors() == [prune]
+    passed, blocking = gate(etl_checks(etl), cfg, etl)
+    assert not passed and blocking[0].startswith("etlStepError.person_map_prune (fatal)")
+    assert next(r for r in etl_checks(etl) if r.check_name == "etlStepError").repairable is False
+    assert repair_triggers(None, etl, cfg) == ([], [])
+    # spec steps are sent; results of older runs (no kind) count as spec steps
+    bad = TableLoadResult(target_table="visit_occurrence", step="05_visit_occurrence", kind="insert", error="y")
+    old = TableLoadResult(target_table="death", step="10_death", error="z")
+    etl = ETLRunResult(started_at=NOW, steps=[person, prune, bad, old])
+    assert repair_triggers(None, etl, cfg) == ([bad, old], [])
+    assert all(r.repairable for r in etl_checks(etl) if r.check_name == "etlStepError" and r.table != "person_map_prune")
+
+
+def test_a_failed_person_load_hides_the_retention_it_causes():
+    etl = ETLRunResult(started_at=NOW, steps=[
+        TableLoadResult(target_table="person", step="03_person", kind="insert", error="division by zero",
+                        source_rows=400),
+        TableLoadResult(target_table="condition_occurrence", step="07_condition_occurrence", kind="insert",
+                        source_rows=1000, retained_rows=0),
+    ])
+    assert [r.key for r in etl_checks(etl)] == ["etlStepError.person"]
+    etl.steps[0] = etl.steps[0].model_copy(update={"error": None, "rows_inserted": 400})
+    assert [r.key for r in etl_checks(etl)] == ["etlRecordRetention.person", "etlRecordRetention.condition_occurrence",
+                                               "etlRecordLoss.condition_occurrence"]
+
+
+def test_repairable():
+    sev = {"fatal", "convention"}
+
+    def res(**kw):
+        base = dict(check_name="isRequired", check_level="FIELD", table="person", description="d",
+                    severity="fatal", failed=True)
+        return CheckResult(**{**base, **kw})
+
+    assert repairable(res(), sev)
+    assert repairable(res(failed=False, error="column does not exist"), sev)
+    assert not repairable(res(failed=False), sev)
+    assert not repairable(res(not_applicable=True), sev)
+    assert not repairable(res(severity="characterization"), sev)
+    assert not repairable(res(repairable=False), sev)
+    assert repairable(res(repairable=True), sev)
+    # an era table the spec loads is repaired like any other; one the build derived is not
+    assert repairable(res(table="drug_era"), sev) and repairable(res(table="condition_era"), sev)
+    assert not repairable(res(table="drug_era"), sev, derived={"drug_era"})
+    assert repairable(res(table="condition_era"), sev, derived={"drug_era"})
+    completeness = res(check_name="measurePersonCompleteness", check_level="TABLE", table="observation")
+    assert repairable(completeness, sev)
+    assert not repairable(completeness, sev, route_only={"observation"})
+    assert repairable(res(table="observation"), sev, route_only={"observation"})
+
+
+def test_score_and_repairable_ignore_non_blocking_and_generated_failures(tmp_path):
+    from omop_agent.pipeline import Pipeline
+
+    cfg = plain_config(tmp_path)
+    cfg = cfg.model_copy(update={"llm": cfg.llm.model_copy(update={"provider": "none"})})
+    p = Pipeline(cfg, log=lambda m: None)
+
+    def report(etl: ETLRunResult) -> DQReport:
+        results = etl_checks(etl)
+        passed, blocking = gate(results, cfg, etl)
+        return DQReport(run_at=NOW, passed=passed, results=results, blocking_failures=blocking)
+
+    person = TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=10, source_rows=10)
+    clean = ETLRunResult(started_at=NOW, steps=[person])
+    # a non-blocking step's error is reported (convention, not repairable): it neither lowers the
+    # score of a build nor keeps the repair loop going
+    era = TableLoadResult(target_table="drug_era", step="19_drug_era", kind="derived", blocking=False,
+                          error="relation concept_ancestor does not exist")
+    with_era = ETLRunResult(started_at=NOW, steps=[person, era])
+    assert any(r.check_name == "etlStepError" and r.severity == "convention" for r in report(with_era).results)
+    assert p._score(with_era, report(with_era)) == p._score(clean, report(clean))
+    assert p._score(with_era, None) == p._score(clean, None)
+    assert not p._repairable(report(with_era)) and not p._repairable(report(clean))
+    # a blocking spec step that failed lowers the score and is given to the agent
+    death = TableLoadResult(target_table="death", step="10_death", kind="insert", error="boom")
+    broken = ETLRunResult(started_at=NOW, steps=[person, death])
+    assert p._score(broken, report(broken)) < p._score(clean, report(clean))
+    assert p._score(broken, None) < p._score(clean, None)
+    assert p._repairable(report(broken))
+
+
+def test_old_etl_results_still_load():
+    old = ETLRunResult.model_validate({"started_at": "2026-01-01T00:00:00Z", "steps": [
+        {"target_table": "person", "step": "03_person", "rows_inserted": 3, "source_rows": 3, "retained_rows": 3},
+        {"target_table": "death", "step": "10_death", "error": "boom"},
+    ]})
+    assert [(s.kind, s.blocking, s.id_retained_rows, s.value_counts, s.stats, s.moved, s.skipped) for s in old.steps] == [
+        (None, True, None, {}, {}, [], None)] * 2
+    assert not old.ok and old.blocking_errors() == old.errors()
 
 
 def test_redact_error():
@@ -616,6 +757,27 @@ def test_count_records_binds_values(repair_env):
         "ERROR: filter on sex: op '=' needs a `value`")
     assert count({"table": "src.individuals", "filters": [{"column": "sex", "op": "in"}]}).startswith("ERROR")
     assert scalar(state.conn, f"SELECT COUNT(*) FROM {qi(state.schemas.src)}.individuals") == 400
+
+
+@pytest.mark.postgres
+def test_repair_counts_and_explains_read_dates_as_the_build_does(repair_env):
+    """The agent's counts and its edits' EXPLAIN run under the build's session settings: a
+    month-first date the server's own DateStyle would accept is an error, as in the build."""
+    state, tools = repair_env
+    count = tools["count_records"].invoke
+    assert scalar(state.conn, "SELECT '03/04/2020'::date IS NOT NULL") is True  # the server's DateStyle reads it
+    on = {"table": "cdm.visit_occurrence", "filters": [{"column": "visit_start_date", "op": "=", "value": "03/04/2020"}]}
+    assert count(on).startswith("ERROR: date/time field value out of range")
+    iso = {"table": "cdm.visit_occurrence", "filters": [{"column": "visit_start_date", "op": "=", "value": "2020-03-04"}]}
+    assert count(iso).startswith("cdm.visit_occurrence WHERE visit_start_date = '2020-03-04': n")
+
+    tm = state.spec.mapping_for("death").model_copy(deep=True)
+    fm = next(f for f in tm.fields if f.target_field == "death_date")
+    fm.kind, fm.expression = "expression", "'03/04/2020'::date"
+    error = validate_mapping(tm, state.spec, state.conn, state.schemas, state.cfg)
+    assert error is not None and error.startswith("EXPLAIN failed: date/time field value out of range")
+    fm.expression = "'2020/03/04'::date"  # year first reads the same under every DateStyle
+    assert validate_mapping(tm, state.spec, state.conn, state.schemas, state.cfg) is None
 
 
 @pytest.mark.postgres

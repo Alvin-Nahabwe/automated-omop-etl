@@ -11,7 +11,8 @@ corresponding DQD SQL file, so results line up with the official R package:
   ``plausibleStartBeforeEnd``, ``plausibleAfterBirth``, ``plausibleBeforeDeath``,
   ``plausibleDuringLife``, ``withinVisitDates``;
 * ETL level (ours): ``etlRecordRetention`` (source rows that never reached the CDM) and
-  ``etlStepError`` (an ETL step that failed).
+  ``etlStepError`` (an ETL step that failed). Each carries the step's label (``step``): a second
+  mapping into one table gets its own key, e.g. ``etlRecordRetention.measurement.measurement_2``.
 
 The other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``, ``plausibleTemporalAfter``,
 ``measureConditionEraCompleteness`` and the concept-level checks) are reported once per
@@ -41,7 +42,7 @@ from ..cdm.ddl import schema_for
 from ..cdm.spec import RESOURCE_PKG, load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, execute, fetch_all, fetch_one, qi, ql, short_error
-from ..etl.compiler import target_tables
+from ..etl.compiler import SPEC_KINDS, step_label, target_tables
 from ..models import CheckResult, DQReport, ETLRunResult, ETLSpec, TableLoadResult
 from ..workspace import utcnow
 
@@ -574,9 +575,18 @@ def _not_implemented_checks(ctx: _Ctx, table: str) -> list[CheckResult]:
 
 def etl_checks(etl_result: ETLRunResult, min_retention_pct: float = 50.0) -> list[CheckResult]:
     """``etlStepError`` for failed steps; ``etlRecordRetention`` for steps that report source rows,
-    and the fatal ``etlRecordLoss`` when a step keeps less than ``min_retention_pct`` of them."""
+    and the fatal ``etlRecordLoss`` when a step keeps less than ``min_retention_pct`` of them.
+
+    Every result carries the step label. The error of a non-blocking step is a convention-level
+    failure, and the repair agent only gets the errors of steps that run spec SQL. When a person
+    load failed, the other steps' retention is left out: its error is the cause of their drops.
+    """
     out: list[CheckResult] = []
+    person_failed = any(
+        s.error and s.target_table == "person" and s.kind in (None, "insert") for s in etl_result.steps
+    )
     for s in etl_result.steps:
+        label = step_label(s.step)
         if s.error:
             out.append(
                 CheckResult(
@@ -586,14 +596,16 @@ def etl_checks(etl_result: ETLRunResult, min_retention_pct: float = 50.0) -> lis
                     description=f"ETL step '{s.step}' loading {s.target_table} failed: {s.error}",
                     category="Conformance",
                     subcategory="ETL",
-                    severity="fatal",
+                    severity="fatal" if s.blocking else "convention",
                     failed=True,
                     error=s.error,
                     sql=s.sql,
+                    step=label,
+                    repairable=s.kind is None or s.kind in SPEC_KINDS,
                 )
             )
-        elif s.source_rows is not None:
-            kept = _retention(s)
+        elif s.source_rows is not None and not person_failed:
+            kept = _retention(s).model_copy(update={"step": label})
             out.append(kept)
             if kept.num_denominator_rows and (1 - kept.pct_violated_rows) * 100 < min_retention_pct:
                 out.append(
@@ -667,11 +679,31 @@ def is_listed_check(r: CheckResult, entries: list[str]) -> bool:
     return any(e == r.check_name or e == r.key or r.key.startswith(e + ".") for e in entries)
 
 
+def repairable(
+    r: CheckResult,
+    severities: set[str] | list[str],
+    *,
+    derived: set[str] | frozenset[str] = frozenset(),
+    route_only: set[str] | frozenset[str] = frozenset(),
+) -> bool:
+    """True when ``r`` is a failure the repair agent should be given: failed or errored, applicable,
+    with a severity in ``severities``, and caused by something the spec tools can change. Never:
+    results marked ``repairable=False`` (e.g. errors of generated steps), checks on the tables this
+    build derived from other tables rather than from the spec (``derived``, e.g. eras built by the
+    build's own steps; an era table the spec loads stays repairable), and person completeness of
+    tables that only receive records moved there by domain (``route_only``)."""
+    if r.repairable is False or r.not_applicable or not (r.failed or r.error) or r.severity not in severities:
+        return False
+    if r.table in derived:
+        return False
+    return not (r.check_name == "measurePersonCompleteness" and r.table in route_only)
+
+
 def gate(
     results: list[CheckResult], cfg: ProjectConfig, etl_result: ETLRunResult | None = None
 ) -> tuple[bool, list[str]]:
     """Pass iff no failed or errored check has a blocking severity or is listed in
-    ``quality.blocking_checks``, and no ETL step errored.
+    ``quality.blocking_checks``, and no blocking ETL step errored.
 
     Returns (passed, one line per blocking problem).
     """
@@ -688,7 +720,7 @@ def gate(
         if r.check_name == "etlStepError":
             step_errors_seen.add((r.table, r.error or ""))
     if etl_result is not None:
-        for s in etl_result.errors():
+        for s in etl_result.blocking_errors():
             if (s.target_table, s.error or "") not in step_errors_seen:
                 blocking.append(f"etlStepError.{s.target_table} (step {s.step}): {(s.error or '')[:300]}")
     return not blocking, blocking

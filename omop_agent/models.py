@@ -10,7 +10,7 @@ field descriptions precise: they are part of the prompt.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.json_schema import SkipJsonSchema
@@ -193,6 +193,14 @@ class TableMapping(BaseModel):
     source: SourceTableRef
     joins: list[JoinSpec] = Field(default_factory=list)
     where: str | None = Field(None, description="Optional SQL filter over the aliases.")
+    dedup_order: str | None = Field(
+        None,
+        description="Only for tables that keep one row per key (person and death: one per person; "
+        "visit_occurrence: one per visit). A SQL ORDER BY list over the aliases that ranks the source rows of "
+        "one key, best first, e.g. \"x.dod::date DESC\" (latest death) or \"(v.visit_type = 'IPD') DESC\". "
+        "Rows whose required fields are NULL never win. Leave it empty to keep the most complete row (for "
+        "death: the latest death date).",
+    )
     fields: list[FieldMapping]
     rationale: str = ""
 
@@ -228,6 +236,17 @@ class ETLSpec(BaseModel):
         "'table_mapping' means a TableMapping for observation_period is provided.",
     )
     observation_period_type_concept_id: int = 32817
+    route_by_domain: bool = Field(
+        True,
+        description="After loading, move every condition/procedure/drug/device/measurement record whose standard "
+        "concept belongs to another event domain (Condition, Procedure, Drug, Device, Measurement, Observation) to "
+        "that domain's table. Measured results are never dropped.",
+    )
+    derive_eras: bool = Field(
+        True,
+        description="Build condition_era and drug_era with the OHDSI era logic. Spec SQL that loads an era table "
+        "replaces the built-in step for that table.",
+    )
     table_mappings: list[TableMapping]
     custom_sql: list[CustomSQL] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
@@ -235,6 +254,16 @@ class ETLSpec(BaseModel):
 
     def mapping_for(self, target_table: str) -> TableMapping | None:
         return next((m for m in self.table_mappings if m.target_table == target_table), None)
+
+
+# Fields added to ETLSpec / TableMapping after design approvals were first recorded, with their
+# defaults. The design-approval digest (approvals.py) leaves a field out while it holds this
+# default, so a spec approved before the field existed keeps its approval. Every new defaulted
+# field of ETLSpec or TableMapping must be registered here (tests pin the demo spec's digest).
+DIGEST_IGNORED_DEFAULTS: dict[str, dict[str, Any]] = {
+    "spec": {"derive_eras": True, "route_by_domain": True},
+    "table_mapping": {"dedup_order": None},
+}
 
 
 class PlannedTable(BaseModel):
@@ -280,6 +309,11 @@ class SourceTerm(BaseModel):
     source_name: str
     frequency: int
     target_domain: str | None = None
+    accepted_domains: list[str] = Field(
+        default_factory=list,
+        description="Domains a target concept may belong to (the record is moved to its domain's table); "
+        "empty: target_domain only.",
+    )
     units: list[ValueFreq] = Field(
         default_factory=list,
         description="Units recorded with this code (measurements/observations), each seen at least "
@@ -293,6 +327,7 @@ class MappingDecision(BaseModel):
     source_name: str
     frequency: int
     target_domain: str | None = None
+    accepted_domains: list[str] = Field(default_factory=list)
     target_concept_id: int = 0
     target_concept_name: str | None = None
     target_domain_id: str | None = None
@@ -351,10 +386,19 @@ class CheckResult(BaseModel):
     not_applicable: bool = False
     error: str | None = None
     sql: str | None = None
+    step: str | None = Field(
+        None, description="ETL checks: the step label without its number, e.g. 'person_2' or 'custom_fix_dates'."
+    )
+    repairable: bool | None = Field(
+        None, description="False: never sent to the repair agent (it cannot fix the cause with the spec tools)."
+    )
 
     @property
     def key(self) -> str:
         parts = [self.check_name, self.table, self.field or "", str(self.concept_id or "")]
+        # a second mapping (or a custom step) into the same table gets its own ETL check key
+        if self.check_level == "ETL" and self.step and self.step != self.table:
+            parts.append(self.step)
         return ".".join(p for p in parts if p)
 
 
@@ -376,16 +420,47 @@ class DQReport(BaseModel):
 # --------------------------------------------------------------------------------------
 
 
+class RoutedRows(BaseModel):
+    """Records a route step moved to the table of their concept's domain."""
+
+    from_table: str
+    to_table: str
+    domain_id: str
+    moved_rows: int = 0
+    rows_with_dropped_fields: int = Field(
+        0, description="Moved rows that had a value in a field the destination table has no place for."
+    )
+
+
 class TableLoadResult(BaseModel):
     target_table: str
     step: str
+    kind: str | None = Field(
+        None, description="id_map | insert | custom | prune | route | merge | derived | metadata (None: older results)."
+    )
+    blocking: bool = Field(True, description="False: an error is reported but does not fail the build (route, eras).")
     rows_inserted: int = 0
     source_rows: int | None = Field(None, description="Source rows after the mapping's joins and WHERE.")
+    id_retained_rows: int | None = Field(
+        None, description="Source rows that survive the INNER person/visit id-map joins."
+    )
     retained_rows: int | None = Field(
         None,
-        description="Source rows that survive the person/visit id joins (before vocabulary fan-out); "
+        description="Source rows that survive the person/visit id joins and the required-field policy, before "
+        "vocabulary fan-out and before de-duplication (id_retained_rows minus value_counts['row']['dropped']); "
         "source_rows - retained_rows is the number of records dropped.",
     )
+    value_counts: dict[str, dict[str, int]] = Field(
+        default_factory=dict,
+        description="Values not loaded as written: category (invalid, imputed, partial_null, offset_ignored, "
+        "offset_converted, defaulted, required_null) -> field -> rows; value_counts['row']['dropped'] counts the "
+        "rows dropped for a NULL required value.",
+    )
+    stats: dict[str, Any] = Field(
+        default_factory=dict, description="Step statistics (one row per key, merge, fill, visit links)."
+    )
+    moved: list[RoutedRows] = Field(default_factory=list, description="Route steps: the records moved.")
+    skipped: str | None = Field(None, description="Why the step was not run (a step it requires failed).")
     seconds: float = 0.0
     error: str | None = None
     sql: str | None = None
@@ -398,10 +473,16 @@ class ETLRunResult(BaseModel):
 
     @property
     def ok(self) -> bool:
-        return all(s.error is None for s in self.steps)
+        """No blocking step failed (errors of non-blocking steps are reported but do not fail the build)."""
+        return all(s.error is None or not s.blocking for s in self.steps)
 
     def errors(self) -> list[TableLoadResult]:
+        """Every step that failed, blocking or not (for logs and the report)."""
         return [s for s in self.steps if s.error]
+
+    def blocking_errors(self) -> list[TableLoadResult]:
+        """The failed steps that fail the build."""
+        return [s for s in self.steps if s.error and s.blocking]
 
 
 class RepairAction(BaseModel):

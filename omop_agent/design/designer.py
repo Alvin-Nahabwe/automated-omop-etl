@@ -464,10 +464,8 @@ def design_etl(
     # validate each mapping; send the ones with errors back with the findings
     for i in range(len(mappings)):
         for n in range(1, max_revisions + 1):
-            errors = [
-                x for x in validate_table_mapping(spec.table_mappings[i], spec, profile, conn, schemas, cfg.privacy)
-                if x.severity == "error"
-            ]
+            issues = validate_table_mapping(spec.table_mappings[i], spec, profile, conn, schemas, cfg.privacy, cfg=cfg)
+            errors = [x for x in issues if x.severity == "error"]
             if not errors:
                 break
             rkey = f"{keys[i]}:revision{n}"
@@ -488,7 +486,7 @@ def design_etl(
             if ws is not None:
                 ws.audit("design_revision", key=rkey, issues=[str(x) for x in errors])
 
-    issues = validate_spec(spec, profile, conn, schemas, cfg.privacy)
+    issues = validate_spec(spec, profile, conn, schemas, cfg.privacy, cfg=cfg)
     if ws is not None:
         save_design(ws, spec, issues)
         ws.audit(

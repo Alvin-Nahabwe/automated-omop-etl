@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import date
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
@@ -28,6 +30,10 @@ def expand_env(value: str) -> str:
         raise ValueError(f"Environment variable {name} is referenced in the config but not set")
 
     return _ENV_REF.sub(repl, value)
+
+
+# Missing-value markers that CSV staging stores as NULL by default (source.na_values).
+CSV_NA_VALUES = ("NA", "NULL", "\\N", ".")
 
 
 class _Base(BaseModel):
@@ -48,6 +54,11 @@ class SourceConfig(_Base):
     skip_ragged_rows: bool = Field(
         False, description="Stage CSV files even if some rows have the wrong number of fields (those rows are left out and counted)."
     )
+    na_values: list[str] | None = Field(
+        None,
+        description="Values (after trimming, case-sensitive) that staging stores as NULL. Default: NA, NULL, \\N "
+        "and '.' for CSV files; none for databases. Set [] to keep them as data.",
+    )
 
     @model_validator(mode="after")
     def _check(self) -> "SourceConfig":
@@ -56,6 +67,13 @@ class SourceConfig(_Base):
         if self.type == "database" and not self.url:
             raise ValueError("source.url is required when source.type is 'database'")
         return self
+
+    @property
+    def effective_na_values(self) -> list[str]:
+        """The configured ``na_values``, else the default for the source type."""
+        if self.na_values is not None:
+            return list(self.na_values)
+        return list(CSV_NA_VALUES) if self.type == "csv" else []
 
 
 class TargetConfig(_Base):
@@ -71,8 +89,8 @@ class TargetConfig(_Base):
         None,
         description="Optional least-privilege role for running the generated ETL SQL (SET LOCAL ROLE). It "
         "needs USAGE and SELECT on the staging and vocabulary schemas, USAGE plus SELECT, INSERT and DELETE on "
-        "the CDM and ETL schemas, and the connecting user must be a member of it. Tables are emptied as the "
-        "connecting user, not this role.",
+        "the CDM and ETL schemas, EXECUTE on the functions in the ETL schema (granted to PUBLIC by default), "
+        "and the connecting user must be a member of it. Tables are emptied as the connecting user, not this role.",
     )
 
     @model_validator(mode="after")
@@ -164,6 +182,72 @@ class CdmSourceConfig(_Base):
     cdm_source_abbreviation: str = "CDM"
     cdm_holder: str = ""
     source_description: str = ""
+    source_release_date: date | None = Field(
+        None,
+        description="The data extract date. Written to cdm_source.source_release_date; observation periods "
+        "still open at the extract (NULL exit date) end on it. Default: derived from the residency exit dates "
+        "and reported.",
+    )
+
+    @field_validator("source_release_date", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, v: object) -> object:
+        # ``${VAR:-}`` expands to an empty string
+        return None if isinstance(v, str) and not v.strip() else v
+
+    @field_validator("source_release_date", mode="after")
+    @classmethod
+    def _not_in_future(cls, v: date | None) -> date | None:
+        # DQD checks cdm_release_date (the build date) plausibleTemporalAfter source_release_date, threshold 0
+        if v is not None and v > date.today():
+            raise ValueError(
+                f"cdm_source.source_release_date {v.isoformat()} is in the future; use the date of the data extract"
+            )
+        return v
+
+
+class EtlConfig(_Base):
+    """How the build reads source values that need interpretation. Spec SQL always runs with
+    DateStyle 'ISO, YMD' (``etl.session``): a day-first or month-first text date needs to_date
+    with its template, since ``'31/12/2020'::date`` is an error whatever the server's DateStyle."""
+
+    timezone: str | None = Field(
+        None,
+        description="IANA zone of the site, e.g. Africa/Nairobi. Set it when timestamps carry offsets or 'Z': "
+        "they are then converted to this zone. Unset: an offset is ignored and the time is kept as written.",
+    )
+    partial_dates: Literal["widest", "reject"] = Field(
+        "widest",
+        description="Unknown day or month (00, 97-99, or a template without DD/MM) outside birth and death dates: "
+        "'widest' = start dates take the first day, end dates the last day, single dates the 15th; 'reject' = NULL. "
+        "Birth and death dates follow THEMIS.",
+    )
+
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _blank_zone_is_unset(cls, v: object) -> object:
+        return None if isinstance(v, str) and not v.strip() else v
+
+    @field_validator("timezone")
+    @classmethod
+    def _known_zone(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError):
+            if _have_zone_database():
+                raise ValueError(f"etl.timezone {v!r} is not an IANA time zone name (e.g. Africa/Nairobi)") from None
+        return v
+
+
+def _have_zone_database() -> bool:
+    """False on a system without tz data, where PostgreSQL is left to check the zone name."""
+    try:
+        ZoneInfo("Africa/Nairobi")
+    except (ZoneInfoNotFoundError, ValueError):
+        return False
+    return True
 
 
 class ProjectConfig(_Base):
@@ -177,6 +261,7 @@ class ProjectConfig(_Base):
     mapping: MappingConfig = MappingConfig()
     quality: QualityConfig = QualityConfig()
     cdm_source: CdmSourceConfig = CdmSourceConfig()
+    etl: EtlConfig = EtlConfig()
     config_path: Path | None = Field(None, exclude=True)
 
 

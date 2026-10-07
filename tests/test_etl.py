@@ -8,10 +8,21 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omop_agent.cdm.spec import LOAD_ORDER
 from omop_agent.db import Schemas, execute, fetch_all, scalar
-from omop_agent.etl.compiler import CompileError, compile_spec, compile_table, target_tables
-from omop_agent.etl.runner import run_etl
-from omop_agent.models import CustomSQL, ETLSpec, FieldMapping, JoinSpec, TableMapping
+from omop_agent.etl.compiler import (
+    SPEC_KINDS,
+    CompiledStep,
+    CompileError,
+    compile_spec,
+    compile_table,
+    step_label,
+    target_tables,
+)
+from omop_agent.etl.runner import _analyzed_after, _run_step, run_etl
+from omop_agent.etl.session import session_sql
+from omop_agent.models import CustomSQL, ETLSpec, FieldMapping, JoinSpec, TableLoadResult, TableMapping
+from omop_agent.sqlguard import strip_literals
 from omop_agent.workspace import Workspace
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -67,10 +78,19 @@ def test_step_order_and_targets():
         "11_observation_period",
         "12_cdm_source",
     ]
-    assert [s.kind for s in steps] == ["id_map", "id_map", "insert", "id_map", "insert", "id_map"] + ["insert"] * 5 + [
+    assert [s.kind for s in steps] == ["id_map", "id_map", "insert", "prune", "insert", "prune"] + ["insert"] * 5 + [
         "metadata"
     ]
     assert [s.requires for s in steps if s.requires] == ["person", "visit_occurrence"]
+    # sort keys: (load index of the table, band, sequence); id maps first, cdm_source last
+    assert [s.slot for s in steps] == sorted(s.slot for s in steps)
+    assert steps[0].slot[0] == steps[1].slot[0] == -1 and steps[-1].slot[0] > len(LOAD_ORDER) - 1
+    assert step(steps, "person_map_prune").slot == (LOAD_ORDER.index("person"), 1, 0)
+    assert [s.label for s in steps][:3] == ["person_map", "visit_map", "person"]
+    # every generated step is blocking, reads a row count and is one statement; the spec kinds
+    assert all(s.blocking and s.returns == "rowcount" and s.count_sites == () for s in steps)
+    assert all(s.statements == (s.sql,) for s in steps)
+    assert {s.kind for s in steps if s.kind in SPEC_KINDS} == {"id_map", "insert"}
     assert target_tables(spec) == [
         "person", "visit_occurrence", "condition_occurrence", "drug_exposure",
         "measurement", "death", "observation_period", "cdm_source",
@@ -117,8 +137,16 @@ def test_id_maps():
 def test_person_prune_follows_person_custom_sql():
     spec = load_ref().model_copy(deep=True)
     spec.custom_sql = [CustomSQL(name="extra people", target_table="person", sql="SELECT 1")]
-    names = [s.name for s in compile_spec(spec, S)]
+    steps = compile_spec(spec, S)
+    names = [s.name for s in steps]
     assert names[2:5] == ["03_person", "04_custom_extra_people", "05_person_map_prune"]
+    assert [s.kind for s in steps[2:5]] == ["insert", "custom", "prune"]
+    assert steps[3].statements == ()  # custom SQL is not split into statements
+
+    # people loaded only by custom SQL: the prune still follows them, before the visits
+    spec.table_mappings = [tm for tm in spec.table_mappings if tm.target_table != "person"]
+    names = [s.name for s in compile_spec(spec, S)]
+    assert names[2:5] == ["03_custom_extra_people", "04_person_map_prune", "05_visit_occurrence"]
 
 
 def test_casts_and_person_join():
@@ -228,7 +256,8 @@ def test_where_joins_and_custom_sql():
     steps = compile_spec(spec, S)
     names = [s.name for s in steps]
     assert names.index("09_custom_drop_orphans") == names.index("08_drug_exposure") + 1
-    assert names[-2] == "13_custom_note"  # remaining custom SQL after the inserts
+    # custom SQL of a table without a mapping runs at that table's place in the load order
+    assert names[-4:] == ["11_death", "12_custom_note", "13_observation_period", "14_cdm_source"]
     de = step(steps, "drug_exposure")
     assert "INNER JOIN src.clinic_visits cv ON cv.visit_id = p.visit_id" in de.sql
     assert de.sql.rstrip().endswith("WHERE (cv.visit_type <> 'EMERG');")
@@ -241,6 +270,66 @@ def test_where_joins_and_custom_sql():
     custom = steps[names.index("09_custom_drop_orphans")]
     assert "DELETE FROM cdm.drug_exposure" in custom.sql and custom.origins == (spec.custom_sql[0],)
     assert "note" in target_tables(spec)
+
+
+def test_custom_sql_runs_at_its_tables_load_order_slot():
+    spec = load_ref().model_copy(deep=True)
+    spec.custom_sql = [
+        CustomSQL(name="eras", target_table="drug_era", sql="SELECT 1"),
+        CustomSQL(name="sites", target_table="care_site", sql="SELECT 1"),
+        CustomSQL(name="va deaths", target_table="death", sql="SELECT 1"),
+        CustomSQL(name="specimens", target_table="specimen", sql="SELECT 2"),
+        CustomSQL(name="more specimens", target_table="specimen", sql="SELECT 3"),
+        CustomSQL(name="dates", target_table="observation_period", sql="SELECT 4"),
+        CustomSQL(name="other", target_table="not_a_cdm_table", sql="SELECT 5"),
+    ]
+    labels = [s.label for s in compile_spec(spec, S)]
+    assert labels == [
+        "person_map", "visit_map", "custom_sites", "person", "person_map_prune", "visit_occurrence",
+        "visit_map_prune", "condition_occurrence", "drug_exposure", "measurement", "death", "custom_va_deaths",
+        "custom_specimens", "custom_more_specimens", "observation_period", "custom_dates", "custom_eras",
+        "custom_other", "cdm_source",
+    ]
+    # a derived observation period follows every spec writer of observation_period
+    spec = spec.model_copy(update={"observation_period": "from_events"})
+    spec.table_mappings = [tm for tm in spec.table_mappings if tm.target_table != "observation_period"]
+    labels = [s.label for s in compile_spec(spec, S)]
+    assert labels[labels.index("custom_specimens"):labels.index("custom_eras")] == [
+        "custom_specimens", "custom_more_specimens", "custom_dates", "observation_period"]
+    assert step_label("05_person_2") == "person_2" and step_label("person") == "person"
+
+
+def check_step_invariants(steps: list[CompiledStep]) -> None:
+    """What the runner relies on in every compiled step list."""
+    by_label = {s.label: s for s in steps}
+    for s in steps:
+        # a skip is not an error: a blocking step may only require blocking steps, or the build
+        # would pass without it
+        if s.requires and s.blocking:
+            needed = [by_label[s.requires]] if s.requires in by_label else [
+                w for w in steps if w.target_table == s.requires and w.kind != "route"]
+            assert needed and all(n.blocking for n in needed), s.name
+        # EXPLAIN takes one statement at a time
+        if s.sql and s.kind != "custom":
+            assert s.statements, s.name
+            assert all(";" not in strip_literals(x).strip().rstrip(";") for x in s.statements), s.name
+
+
+def test_step_invariants():
+    spec = load_ref().model_copy(deep=True)
+    spec.custom_sql = [CustomSQL(name="extra people", target_table="person", sql="SELECT 1; SELECT 2"),
+                       CustomSQL(name="notes", target_table="note", sql="SELECT 3")]
+    check_step_invariants(compile_spec(spec, S))
+    spec = spec.model_copy(update={"observation_period": "from_events"})
+    spec.table_mappings = [tm for tm in spec.table_mappings if tm.target_table != "observation_period"]
+    check_step_invariants(compile_spec(spec, S))
+    # what the check catches
+    with pytest.raises(AssertionError, match="02_x"):
+        check_step_invariants([CompiledStep("01_r", None, "route", "SELECT 1", blocking=False, statements=("SELECT 1",)),
+                               CompiledStep("02_x", None, "derived", "SELECT 1", requires="r", statements=("SELECT 1",))])
+    with pytest.raises(AssertionError, match="01_two"):
+        check_step_invariants([CompiledStep("01_two", None, "merge", "SELECT 1; SELECT 2",
+                                            statements=("SELECT 1; SELECT 2",))])
 
 
 def test_from_events_and_cdm_source_steps():
@@ -258,6 +347,14 @@ def test_from_events_and_cdm_source_steps():
     assert cs.name.endswith("_cdm_source") and cs.kind == "metadata"
     assert "vocabulary_id = 'CDM' AND concept_code IN ('CDM v5.4.0', 'CDM v5.4')" in cs.sql
     assert "WHERE vocabulary_id = 'None'), 'unknown')" in cs.sql
+    assert "    'omop-agent',\n    CURRENT_DATE,\n    CURRENT_DATE," in cs.sql
+    # a configured extract date is the source release date
+    from datetime import date
+
+    from omop_agent.config import CdmSourceConfig
+
+    configured = compile_spec(spec, S, CdmSourceConfig(source_release_date=date(2023, 12, 31)))[-1]
+    assert "    'omop-agent',\n    DATE '2023-12-31',\n    CURRENT_DATE," in configured.sql
 
 
 def test_trailing_comment_in_expression_is_safe():
@@ -646,3 +743,226 @@ def test_runner_refuses_unsafe_spec_sql(staged):
     assert errors["person"].startswith("refused: unsafe SQL in the spec: person.gender_source_value:")
     assert "pg_read_file()" in errors["person"] and "DROP" in errors["death"]
     assert count(conn, schemas, "person") == 0 and count(conn, schemas, "death") > 0  # the table still exists
+
+
+# --------------------------------------------------------------------------------------
+# step mechanics (kinds, returns, counters, skips, session settings, ANALYZE)
+# --------------------------------------------------------------------------------------
+
+
+def test_analyze_policy():
+    def res(**kw):
+        return TableLoadResult(target_table="x", step="01_x", **kw)
+
+    insert = CompiledStep("05_condition_occurrence", "condition_occurrence", "insert", "INSERT ...")
+    assert _analyzed_after(insert, res(rows_inserted=3), S, last_id_map=False) == ["cdm.condition_occurrence"]
+    assert _analyzed_after(insert, res(error="boom"), S, last_id_map=False) == []
+    assert _analyzed_after(insert, res(skipped="a step loading person failed"), S, last_id_map=False) == []
+    # the id maps: after the last id-map step and after each prune
+    id_map = CompiledStep("02_visit_map", None, "id_map", "INSERT ...")
+    assert _analyzed_after(id_map, res(), S, last_id_map=True) == ["etl.person_map", "etl.visit_map"]
+    assert _analyzed_after(id_map, res(), S, last_id_map=False) == []
+    prune = CompiledStep("04_person_map_prune", None, "prune", "DELETE ...")
+    assert _analyzed_after(prune, res(), S, last_id_map=False) == ["etl.person_map", "etl.visit_map"]
+    # a route step: its source table and the destinations of what it moved
+    route = CompiledStep("12_route_measurement", "measurement", "route", "WITH ...", returns="rows")
+    moved = res(moved=[{"from_table": "measurement", "to_table": "observation", "domain_id": "Observation",
+                        "moved_rows": 4}])
+    assert _analyzed_after(route, moved, S, last_id_map=False) == ["cdm.measurement", "cdm.observation"]
+    # the cdm_source row and custom SQL into a non-CDM table are not analyzed
+    assert _analyzed_after(CompiledStep("20_cdm_source", "cdm_source", "metadata", "INSERT ..."), res(), S,
+                           last_id_map=False) == []
+    assert _analyzed_after(CompiledStep("09_custom_x", "elsewhere", "custom", "SELECT 1"), res(), S,
+                           last_id_map=False) == []
+
+
+def test_session_sql():
+    from datetime import date
+
+    from omop_agent.config import CdmSourceConfig, EtlConfig
+
+    # without a configured zone the session keeps the server's
+    assert session_sql() == [
+        "SET LOCAL datestyle = 'ISO, YMD';",
+        "SELECT set_config('omop_agent.imputation_cap', CURRENT_DATE::text, true);",
+    ]
+    cfg = make_test_config().model_copy(update={
+        "etl": EtlConfig(timezone="Africa/Nairobi"),
+        "cdm_source": CdmSourceConfig(source_release_date=date(2023, 12, 31)),
+    })
+    assert session_sql(cfg)[1:] == [
+        "SET LOCAL timezone = 'Africa/Nairobi';",
+        "SELECT set_config('omop_agent.imputation_cap', '2023-12-31', true);",
+    ]
+
+
+def make_test_config():
+    from omop_agent.config import ProjectConfig
+
+    return ProjectConfig.model_validate({"name": "t", "source": {"type": "csv", "path": "."},
+                                         "target": {"url": "postgresql://unused"}})
+
+
+@pytest.mark.postgres
+def test_step_returns_counters_and_session(staged):
+    from datetime import date
+
+    from omop_agent.config import CdmSourceConfig, EtlConfig
+
+    conn, schemas, cfg = staged
+    cfg = cfg.model_copy(update={
+        "etl": EtlConfig(timezone="Africa/Nairobi"),
+        "cdm_source": CdmSourceConfig(source_release_date=date(2023, 12, 31)),
+    })
+    # returns="row": one row of statistics, 'inserted' is the row count; the settings are pinned
+    stats = CompiledStep(
+        "01_merge", "observation_period", "merge",
+        "SELECT 1;\nSELECT 7 AS inserted, 3::numeric AS episodes, DATE '2020-01-31' AS release_date,"
+        " current_setting('DateStyle') AS datestyle, current_setting('TimeZone') AS tz,"
+        " current_setting('omop_agent.imputation_cap') AS cap",
+        returns="row",
+    )
+    res = _run_step(conn, stats, cfg)
+    assert res.error is None and (res.kind, res.blocking) == ("merge", True)
+    assert res.rows_inserted == 7
+    assert res.stats == {"inserted": 7, "episodes": 3, "release_date": "2020-01-31", "datestyle": "ISO, YMD",
+                         "tz": "Africa/Nairobi", "cap": "2023-12-31"}
+    # SET LOCAL: the settings end with the step's transaction
+    assert scalar(conn, "SELECT current_setting('omop_agent.imputation_cap', true)") in (None, "")
+    # without a configured zone and release date: the session's own zone, and the cap is the current date
+    with conn.transaction(force_rollback=True):
+        execute(conn, "SET LOCAL timezone = 'Asia/Kolkata'")  # e.g. the server's zone
+        res = _run_step(conn, stats, None)
+    assert res.stats["tz"] == "Asia/Kolkata" and res.stats["cap"] == date.today().isoformat()
+
+    # returns="rows": the records a route step moved; a non-blocking step reports its kind
+    route = CompiledStep(
+        "02_route_measurement", "measurement", "route",
+        "SELECT * FROM (VALUES ('observation', 'Observation', 4, 1), ('condition_occurrence', 'Condition', 2, 0))"
+        " AS t(to_table, domain_id, moved_rows, rows_with_dropped_fields)",
+        returns="rows", blocking=False,
+    )
+    res = _run_step(conn, route, cfg)
+    assert res.error is None and res.blocking is False and res.rows_inserted == 0
+    assert [(m.from_table, m.to_table, m.domain_id, m.moved_rows, m.rows_with_dropped_fields) for m in res.moved] == [
+        ("measurement", "observation", "Observation", 4, 1), ("measurement", "condition_occurrence", "Condition", 2, 0)]
+
+    # counters of the step's sites go to value_counts; dropped rows leave retained_rows
+    counted = CompiledStep(
+        "03_person", "person", "insert",
+        "SELECT set_config('omop_agent.invalid__year_of_birth', '2', true),"
+        " set_config('omop_agent.defaulted__gender_concept_id', '5', true),"
+        " set_config('omop_agent.dropped__row', '1', true),"
+        " set_config('omop_agent.invalid__not_a_site', '9', true)",
+        count_sites=("year_of_birth", "gender_concept_id", "row"),
+        retained_count_sql="SELECT 5 AS n, 3 AS visit_key_rows",
+    )
+    res = _run_step(conn, counted, cfg)
+    assert res.error is None
+    assert res.value_counts == {"invalid": {"year_of_birth": 2}, "defaulted": {"gender_concept_id": 5},
+                                "row": {"dropped": 1}}
+    assert (res.id_retained_rows, res.retained_rows) == (5, 4)
+    assert res.stats == {"visit_links": {"visit_key_rows": 3}}
+    # counters set earlier in an enclosing transaction are reset at step start
+    with conn.transaction():
+        execute(conn, "SELECT set_config('omop_agent.invalid__year_of_birth', '8', true)")
+        quiet = CompiledStep("04_person", "person", "insert", "SELECT 1", count_sites=("year_of_birth",))
+        assert _run_step(conn, quiet, cfg).value_counts == {}
+    # a failed step reports no counts
+    broken = CompiledStep("05_person", "person", "insert",
+                          "SELECT set_config('omop_agent.dropped__row', '3', true); SELECT 1/0",
+                          count_sites=("row",), retained_count_sql="SELECT 4 AS n")
+    res = _run_step(conn, broken, cfg)
+    assert "division by zero" in res.error and res.value_counts == {} and res.retained_rows == 4
+
+
+@pytest.mark.postgres
+def test_a_step_result_that_cannot_be_read_fails_that_step(staged):
+    conn, schemas, cfg = staged
+    execute(conn, f"CREATE TABLE {schemas.etl}.p_result_probe (n int)")
+    conn.commit()
+    probe = f"INSERT INTO {schemas.etl}.p_result_probe VALUES (1);\n"
+    try:
+        # a moved-rows row without to_table: the step fails (rolled back), the build goes on
+        route = CompiledStep("12_route_measurement", "measurement", "route",
+                             probe + "SELECT 'Observation' AS domain_id, 3 AS moved_rows", returns="rows",
+                             blocking=False)
+        res = _run_step(conn, route, cfg)
+        assert res.error == "unexpected step result: to_table: Field required" and res.moved == []
+        merge = CompiledStep("16_observation_period_merge", "observation_period", "merge",
+                             probe + "SELECT 'n/a' AS inserted", returns="row")
+        res = _run_step(conn, merge, cfg)
+        assert res.error.startswith("unexpected step result: invalid literal for int()") and res.stats == {}
+        counted = CompiledStep("03_person", "person", "insert",
+                               probe + "SELECT set_config('omop_agent.invalid__year_of_birth', 'x', true)",
+                               count_sites=("year_of_birth",))
+        assert _run_step(conn, counted, cfg).error.startswith("unexpected step result:")
+        assert scalar(conn, f"SELECT COUNT(*) FROM {schemas.etl}.p_result_probe") == 0  # every step rolled back
+    finally:
+        conn.rollback()
+        execute(conn, f"DROP TABLE {schemas.etl}.p_result_probe")
+        conn.commit()
+
+
+@pytest.mark.postgres
+def test_skips_propagate_and_non_blocking_errors_do_not_fail_the_build(staged, tmp_path, monkeypatch):
+    import omop_agent.etl.runner as runner
+
+    conn, schemas, cfg = staged
+    ws = Workspace(tmp_path / "ws")
+    steps = [
+        CompiledStep("01_route_prepare", None, "route", "SELECT 1/0", blocking=False),
+        CompiledStep("02_route_measurement", "measurement", "route", "SELECT 1", requires="route_prepare",
+                     blocking=False, returns="rows"),
+        CompiledStep("03_after_route", None, "derived", "SELECT 1", requires="route_measurement", blocking=False),
+        CompiledStep("04_condition_era", "condition_era", "derived", "SELECT 1/0", blocking=False),
+        CompiledStep("05_drug_era", "drug_era", "derived", "SELECT 1", requires="condition_era", blocking=False),
+        CompiledStep("06_cdm_source", "cdm_source", "metadata", "SELECT 1"),
+        # a route step's own table is not marked failed: steps loading measurement still run
+        CompiledStep("07_measurement_check", None, "derived", "SELECT 1", requires="measurement"),
+    ]
+    monkeypatch.setattr(runner, "compile_spec", lambda *a, **k: steps)
+    result = run_etl(conn, schemas, fixed_ref(), cfg, ws)
+    by = {s.step: s for s in result.steps}
+    assert [s.kind for s in result.steps] == ["route", "route", "derived", "derived", "derived", "metadata", "derived"]
+    assert by["02_route_measurement"].skipped == "step route_prepare failed"
+    assert by["03_after_route"].skipped == "step route_measurement failed"  # the skip propagates
+    assert by["05_drug_era"].skipped == "a step loading condition_era failed"
+    assert by["07_measurement_check"].skipped is None and by["06_cdm_source"].skipped is None
+    assert [s.step for s in result.errors()] == ["01_route_prepare", "04_condition_era"]
+    assert result.ok and result.blocking_errors() == []  # only non-blocking steps failed
+    audit = {e["step"]: e for e in ws.read_audit() if e["event"] == "etl_step"}
+    assert audit["04_condition_era"]["blocking"] is False and audit["04_condition_era"]["kind"] == "derived"
+    assert audit["03_after_route"]["skipped"] == "step route_measurement failed"
+    run = [e for e in ws.read_audit() if e["event"] == "etl_run"][-1]
+    assert run["ok"] is True and run["totals"]["errors"] == 2 and run["totals"]["blocking_errors"] == 0
+    assert run["totals"]["skipped"] == 3
+    # each SQL file records the session settings it ran under
+    assert (ws.sql_dir / "06_cdm_source.sql").read_text().startswith("-- session: SET LOCAL datestyle = 'ISO, YMD';")
+
+    steps[5] = CompiledStep("06_cdm_source", "cdm_source", "metadata", "SELECT 1/0")
+    result = run_etl(conn, schemas, fixed_ref(), cfg)
+    assert not result.ok and [s.step for s in result.blocking_errors()] == ["06_cdm_source"]
+
+
+@pytest.mark.postgres
+def test_spec_sql_is_read_under_the_session_settings(staged):
+    from omop_agent.config import EtlConfig
+    from omop_agent.vocab.evaluate import query_rows
+
+    conn, schemas, cfg = staged
+    cfg = cfg.model_copy(update={"etl": EtlConfig(timezone="Asia/Kolkata")})
+    sql = "SELECT current_setting('DateStyle') AS ds, current_setting('TimeZone') AS tz"
+    assert query_rows(conn, sql, cfg) == [{"ds": "ISO, YMD", "tz": "Asia/Kolkata"}]
+    server_zone = scalar(conn, "SELECT current_setting('TimeZone')")
+    assert query_rows(conn, sql) == [{"ds": "ISO, YMD", "tz": server_zone}]
+    # the build: a timestamptz literal is read in the site zone
+    spec = fixed_ref().model_copy(deep=True)
+    spec.custom_sql = [CustomSQL(name="when", target_table="metadata", sql=(
+        "INSERT INTO {cdm}.metadata (metadata_id, metadata_concept_id, metadata_type_concept_id, name, "
+        "value_as_string, metadata_date) SELECT 1, 0, 0, 'zone', "
+        "to_char('2020-01-01 23:30:00+00'::timestamptz, 'YYYY-MM-DD HH24:MI'), "
+        "('2020-01-01 23:30:00+00'::timestamptz)::date"))]
+    assert run_etl(conn, schemas, spec, cfg).ok
+    rows = fetch_all(conn, f"SELECT value_as_string, metadata_date FROM {schemas.cdm}.metadata")
+    assert [(r["value_as_string"], r["metadata_date"].isoformat()) for r in rows] == [("2020-01-02 05:00", "2020-01-02")]

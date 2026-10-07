@@ -13,7 +13,8 @@ runner re-checks before it executes a spec.
 
 With a database connection the validator also checks concept constants against the loaded
 vocabulary, checks that ``vocab_code`` vocabularies are loaded, and ``EXPLAIN``s each compiled
-INSERT inside a transaction that is always rolled back.
+INSERT inside a transaction that is always rolled back, under the build's session settings
+(``etl.session``).
 
 Semantic problems (a code format that does not match the vocabulary) and runtime problems (a
 NOT NULL violation that only shows up with real rows) are left to the build and the
@@ -30,9 +31,10 @@ from pydantic import BaseModel
 
 from ..cdm.ddl import create_cdm_tables, create_etl_tables
 from ..cdm.spec import CdmTable, load_cdm_spec
-from ..config import PrivacyConfig
+from ..config import PrivacyConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, list_columns, qi, rollback_only, short_error
 from ..etl.compiler import ID_MAP_KEYS, CompileError, alias_refs, compile_table, source_ref
+from ..etl.session import apply_session
 from ..models import CustomSQL, ETLSpec, KeySpec, SourceProfile, TableMapping
 from ..privacy import pii_columns, pii_references
 from ..sqlguard import fragment_issues, strip_literals
@@ -593,6 +595,7 @@ def _explain_all(
     conn: psycopg.Connection,
     schemas: Schemas,
     keys: bool = True,
+    cfg: ProjectConfig | None = None,
 ) -> list[SpecIssue]:
     issues: list[SpecIssue] = []
     compiled: list[tuple[TableMapping, str]] = []
@@ -606,6 +609,7 @@ def _explain_all(
             with conn.transaction():
                 create_cdm_tables(conn, schemas, include_vocab=False)
                 create_etl_tables(conn, schemas)
+            apply_session(conn, cfg)  # constants are folded at EXPLAIN: read them as the build does
             for key, what in [(spec.person_key, "person_key"), (spec.visit_key, "visit_key")]:
                 if key is None or not keys or _key_sql_problems(key):
                     continue
@@ -642,14 +646,17 @@ def validate_table_mapping(
     conn: psycopg.Connection | None = None,
     schemas: Schemas | None = None,
     privacy: PrivacyConfig | None = None,
+    *,
+    cfg: ProjectConfig | None = None,
 ) -> list[SpecIssue]:
-    """Issues of one table mapping, in the context of ``spec`` (its keys)."""
+    """Issues of one table mapping, in the context of ``spec`` (its keys). ``cfg`` gives the
+    session settings the EXPLAIN runs under (defaults without it)."""
     cat = _SourceCatalog(profile, conn, schemas)
     issues = _static_mapping(tm, spec, cat, privacy)
     if conn is not None and schemas is not None:
         issues += _db_concepts(tm, conn, schemas)
         if not any(i.severity == "error" for i in issues):
-            issues += _explain_all(spec, [tm], [], conn, schemas, keys=False)
+            issues += _explain_all(spec, [tm], [], conn, schemas, keys=False, cfg=cfg)
     return issues
 
 
@@ -659,11 +666,14 @@ def validate_spec(
     conn: psycopg.Connection | None = None,
     schemas: Schemas | None = None,
     privacy: PrivacyConfig | None = None,
+    *,
+    cfg: ProjectConfig | None = None,
 ) -> list[SpecIssue]:
     """All issues found in ``spec``. Errors block the build; warnings are for review.
 
     ``privacy`` (default ``PrivacyConfig()``) decides, with the profile's PII flags, which
-    source columns are direct identifiers that must not be loaded.
+    source columns are direct identifiers that must not be loaded. ``cfg`` gives the session
+    settings the EXPLAINs run under (defaults without it).
     """
     cat = _SourceCatalog(profile, conn, schemas)
     issues = _static_spec(spec, cat)
@@ -679,5 +689,5 @@ def validate_spec(
         customs = [
             c for c in spec.custom_sql if load_cdm_spec().has_table(c.target_table) and not _custom_sql_problems(c)
         ]
-        issues += _explain_all(spec, clean, customs, conn, schemas)
+        issues += _explain_all(spec, clean, customs, conn, schemas, cfg=cfg)
     return issues

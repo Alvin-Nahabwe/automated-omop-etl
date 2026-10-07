@@ -170,6 +170,7 @@ def _units_by_code(
     fm: FieldMapping,
     expr: str,
     privacy: PrivacyConfig | None,
+    cfg: ProjectConfig | None = None,
 ) -> dict[str, list[ValueFreq]]:
     """Units recorded with each code of a measurement/observation concept field (the mapper needs
     them to tell, e.g., Glucose [Mass/volume] from [Moles/volume]). Only (code, unit) pairs seen at
@@ -189,7 +190,7 @@ def _units_by_code(
         f"GROUP BY code, unit HAVING COUNT(*) >= {int(k)} ORDER BY code, n DESC"
     )
     try:
-        rows = query_rows(conn, schemas.render(sql))
+        rows = query_rows(conn, schemas.render(sql), cfg)
     except psycopg.Error:
         return {}  # context is optional: never block mapping on it
     out: dict[str, list[ValueFreq]] = {}
@@ -219,6 +220,8 @@ def collect_terms(
     profile: SourceProfile | None = None,
     privacy: PrivacyConfig | None = None,
     ws: Workspace | None = None,
+    *,
+    cfg: ProjectConfig | None = None,
 ) -> list[SourceTerm]:
     """Distinct values (with frequencies) of every ``concept_map`` expression in the spec.
 
@@ -231,7 +234,8 @@ def collect_terms(
     A field whose expression reads a direct identifier is skipped, so its values can never
     reach the LLM or the mapping files: see :func:`pii_concept_fields` for the list (also
     audited as ``vocab_pii_fields_skipped`` when ``ws`` is given). ``privacy`` defaults to
-    :class:`PrivacyConfig`, i.e. the default PII name patterns.
+    :class:`PrivacyConfig`, i.e. the default PII name patterns. The source is read under the build's
+    session settings (``cfg``: time zone and imputation cap; defaults without it).
     """
     skip = _pii_fields(spec, profile, privacy)
     if skip and ws is not None:
@@ -251,12 +255,12 @@ def collect_terms(
                 continue
             seen_reads.add((vocab, sql))
             try:
-                rows = query_rows(conn, schemas.render(sql))
+                rows = query_rows(conn, schemas.render(sql), cfg)
             except psycopg.Error as e:
                 raise ValueError(
                     f"{tm.target_table}.{fm.target_field}: could not read source codes: {short_error(e)}"
                 ) from e
-            units = _units_by_code(conn, schemas, tm, fm, expr, privacy)
+            units = _units_by_code(conn, schemas, tm, fm, expr, privacy, cfg)
             for r in rows:
                 key = (vocab, r["code"])
                 if key in merged:

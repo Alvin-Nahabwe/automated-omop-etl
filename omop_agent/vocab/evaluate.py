@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from ..config import ProjectConfig
 from ..db import Schemas, fetch_all, qi, ql, short_error
+from ..etl.session import apply_session
 from ..models import ETLSpec, FieldMapping, TableMapping, ValueFreq
 from .loader import vocabulary_inventory, vocabulary_version
 
@@ -122,13 +123,15 @@ def code_counts_sql(tm: TableMapping, expression: str) -> str:
     return f"SELECT {paren(expression)}::text AS code, COUNT(*) AS n\n{source_from_sql(tm)}\nGROUP BY 1"
 
 
-def query_rows(conn: psycopg.Connection, sql: str) -> list[dict]:
-    """Run a read-only statement in a savepoint that is always rolled back.
+def query_rows(conn: psycopg.Connection, sql: str, cfg: ProjectConfig | None = None) -> list[dict]:
+    """Run a read-only statement in a savepoint that is always rolled back, under the session
+    settings of the build (``etl.session``), so spec expressions read dates as the ETL does.
 
     An error (a bad expression in the spec, say) leaves the caller's transaction usable. The
     statement is sent without parameters, so ``%`` in spec expressions needs no escaping.
     """
     with conn.transaction(force_rollback=True):
+        apply_session(conn, cfg)
         return fetch_all(conn, sql)
 
 
@@ -182,7 +185,7 @@ def _required(spec: ETLSpec, present: set[str]) -> list[RequiredVocabulary]:
 
 
 def _coverage(
-    conn: psycopg.Connection, schemas: Schemas, tm: TableMapping, fm: FieldMapping, min_cell_count: int
+    conn: psycopg.Connection, schemas: Schemas, tm: TableMapping, fm: FieldMapping, cfg: ProjectConfig
 ) -> CodeCoverage:
     vocab = fm.vocabulary.strip()  # type: ignore[union-attr]
     v = "{vocab}"
@@ -210,7 +213,7 @@ ORDER BY k.n DESC, k.code"""
         concept_role=fm.concept_role,
     )
     try:
-        rows = query_rows(conn, schemas.render(sql))
+        rows = query_rows(conn, schemas.render(sql), cfg)
     except psycopg.Error as e:
         return CodeCoverage(
             **base,
@@ -230,7 +233,7 @@ ORDER BY k.n DESC, k.code"""
         codes_mapped_to_standard=sum(1 for r in rows if r["mapped"]),
         records=sum(int(r["n"]) for r in rows),
         records_mapped=sum(int(r["n"]) for r in rows if r[ok_key]),
-        unmatched=[u for u in unmatched if u.count >= min_cell_count][:MAX_UNMATCHED],
+        unmatched=[u for u in unmatched if u.count >= cfg.privacy.min_cell_count][:MAX_UNMATCHED],
     )
 
 
@@ -272,7 +275,7 @@ def evaluate_vocabulary(
     ev.required = _required(spec, present)
 
     fields = _vocab_fields(spec, "vocab_code")
-    ev.coverage = [_coverage(conn, schemas, tm, fm, cfg.privacy.min_cell_count) for tm, fm in fields]
+    ev.coverage = [_coverage(conn, schemas, tm, fm, cfg) for tm, fm in fields]
 
     # ---- issues ----------------------------------------------------------------------
     if inventory and not ev.loaded:
