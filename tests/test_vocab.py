@@ -466,7 +466,8 @@ def test_map_terms_with_replay(staged, tmp_path):
     # exact matches still go to the model (as the top candidate), so related terms are mapped
     # consistently; without an answer for them the exact match is used (asserted above)
     assert 'source_code: "Malaria"' in prompts["SRC_VA_CAUSE:batch1"]
-    assert "2000003002 | acetaminophen 500 MG Oral Tablet | Clinical Drug | RxNorm |" in prompts["SRC_DRUG:batch1"]
+    # drug codes also accept Device concepts: each candidate shows its domain
+    assert "2000003002 | acetaminophen 500 MG Oral Tablet | Drug | Clinical Drug | RxNorm |" in prompts["SRC_DRUG:batch1"]
     retry = prompts["SRC_DRUG:retry1"]
     assert "AL 20/120 tabs" in retry and "artemether lumefantrine" in retry and "Paracetamol" not in retry
 
@@ -723,6 +724,14 @@ def test_review_round_trip(staged, tmp_path):
     assert imported["ORS sachets"].status == "REJECTED" and imported["ORS sachets"].method == "llm"
     assert imported["Zinc 20mg"].status == "FLAGGED" and "not a standard concept" in imported["Zinc 20mg"].rationale
     assert imported["Metformin 500mg"].status == "FLAGGED"
+    # a rejected id never becomes the target under the labels of the concept it replaced: the term
+    # keeps its concept (FLAGGED, so it is not loaded) and the rationale names the rejected id
+    for code in ("Zinc 20mg", "Metformin 500mg"):
+        was = next(d for d in decisions if d.source_code == code)
+        now = imported[code]
+        assert (now.target_concept_id, now.target_concept_name, now.method) == (
+            was.target_concept_id, was.target_concept_name, was.method), code
+    assert "target_concept_id 2000002001 rejected" in imported["Zinc 20mg"].rationale
     aml = imported["Amlodipine 5mg"]
     assert (aml.target_concept_id, aml.status, aml.method, aml.target_concept_name) == (0, "APPROVED", "manual", None)
     quinine = imported["Quinine inj 600mg"]
@@ -797,7 +806,7 @@ def test_export_review_formats(tmp_path):
     assert re.fullmatch(r"SRC_Weird_ID-[0-9a-f]{8}\.csv", paths[1].name)
     with paths[1].open(newline="") as fh:
         row = next(csv.DictReader(fh))
-    assert row["source_code"] == "a,b" and row["confidence"] == "0.12" and row["alternatives"] == "6:six"
+    assert row["source_code"] == "a,b" and row["confidence"] == "0.12" and row["alternatives"] == "6:six [Drug]"
     assert import_review(ws) == [d]
 
 

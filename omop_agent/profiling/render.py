@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..models import ColumnProfile, SourceProfile, ValueFreq
-from ..privacy import suppress_small_cells
+from ..privacy import small_count, suppress_small_cells
 
 TOP_VALUES_SHOWN = 8
 _MAX_VALUE_CHARS = 40
@@ -53,6 +53,35 @@ def _top(c: ColumnProfile, min_cell_count: int) -> str:
     return ", ".join(parts)
 
 
+def _freqs(values: list[ValueFreq], k: int) -> str:
+    kept, _ = suppress_small_cells(list(values), k)  # defensive, as for top values
+    return ", ".join(f"{_value(v.value)}×{v.count}" for v in kept)
+
+
+def rare_offsets(c: ColumnProfile, k: int) -> str:
+    """The values whose offset is too rare to name (counted with the listed offsets a stricter
+    threshold hides)."""
+    hidden = sum(v.count for v in c.tz_offsets) - sum(v.count for v in suppress_small_cells(list(c.tz_offsets), k)[0])
+    n = c.n_rare_offsets + hidden
+    return f"{small_count(n, k)} with rarer offsets" if n else ""
+
+
+def _reading(c: ColumnProfile, k: int) -> list[str] | None:
+    """One row of the "Reading the values" table, or None when there is nothing to say."""
+    if c.is_pii:
+        return None
+    cells = [
+        _freqs(c.value_shapes, k),
+        small_count(c.n_nonconforming, k) if c.n_nonconforming else "",
+        _freqs(c.nonconforming_shapes, k),
+        small_count(c.n_partial_dates, k) if c.n_partial_dates else "",
+        ", ".join(x for x in [_freqs(c.tz_offsets, k), rare_offsets(c, k)] if x),
+        small_count(c.n_na_markers, k) if c.n_na_markers else "",
+        _cell("; ".join(c.format_notes)),
+    ]
+    return cells if any(cells) else None
+
+
 def render_profile_md(profile: SourceProfile) -> str:
     """Scan report: an overview table, then one column table per source table."""
     k = profile.min_cell_count
@@ -67,7 +96,8 @@ def render_profile_md(profile: SourceProfile) -> str:
         f"count says how many distinct values were left out (rare values, or beyond the top list). "
         f"Text min/max are shown only when both values occur at least {k} times. "
         f"Columns flagged **PII** ({n_pii} here) are direct identifiers: they show counts only, "
-        "never values, ranges or means.",
+        "never values, ranges, means or shapes. A shape writes a value with 9 for each digit and a / A for "
+        f"each letter; shapes and offsets follow the same rule, and counts below {k} are shown as <{k}.",
         "",
         "## Overview",
         "",
@@ -106,4 +136,15 @@ def render_profile_md(profile: SourceProfile) -> str:
                 )
                 + " |"
             )
+        reading = [(c, row) for c in t.columns if (row := _reading(c, k)) is not None]
+        if reading:
+            lines += [
+                "",
+                "Reading the values (whole column; ISO dates fit every date format, partial dates have an unknown "
+                "day or month or no day):",
+                "",
+                "| Column | Shapes | Do not fit | Their shapes | Partial dates | Offsets | NA markers | Notes |",
+                "|---|---|---:|---|---:|---|---:|---|",
+            ]
+            lines += [f"| {_cell(c.name)} | " + " | ".join(row) + " |" for c, row in reading]
     return "\n".join(lines) + "\n"

@@ -10,7 +10,7 @@ field descriptions precise: they are part of the prompt.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.json_schema import SkipJsonSchema
@@ -28,12 +28,14 @@ class ValueFreq(BaseModel):
 class ColumnProfile(BaseModel):
     name: str
     declared_type: str | None = Field(None, description="Type reported by the source database, if any.")
-    inferred_type: Literal["integer", "float", "boolean", "date", "datetime", "string", "empty"]
+    inferred_type: Literal["integer", "float", "boolean", "date", "datetime", "time", "string", "empty"]
     n_rows: int
-    n_null: int = Field(..., description="NULL or empty-string values.")
+    n_null: int = Field(..., description="NULL or empty-string values (missing-value markers included).")
     n_distinct: int
     unique: bool = Field(..., description="Every non-null value is distinct.")
-    min_value: str | None = None
+    min_value: str | None = Field(
+        None, description="Smallest value; for dates and times the earliest complete, valid one (ISO)."
+    )
     max_value: str | None = None
     mean: float | None = None
     min_length: int | None = None
@@ -46,6 +48,41 @@ class ColumnProfile(BaseModel):
     n_suppressed_values: int = Field(0, description="Distinct values hidden by small-cell suppression.")
     is_pii: bool = False
     pii_reason: str | None = None
+    # Added with the tolerant date reading; the defaults keep older profile.json files loading.
+    n_na_markers: int = Field(
+        0, description="Values staged as NULL because they were a missing-value marker (source.na_values); "
+        "part of n_null."
+    )
+    n_nonconforming: int = Field(
+        0, description="Non-null values (whole column) that do not fit the inferred type or date format. As in "
+        "the build, ISO dates fit every date format, any one of - / . _ may stand for a separator and a time may "
+        "follow a date. Impossible dates (31/02) do not fit; partial dates are counted apart."
+    )
+    nonconforming_shapes: list[ValueFreq] = Field(
+        default_factory=list,
+        description="Shapes of the non-conforming values (digits as 9, letters as a / A, other characters "
+        "kept), each seen at least min_cell_count times.",
+    )
+    n_partial_dates: int = Field(
+        0, description="Dates with an unknown day or month (00, 97-99), without their day ('06/1975'), or "
+        "only a year; the build completes or rejects them (etl.partial_dates)."
+    )
+    value_shapes: list[ValueFreq] = Field(
+        default_factory=list,
+        description="The most common shapes of the values (e.g. '99/99/9999 99:99'), each seen at least "
+        "min_cell_count times. Never for direct identifiers.",
+    )
+    tz_offsets: list[ValueFreq] = Field(
+        default_factory=list,
+        description="Time zone offsets written after the times ('Z', '+03:00'), each seen at least "
+        "min_cell_count times.",
+    )
+    n_rare_offsets: int = Field(
+        0, description="Values whose offset is seen fewer than min_cell_count times (not in tz_offsets)."
+    )
+    format_notes: list[str] = Field(
+        default_factory=list, description="How to read the values, where the type and format alone do not say."
+    )
 
 
 class TableProfile(BaseModel):
@@ -149,14 +186,25 @@ class FieldMapping(BaseModel):
                    'Maps to' to the standard concept; concept_role='source' returns the source
                    concept itself (for *_source_concept_id fields).
       person_id    expression = the source patient key; resolved to person_id via the person
-                   id map. Rows whose key has no person are dropped.
+                   id map. Rows whose key has no person are dropped. Every person mapping adds
+                   the keys of its rows to the map (people can come from several tables).
       visit_id     expression = the source visit key; resolved via the visit id map. When the CDM
                    field is optional the row is kept with NULL; when it is required (the
-                   visit_occurrence primary key) rows without a visit are dropped.
+                   visit_occurrence primary key) rows without a visit are dropped. A record
+                   links only to a visit of its own person, and only when its key gives exactly
+                   the text of the visit mapping's key.
       auto_id      a generated surrogate key (only for the table's own primary key; never for
                    person.person_id or visit_occurrence.visit_occurrence_id, which must come from
                    the id maps so that events link to the right person and visit).
       null         leave the field NULL.
+
+    The value of a column or expression is converted to the CDM type, and its casts and
+    to_date / to_timestamp calls are read tolerantly (``etl.tolerant``): a value that cannot be
+    read becomes NULL and is counted, instead of failing the whole table. When a column,
+    expression or constant of a required field yields NULL, the build applies the CDM convention
+    and counts it (``etl.policies``): a concept becomes 0, visit_end_date, visit_detail_end_date
+    and drug_exposure_end_date take the start date, and a row without any other required value (a
+    start date, year_of_birth, death_date) is dropped.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -193,6 +241,16 @@ class TableMapping(BaseModel):
     source: SourceTableRef
     joins: list[JoinSpec] = Field(default_factory=list)
     where: str | None = Field(None, description="Optional SQL filter over the aliases.")
+    dedup_order: str | None = Field(
+        None,
+        description="Only for tables that keep one row per key (person and death: one per person; "
+        "visit_occurrence: one per visit and person, spanning the earliest start to the latest end of its rows). "
+        "A SQL ORDER BY list over the aliases that ranks the source rows of one key, best first, e.g. "
+        "\"x.dod::date DESC\" (latest death) or \"(v.visit_type = 'IPD') DESC\". A missing or unreadable "
+        "value ranks last, and rows whose required fields are NULL never win. Leave it empty to keep the most "
+        "complete row (for death: a date known to the day, then the latest). It ranks this mapping's rows only: "
+        "between the mappings of one table, the first in spec order that loads a key wins.",
+    )
     fields: list[FieldMapping]
     rationale: str = ""
 
@@ -224,10 +282,24 @@ class ETLSpec(BaseModel):
     visit_key: KeySpec | None = None
     observation_period: Literal["from_events", "table_mapping"] = Field(
         "from_events",
-        description="'from_events' derives one period per person from min/max event dates; "
-        "'table_mapping' means a TableMapping for observation_period is provided.",
+        description="'from_events': one period per person from the first to the last event date. 'table_mapping': "
+        "mappings (or custom SQL) load one row per source episode (enrolment, residency, follow-up). Either way the "
+        "build merges each person's overlapping and back-to-back periods; with 'table_mapping' it ends open periods "
+        "(NULL end) at cdm_source.source_release_date or at death and gives persons without a valid episode a "
+        "period from their events.",
     )
     observation_period_type_concept_id: int = 32817
+    route_by_domain: bool = Field(
+        True,
+        description="After loading, move every condition/procedure/drug/device/measurement record whose standard "
+        "concept belongs to another event domain (Condition, Procedure, Drug, Device, Measurement, Observation) to "
+        "that domain's table. Measured results are never dropped.",
+    )
+    derive_eras: bool = Field(
+        True,
+        description="Build condition_era and drug_era with the OHDSI era logic. Spec SQL that loads an era table "
+        "replaces the built-in step for that table.",
+    )
     table_mappings: list[TableMapping]
     custom_sql: list[CustomSQL] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
@@ -235,6 +307,16 @@ class ETLSpec(BaseModel):
 
     def mapping_for(self, target_table: str) -> TableMapping | None:
         return next((m for m in self.table_mappings if m.target_table == target_table), None)
+
+
+# Fields added to ETLSpec / TableMapping after design approvals were first recorded, with their
+# defaults. The design-approval digest (approvals.py) leaves a field out while it holds this
+# default, so a spec approved before the field existed keeps its approval. Every new defaulted
+# field of ETLSpec or TableMapping must be registered here (tests pin the demo spec's digest).
+DIGEST_IGNORED_DEFAULTS: dict[str, dict[str, Any]] = {
+    "spec": {"derive_eras": True, "route_by_domain": True},
+    "table_mapping": {"dedup_order": None},
+}
 
 
 class PlannedTable(BaseModel):
@@ -280,6 +362,16 @@ class SourceTerm(BaseModel):
     source_name: str
     frequency: int
     target_domain: str | None = None
+    accepted_domains: list[str] = Field(
+        default_factory=list,
+        description="Domains a target concept may belong to (the record is moved to its domain's table); "
+        "empty: target_domain only.",
+    )
+    auto_approve: bool = Field(
+        True,
+        description="False: the fields that use its source vocabulary expect concepts of different domains, so "
+        "no concept is approved for it without a reviewer.",
+    )
     units: list[ValueFreq] = Field(
         default_factory=list,
         description="Units recorded with this code (measurements/observations), each seen at least "
@@ -293,6 +385,7 @@ class MappingDecision(BaseModel):
     source_name: str
     frequency: int
     target_domain: str | None = None
+    accepted_domains: list[str] = Field(default_factory=list)
     target_concept_id: int = 0
     target_concept_name: str | None = None
     target_domain_id: str | None = None
@@ -351,10 +444,19 @@ class CheckResult(BaseModel):
     not_applicable: bool = False
     error: str | None = None
     sql: str | None = None
+    step: str | None = Field(
+        None, description="ETL checks: the step label without its number, e.g. 'person_2' or 'custom_fix_dates'."
+    )
+    repairable: bool | None = Field(
+        None, description="False: never sent to the repair agent (it cannot fix the cause with the spec tools)."
+    )
 
     @property
     def key(self) -> str:
         parts = [self.check_name, self.table, self.field or "", str(self.concept_id or "")]
+        # a second mapping (or a custom step) into the same table gets its own ETL check key
+        if self.check_level == "ETL" and self.step and self.step != self.table:
+            parts.append(self.step)
         return ".".join(p for p in parts if p)
 
 
@@ -376,18 +478,53 @@ class DQReport(BaseModel):
 # --------------------------------------------------------------------------------------
 
 
+class RoutedRows(BaseModel):
+    """Records a route step moved to the table of their concept's domain."""
+
+    from_table: str
+    to_table: str
+    domain_id: str
+    moved_rows: int = 0
+    rows_with_dropped_fields: int = Field(
+        0, description="Moved rows that had a value in a field the destination table has no place for."
+    )
+
+
 class TableLoadResult(BaseModel):
     target_table: str
     step: str
+    kind: str | None = Field(
+        None, description="id_map | insert | custom | prune | route | merge | derived | metadata (None: older results)."
+    )
+    blocking: bool = Field(True, description="False: an error is reported but does not fail the build (route, eras).")
     rows_inserted: int = 0
     source_rows: int | None = Field(None, description="Source rows after the mapping's joins and WHERE.")
+    id_retained_rows: int | None = Field(
+        None, description="Source rows that survive the INNER person/visit id-map joins."
+    )
     retained_rows: int | None = Field(
         None,
-        description="Source rows that survive the person/visit id joins (before vocabulary fan-out); "
+        description="Source rows that survive the person/visit id joins and the required-field policy, before "
+        "vocabulary fan-out and before de-duplication (id_retained_rows minus value_counts['row']['dropped']); "
         "source_rows - retained_rows is the number of records dropped.",
     )
+    value_counts: dict[str, dict[str, int]] = Field(
+        default_factory=dict,
+        description="Values not loaded as written: category (invalid, imputed, partial_null, offset_ignored, "
+        "offset_converted, defaulted, required_null) -> field -> rows; value_counts['row']['dropped'] counts the "
+        "rows dropped for a NULL required value.",
+    )
+    stats: dict[str, Any] = Field(
+        default_factory=dict, description="Step statistics (one row per key, merge, fill, visit links)."
+    )
+    moved: list[RoutedRows] = Field(default_factory=list, description="Route steps: the records moved.")
+    skipped: str | None = Field(None, description="Why the step was not run (a step it requires failed).")
     seconds: float = 0.0
     error: str | None = None
+    repairable: bool = Field(
+        True, description="False: the error is not one a change of the spec can fix (a missing privilege), so it is "
+        "never sent to the repair agent.",
+    )
     sql: str | None = None
 
 
@@ -398,10 +535,36 @@ class ETLRunResult(BaseModel):
 
     @property
     def ok(self) -> bool:
-        return all(s.error is None for s in self.steps)
+        """No blocking step failed (errors of non-blocking steps are reported but do not fail the build)."""
+        return all(s.error is None or not s.blocking for s in self.steps)
 
     def errors(self) -> list[TableLoadResult]:
+        """Every step that failed, blocking or not (for logs and the report)."""
         return [s for s in self.steps if s.error]
+
+    def blocking_errors(self) -> list[TableLoadResult]:
+        """The failed steps that fail the build."""
+        return [s for s in self.steps if s.error and s.blocking]
+
+    def rows_loaded(self) -> int:
+        """Rows the steps without an error loaded into the CDM from the source. The id-map and pruning
+        steps write only the id maps (new and retired keys) and are left out, and so is the
+        observation-period merge, whose periods replace the episodes its table's writers loaded, and
+        so are the route steps, which only move records already loaded (``rows_moved``) and keep
+        their bookkeeping. The rows the build derived from other CDM tables are counted apart
+        (``rows_derived``)."""
+        return sum(s.rows_inserted for s in self.steps
+                   if s.error is None and s.kind not in ("id_map", "prune", "merge", "route", "derived"))
+
+    def rows_moved(self) -> int:
+        """Records the route steps moved to the table of their concept's domain (they are counted in
+        ``rows_loaded`` by the steps that loaded them)."""
+        return sum(m.moved_rows for s in self.steps if s.error is None for m in s.moved)
+
+    def rows_derived(self) -> int:
+        """The rows the build derived from other CDM tables (observation periods from events, the fill
+        of persons without a period, the eras), apart from ``rows_loaded``."""
+        return sum(s.rows_inserted for s in self.steps if s.error is None and s.kind == "derived")
 
 
 class RepairAction(BaseModel):

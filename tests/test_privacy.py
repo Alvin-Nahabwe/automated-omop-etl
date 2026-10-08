@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from omop_agent.approvals import gate_state, record_approval, recorded_approver
@@ -215,3 +217,177 @@ def test_stage_commands_need_a_recorded_privacy_review(tmp_path):
     result = CliRunner().invoke(app, ["approve", "privacy", "--by", "rita", "-c", str(cfg_path)])
     assert result.exit_code == 0 and "Privacy review approved by rita" in result.output
     assert gate_state(ws, "privacy").current
+
+
+# --------------------------------------------------------------------------------------
+# value shapes, offsets and the counts of values that do not fit
+# --------------------------------------------------------------------------------------
+
+# The prompt text of _profile() before the profile had shapes and offsets: an old profile.json
+# must give exactly this text, so an approved privacy review stays approved after an upgrade.
+OLD_PROFILE_TEXT = """SOURCE TABLE va (100 rows)
+  - informant: string, 0% null, 2 distinct
+      top values: 'Kamau Mwangi'×20; 'Mary Achieng'×20
+  - cause: string, 0% null, 2 distinct
+      top values: 'Malaria'×20; 'Pneumonia'×20
+  - cd4_count: string, 0% null, 50 distinct, PII - values withheld (the column name suggests a phone number)
+  - story: string, 0% null, 1 distinct
+      top values: 'fever then cough'×20
+"""
+
+
+def test_old_profiles_keep_their_text_and_review(tmp_path):
+    from omop_agent.privacy import profile_prompt_text
+
+    new_fields = {"n_na_markers", "n_nonconforming", "nonconforming_shapes", "n_partial_dates", "value_shapes",
+                  "tz_offsets", "n_rare_offsets", "format_notes"}
+    old = _profile().model_dump(mode="json")
+    for t in old["tables"]:
+        for c in t["columns"]:
+            for f in new_fields:
+                c.pop(f)
+    profile = SourceProfile.model_validate(old)  # a profile.json written before these fields existed
+    assert profile_prompt_text(profile, PrivacyConfig()) == OLD_PROFILE_TEXT
+
+    cfg = _project(tmp_path)
+    ws = Workspace(cfg.workdir)
+    ws.root.mkdir(parents=True, exist_ok=True)
+    ws.profile_json.write_text(json.dumps(old))
+    refresh(cfg, ws)
+    record_approval(ws, "privacy", "rita")
+    ws.save_json(ws.profile_json, profile)  # the same profile, saved by this version
+    refresh(cfg, ws)
+    assert gate_state(ws, "privacy").current
+    # profiled again with shapes: what is sent changes, so the review needs a new approval
+    profile.tables[0].columns[1].value_shapes = [ValueFreq(value="Aaaaaaa", count=40)]
+    ws.save_json(ws.profile_json, profile)
+    refresh(cfg, ws)
+    assert not gate_state(ws, "privacy").current
+    assert "value shapes (9 digit, a/A letter): 'Aaaaaaa'×40" in build_review(cfg, ws)["profile_text"]
+
+
+def _shaped_profile() -> SourceProfile:
+    def col(name, **kw):
+        base = dict(name=name, inferred_type="string", n_rows=100, n_null=0, n_distinct=60, unique=False)
+        return ColumnProfile(**{**base, **kw})
+
+    return SourceProfile(
+        generated_at=utcnow(), min_cell_count=5, source_type="csv",
+        tables=[TableProfile(name="visits", n_rows=100, columns=[
+            col("visit_ref", value_shapes=[ValueFreq(value="A9999", count=80), ValueFreq(value="AAA-99", count=6)]),
+            col("submitted", inferred_type="datetime", date_format="%Y-%m-%dT%H:%M:%S", n_nonconforming=3,
+                n_partial_dates=12, n_na_markers=4, tz_offsets=[ValueFreq(value="+03:00", count=70),
+                                                                ValueFreq(value="Z", count=6)],
+                nonconforming_shapes=[ValueFreq(value="aaaaaaa", count=6)], format_notes=["a note"]),
+            # an identifier that (wrongly) still carries shapes must not leak them
+            col("phone", is_pii=True, pii_reason="phone", value_shapes=[ValueFreq(value="9999999999", count=90)],
+                format_notes=["a note on the phone"]),
+        ])],
+    )
+
+
+def test_shapes_and_offsets_follow_the_small_cell_rule():
+    from omop_agent.privacy import profile_prompt_text
+    from omop_agent.profiling.render import render_profile_md
+
+    profile = _shaped_profile()
+    text = profile_prompt_text(profile, PrivacyConfig())
+    assert "value shapes (9 digit, a/A letter): 'A9999'×80; 'AAA-99'×6" in text
+    assert "time zone offsets '+03:00'×70; 'Z'×6" in text
+    assert "<5 values do not fit the format %Y-%m-%dT%H:%M:%S" in text  # 3: a small count
+    assert "12 partial dates" in text and "<5 missing-value markers" in text and "note: a note" in text
+    assert "shapes of the values that do not fit: 'aaaaaaa'×6" in text
+    phone_line = next(line for line in text.splitlines() if line.startswith("  - phone:"))
+    assert "PII" in phone_line and "9999999999" not in text and "a note on the phone" not in text
+    # a stricter current threshold hides what the profile kept
+    strict = profile_prompt_text(profile, PrivacyConfig(min_cell_count=10))
+    for gone in ("'AAA-99'", "'Z'", "'aaaaaaa'"):
+        assert gone not in strict
+    assert "'A9999'×80" in strict and "<10 values do not fit" in strict
+    # without values: counts and notes only
+    bare = profile_prompt_text(profile, PrivacyConfig(send_values_to_llm=False))
+    assert "value shapes" not in bare and "offsets" not in bare and "shapes of the values" not in bare
+    assert "note: a note" in bare and "12 partial dates" in bare
+    # profile.md shows the same, under the same rule
+    md = render_profile_md(profile)
+    assert "`A9999`×80, `AAA-99`×6" in md and "`+03:00`×70, `Z`×6" in md and "| <5 |" in md
+    assert "9999999999" not in md and "a note on the phone" not in md
+    # a column withheld later (privacy.pii_columns) loses its shapes and offsets too
+    hidden = apply_overrides(profile, PrivacyConfig(pii_columns=["visits.submitted"]))
+    sub = hidden.tables[0].columns[1]
+    assert sub.is_pii and sub.tz_offsets == [] and sub.value_shapes == [] and sub.nonconforming_shapes == []
+    assert "+03:00" not in profile_prompt_text(hidden, PrivacyConfig())
+
+
+@pytest.mark.postgres
+def test_profiled_shapes_never_leak_rare_or_identifier_values(pg, tmp_path):
+    from conftest import make_config
+
+    from omop_agent.db import ensure_schema, execute
+    from omop_agent.privacy import profile_prompt_text
+    from omop_agent.profiling.profiler import profile_staging
+    from omop_agent.profiling.render import render_profile_md
+
+    conn, schemas = pg
+    cfg = make_config(tmp_path, tmp_path, schemas)
+    ensure_schema(conn, schemas.src)
+    execute(conn, f"""CREATE TABLE {schemas.src}.visits AS SELECT
+        'V' || lpad(g::text, 5, '0') AS visit_ref,
+        CASE WHEN g = 1 THEN 'Special-Ward-7' ELSE 'OPD-' || (g % 90) END AS ward_code,
+        '07' || lpad((g * 7919 % 100000000)::text, 8, '0') AS phone,
+        to_char(TIMESTAMP '2020-01-01' + g * interval '1 hour', 'YYYY-MM-DD"T"HH24:MI:SS')
+          || CASE WHEN g = 2 THEN '+01:00' WHEN g % 3 = 0 THEN 'Z' ELSE '+03:00' END AS submitted,
+        CASE WHEN g = 3 THEN '1/1' ELSE g::text END AS qty,
+        CASE WHEN g <= 7 THEN 'TEMP_A1' ELSE 'KMR' || lpad((g / 3)::text, 5, '0') END AS individual_id
+        FROM generate_series(1, 400) g""")
+    profile = profile_staging(conn, schemas, cfg)
+    k = profile.min_cell_count
+    cols = {c.name: c for c in profile.table("visits").columns}
+    assert cols["phone"].is_pii
+    assert (cols["phone"].value_shapes, cols["phone"].nonconforming_shapes, cols["phone"].format_notes) == ([], [], [])
+    for c in cols.values():
+        assert all(v.count >= k for v in [*c.value_shapes, *c.nonconforming_shapes, *c.tz_offsets]), c.name
+    assert cols["visit_ref"].value_shapes == [ValueFreq(value="A99999", count=400)]
+    assert {v.value for v in cols["submitted"].tz_offsets} == {"+03:00", "Z"}
+    assert cols["qty"].n_nonconforming == 1 and cols["qty"].nonconforming_shapes == []
+    # a key's shape is listed only when enough different keys have it: the 7 rows of 'TEMP_A1' are
+    # one person's records
+    assert (cols["individual_id"].top_values, cols["individual_id"].value_shapes) == (
+        [], [ValueFreq(value="AAA99999", count=393)])
+    # the rare values (a ward code, an offset, a fraction, a key) and their shapes appear nowhere;
+    # the value with the rare offset is counted as "<k"
+    prompt = profile_prompt_text(profile, cfg.privacy)
+    texts = [profile.model_dump_json(), prompt, render_profile_md(profile)]
+    for leaked in ("Special", "Aaaaaaa-Aaaa-9", "+01:00", "1/1", "9/9", "TEMP", "AAAA_A9"):
+        assert all(leaked not in t for t in texts), leaked
+    assert cols["submitted"].n_rare_offsets == 1
+    assert f"<{k} values with a time zone offset seen fewer than {k} times" in prompt
+    assert f"<{k} with rarer offsets" in texts[2]
+    # nor do the identifier's values or shape
+    phones = [r["phone"] for r in conn.execute(f"SELECT phone FROM {schemas.src}.visits").fetchall()]
+    assert all(p not in t for p in phones for t in texts)
+    assert all("9999999999" not in t for t in texts)
+
+
+@pytest.mark.postgres
+def test_sparse_identifier_columns_are_still_detected(pg, tmp_path):
+    """A mostly empty phone or e-mail column in a large table, under a name the rules miss: the
+    spread sample holds too few of its values, so the profiler reads the column's first values to
+    judge it (household phones repeat, and would otherwise be listed)."""
+    from conftest import make_config
+
+    from omop_agent.db import ensure_schema, execute
+    from omop_agent.profiling.profiler import profile_staging
+
+    conn, schemas = pg
+    cfg = make_config(tmp_path, tmp_path, schemas)
+    ensure_schema(conn, schemas.src)
+    execute(conn, f"""CREATE TABLE {schemas.src}.individuals AS SELECT 'P' || g AS perm_id,
+        CASE WHEN g % 3750 = 0 THEN '07' || lpad((g / 18750)::text, 8, '0') END AS hh_contact,
+        CASE WHEN g % 3750 = 0 THEN 'house' || (g / 18750) || '@mail.example.org' END AS hh_alt
+        FROM generate_series(1, 150000) g""")
+    cols = {c.name: c for c in profile_staging(conn, schemas, cfg).table("individuals").columns}
+    for name, reason in [("hh_contact", "phone numbers"), ("hh_alt", "e-mail addresses")]:
+        c = cols[name]
+        assert (c.n_rows - c.n_null, c.is_pii, c.top_values) == (40, True, []), name
+        assert reason in (c.pii_reason or ""), name

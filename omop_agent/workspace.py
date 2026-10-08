@@ -12,6 +12,7 @@ edited by a human, re-run, and traced afterwards::
       mappings/*.csv        stage 3  - vocabulary mapping review files
       sql/*.sql             stage 4  - generated ETL SQL
       etl_run.json          stage 4  - load results
+      etl_tables.json       stage 4  - the tables a build that has not finished may have written
       dq_results.json       stage 5  - quality checks
       repairs.json          stage 5b - changes the repair agent made
       report.md/.html       stage 6  - inspection report
@@ -87,6 +88,13 @@ class Workspace:
     @property
     def etl_run_json(self) -> Path:
         return self.root / "etl_run.json"
+
+    @property
+    def etl_tables_json(self) -> Path:
+        """The CDM tables a running build may write (it emptied them first); removed once the build
+        saved etl_run.json. A build that was cancelled or crashed leaves it, so the next build
+        empties those tables too, whatever its spec writes."""
+        return self.root / "etl_tables.json"
 
     @property
     def dq_json(self) -> Path:

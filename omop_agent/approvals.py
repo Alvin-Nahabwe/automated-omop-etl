@@ -8,7 +8,9 @@ kept under ``<workdir>/approvals/`` so a later change can be shown as a diff.
 
 ``recorded_approver`` lets a non-interactive run pass a gate only while that digest still
 matches. A spec that changed since it was approved (hand edit, redraft, the repair agent) or
-mappings that changed (an edit, new source codes) need a fresh review.
+mappings that changed (an edit, new source codes) need a fresh review. The design digest
+compares meaning, not formatting, and leaves out spec fields added later while they hold their
+default (``models.DIGEST_IGNORED_DEFAULTS``), so upgrading the tool does not void approvals.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ import yaml
 from pydantic import BaseModel, ValidationError
 
 from .fsutil import atomic_write_text, file_lock
-from .models import ETLSpec
+from .models import DIGEST_IGNORED_DEFAULTS, ETLSpec
 from .workspace import Workspace, utcnow
 
 GATES = {
@@ -90,9 +92,41 @@ def _spec_payload_of(text: str) -> Any:
     except yaml.YAMLError:
         return {"unparsable_yaml": text}  # still has a digest: a broken file is "changed"
     try:  # compare meaning, not formatting: defaults and key order do not matter
-        return ETLSpec.model_validate(raw).model_dump(mode="json")
+        payload = ETLSpec.model_validate(raw).model_dump(mode="json")
     except ValidationError:
         return raw
+    return _without_new_defaults(payload)
+
+
+def without_default_lines(text: str) -> str:
+    """Spec YAML ``text`` without the lines that only write a DIGEST_IGNORED_DEFAULTS field at its
+    default (``route_by_domain: true``, ``dedup_order: null``). A spec approved before those fields
+    existed gains them the first time this version saves it; a diff of the two texts should show
+    the changes someone made, not those lines (they change no digest either)."""
+    import re
+
+    def literal(value: Any) -> str:
+        return {True: "true", False: "false", None: "(?:null|~)?"}.get(value, re.escape(str(value)))
+
+    names = {**DIGEST_IGNORED_DEFAULTS["spec"], **DIGEST_IGNORED_DEFAULTS["table_mapping"]}
+    pattern = re.compile(r"^\s*(?:" + "|".join(f"{re.escape(n)}:\\s*{literal(v)}" for n, v in names.items())
+                         + r")\s*$")
+    return "\n".join(line for line in text.splitlines() if not pattern.match(line))
+
+
+def _without_new_defaults(payload: dict[str, Any]) -> dict[str, Any]:
+    """``payload`` without the fields of DIGEST_IGNORED_DEFAULTS that hold their default: a spec
+    approved before those fields existed keeps its digest; setting one changes it."""
+
+    def drop(d: dict[str, Any], defaults: dict[str, Any]) -> None:
+        for name, default in defaults.items():
+            if name in d and d[name] == default:
+                del d[name]
+
+    drop(payload, DIGEST_IGNORED_DEFAULTS["spec"])
+    for tm in payload.get("table_mappings") or []:
+        drop(tm, DIGEST_IGNORED_DEFAULTS["table_mapping"])
+    return payload
 
 
 def _spec_payload(ws: Workspace) -> Any | None:

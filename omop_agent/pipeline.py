@@ -26,7 +26,7 @@ from .config import ProjectConfig
 from .db import Schemas, connect
 from .fsutil import atomic_write_text
 from .llm import LLMClient, make_llm
-from .models import DQReport, ETLRunResult, ETLSpec, MappingDecision, SourceAnnotations, SourceProfile
+from .models import DQReport, ETLRunResult, ETLSpec, MappingDecision, SourceAnnotations, SourceProfile, TableLoadResult
 from .workspace import Workspace
 
 # Called at review gates with (stage, message, artifact paths); returns True to continue. An
@@ -215,11 +215,11 @@ class Pipeline:
         return ann  # type: ignore[return-value]
 
     def load_vocabulary(self, force: bool = False) -> None:
-        from .vocab.loader import load_athena, vocab_loaded
+        from .vocab.loader import ensure_indexes, load_athena, vocab_loaded
 
         def run() -> None:
             create_cdm_tables(self.conn, self.schemas, include_vocab=True)
-            create_etl_tables(self.conn, self.schemas)
+            create_etl_tables(self.conn, self.schemas, self.cfg.target.etl_role)
             self.conn.commit()
             if self.cfg.vocabulary.athena_dir:
                 counts = load_athena(self.conn, self.schemas, self.cfg.vocabulary.athena_dir, self.ws, force=force)
@@ -229,6 +229,14 @@ class Pipeline:
                     "No vocabulary loaded. Download vocabularies from https://athena.ohdsi.org and set "
                     "vocabulary.athena_dir, or load them into the vocab schema yourself."
                 )
+            else:  # loaded by someone else: add the indexes the mapping and the build rely on
+                skipped = ensure_indexes(self.conn, self.schemas)
+                if skipped:
+                    self.log(f"  vocabulary indexes not created (the vocabulary tables belong to another role, are "
+                             f"views or are read-only): {', '.join(skipped)}"
+                             + ("; the build finds the concepts to route by domain with a join of the concept table"
+                                if "idx_concept_concept_id" in skipped else ""))
+                    self.ws.audit("vocab_indexes_not_created", indexes=skipped)
 
         self._run_stage("vocab_load", run)
 
@@ -284,6 +292,7 @@ class Pipeline:
             map_terms,
             mapping_summary,
             pii_concept_fields,
+            source_vocabulary_domains,
             write_source_to_concept_map,
         )
         from .vocab.review import export_review, import_review
@@ -292,6 +301,10 @@ class Pipeline:
 
         def run() -> list[MappingDecision]:
             spec = self.load_spec()
+            # the mapping's WHERE is read with the ETL helper functions (try_*): install this
+            # version's, as the vocabulary load does (a project mapped again after an upgrade)
+            create_etl_tables(self.conn, self.schemas, self.cfg.target.etl_role)
+            self.conn.commit()
             ev = evaluate_vocabulary(self.conn, self.schemas, spec, self.cfg)
             self.ws.save_json(self.ws.vocab_eval_json, ev)
             (self.ws.root / "vocab_evaluation.md").write_text(render_vocab_evaluation_md(ev))
@@ -300,12 +313,17 @@ class Pipeline:
             profile = self.load_profile() if self.ws.profile_json.exists() else None
             for f in pii_concept_fields(spec, profile, self.cfg.privacy):
                 self.log(f"  skipped {f}: direct identifiers are never mapped or loaded")
-            terms = collect_terms(self.conn, self.schemas, spec, profile, self.cfg.privacy, self.ws)
+            terms = collect_terms(self.conn, self.schemas, spec, profile, self.cfg.privacy, self.ws, cfg=self.cfg)
             prior: dict[tuple[str, str], MappingDecision] = {}
             if not remap and self.ws.decisions_json.exists():
-                prior = {(d.source_vocabulary_id, d.source_code): d for d in import_review(self.ws, self.conn, self.schemas)}
-            freq = {(t.source_vocabulary_id, t.source_code): t.frequency for t in terms}
-            kept = [d.model_copy(update={"frequency": freq[k]}) for k, d in prior.items() if k in freq]
+                # the domains the spec accepts now, before the reviewer's edits are checked against them
+                domains = source_vocabulary_domains(spec, profile, self.cfg.privacy)
+                prior = {(d.source_vocabulary_id, d.source_code): d
+                         for d in import_review(self.ws, self.conn, self.schemas, domains=domains)}
+            by_key = {(t.source_vocabulary_id, t.source_code): t for t in terms}
+            kept = [d.model_copy(update={"frequency": by_key[k].frequency, "target_domain": by_key[k].target_domain,
+                                         "accepted_domains": list(by_key[k].accepted_domains)})
+                    for k, d in prior.items() if k in by_key]
             new_terms = [t for t in terms if (t.source_vocabulary_id, t.source_code) not in prior]
             if kept:
                 self.log(f"  kept {len(kept)} earlier/reviewed decisions; mapping {len(new_terms)} new terms")
@@ -334,11 +352,16 @@ class Pipeline:
         return decisions  # type: ignore[return-value]
 
     def apply_reviewed_mappings(self) -> int:
-        """Re-import edited mapping CSVs into source_to_concept_map."""
-        from .vocab.mapper import write_source_to_concept_map
+        """Re-import edited mapping CSVs into source_to_concept_map. The edits are checked against
+        the domains the current spec accepts for each source vocabulary."""
+        from .vocab.mapper import source_vocabulary_domains, write_source_to_concept_map
         from .vocab.review import import_review
 
-        decisions = import_review(self.ws, self.conn, self.schemas)
+        domains = None
+        if self.ws.spec_yaml.exists():
+            profile = self.load_profile() if self.ws.profile_json.exists() else None
+            domains = source_vocabulary_domains(self.load_spec(), profile, self.cfg.privacy)
+        decisions = import_review(self.ws, self.conn, self.schemas, domains=domains)
         n = write_source_to_concept_map(
             self.conn, self.schemas, decisions, include_unchecked=self.cfg.mapping.use_unchecked_in_etl
         )
@@ -354,7 +377,7 @@ class Pipeline:
 
         spec = self.load_spec()
         profile = self.load_profile() if self.ws.profile_json.exists() else None
-        issues = validate_spec(spec, profile, self.conn, self.schemas, privacy=self.cfg.privacy)
+        issues = validate_spec(spec, profile, self.conn, self.schemas, privacy=self.cfg.privacy, cfg=self.cfg)
         self.conn.rollback()
         errors = [i for i in issues if i.severity == "error"]
         for i in issues:
@@ -366,14 +389,27 @@ class Pipeline:
         return spec
 
     def build(self, spec: ETLSpec | None = None) -> ETLRunResult:
-        from .etl.runner import run_etl
+        from .etl.runner import UPGRADE_NOTICE, run_etl, upgrade_notice
 
         def run() -> ETLRunResult:
-            result = run_etl(self.conn, self.schemas, spec or self.validated_spec(), self.cfg, self.ws)
-            loaded = sum(s.rows_inserted for s in result.steps if s.error is None)
-            self.log(f"  {len(result.steps)} steps, {loaded} rows loaded, {len(result.errors())} errors")
+            # a spec the validator refuses builds nothing: the notice waits for a build that runs
+            valid = spec or self.validated_spec()
+            behaviours = upgrade_notice(self.ws)
+            if behaviours:  # the first build since the update: say once what builds now do
+                self.log("  note: the first build of this project with the new version, which changes the CDM it "
+                         f"builds: {'; '.join(behaviours)} (README.md, \"Upgrading\")")
+                self.ws.audit("upgrade_notice", notice=UPGRADE_NOTICE, behaviours=behaviours)
+            result = run_etl(self.conn, self.schemas, valid, self.cfg, self.ws)
+            derived, moved = result.rows_derived(), result.rows_moved()
+            n_errors, n_blocking = len(result.errors()), len(result.blocking_errors())
+            self.log(f"  {len(result.steps)} steps, {result.rows_loaded()} rows loaded"
+                     + (f", {derived} derived by the build (observation periods, eras)" if derived else "")
+                     + (f", {moved} records moved to the table of their concept's domain" if moved else "")
+                     + f", {n_errors} errors"
+                     + (f" ({n_errors - n_blocking} in steps that do not block the build)" if n_errors > n_blocking
+                        else ""))
             for s in result.errors():
-                self.log(f"  ✗ {s.step}: {s.error}")
+                self.log(f"  ✗ {s.step}{'' if s.blocking else ' (not blocking)'}: {s.error}")
             return result
 
         return self._run_stage("build", run)  # type: ignore[return-value]
@@ -392,6 +428,10 @@ class Pipeline:
             etl = etl_result or (
                 self.ws.load_json(self.ws.etl_run_json, ETLRunResult) if self.ws.etl_run_json.exists() else None
             )
+            from .etl.runner import OLDER_BUILD_NOTE, built_by_older_version
+
+            if built_by_older_version(etl):
+                self.log(f"  note: {OLDER_BUILD_NOTE}")
             report = run_builtin_checks(self.conn, self.schemas, self.cfg, spec_, etl)
             if self.cfg.quality.use_r_dqd and include_r:
                 problem = None
@@ -465,7 +505,7 @@ class Pipeline:
             etl = self.build(spec)
             report = self.check(spec, etl, include_r=False) if etl.ok else None
             losses = seen.losses(etl, report) if iteration > 0 else []
-            score = self._score(etl, report, losses)
+            score = self._score(etl, report, losses, spec)
             if best is not None and score < best[0]:
                 why = f" ({'; '.join(losses[:3])})" if losses else ""
                 self.log(f"  repair iteration {iteration} made the result worse{why}; restoring the previous spec")
@@ -481,7 +521,7 @@ class Pipeline:
             if best is None or score >= best[0]:
                 best = (score, spec, iteration)
             seen.add(etl, report)
-            if report is not None and report.passed and not self._repairable(report):
+            if report is not None and report.passed and not self._repairable(report, etl, spec):
                 break
             if iteration >= max_iter:
                 self.log(f"  stopping after {max_iter} repair iterations")
@@ -520,20 +560,31 @@ class Pipeline:
         self.ws.save_json(self.ws.vocab_eval_json, ev)
         (self.ws.root / "vocab_evaluation.md").write_text(render_vocab_evaluation_md(ev))
 
-    def _score(self, etl: ETLRunResult, report: DQReport | None, losses: list[str] | None = None) -> tuple:
+    def _score(
+        self, etl: ETLRunResult, report: DQReport | None, losses: list[str] | None = None, spec: ETLSpec | None = None
+    ) -> tuple:
         """Higher is better: no records or data lost compared with earlier builds, then gate passed,
-        fewer ETL errors, fewer blocking and repairable failures. Losing data ranks below any
-        failing check, so a repair that drops records or blanks fields to pass is rolled back."""
+        fewer blocking ETL errors, fewer blocking and repairable failures. Losing data ranks below
+        any failing check, so a repair that drops records or blanks fields to pass is rolled back."""
+        from .quality.checks import derived_tables, repairable
+
         no_loss = not losses
         if report is None:
-            return (no_loss, False, -len(etl.errors()), -10**9, -10**9)
+            return (no_loss, False, -len(etl.blocking_errors()), -10**9, -10**9)
         sev = set(self.cfg.quality.repair_severities)
-        repairable = sum((r.failed or bool(r.error)) and r.severity in sev and not r.not_applicable for r in report.results)
-        return (no_loss, report.passed, -len(etl.errors()), -len(report.blocking_failures), -repairable)
+        derived = derived_tables(etl, spec)
+        n_repairable = sum(repairable(r, sev, derived=derived) for r in report.results)
+        return (no_loss, report.passed, -len(etl.blocking_errors()), -len(report.blocking_failures), -n_repairable)
 
-    def _repairable(self, report: DQReport) -> bool:
+    def _repairable(self, report: DQReport, etl: ETLRunResult | None = None, spec: ETLSpec | None = None) -> bool:
+        """True when ``report`` has a failure the repair agent should be given (``checks.repairable``;
+        not the checks of the era tables the build of ``etl`` derived, or that ``spec`` loads itself
+        while the build derives eras)."""
+        from .quality.checks import derived_tables, repairable
+
         sev = set(self.cfg.quality.repair_severities)
-        return any((r.failed or r.error) and r.severity in sev and not r.not_applicable for r in report.results)
+        derived = derived_tables(etl, spec)
+        return any(repairable(r, sev, derived=derived) for r in report.results)
 
     def report(self, shareable: bool = True) -> None:
         """Write the inspection report, and (by default) the shareable copy beside it, so the two
@@ -596,23 +647,66 @@ class _BuildHistory:
 
     def __init__(self) -> None:
         self.rows: dict[str, int] = {}
+        self.links: dict[str, tuple[int, int]] = {}  # table -> (records with a visit key, linked to a visit)
         self.applicable: set[str] = set()
+        self.route_only: set[str] = set()  # tables that received records moved by domain and nothing else
 
     @staticmethod
     def _rows(etl: ETLRunResult) -> dict[str, int]:
-        """Rows loaded per CDM table (the id maps are append-only, so a rebuild adds none to them)."""
+        """Rows loaded per CDM table (the id-map and pruning steps write no CDM table and are left out).
+        When its periods were merged, observation_period counts the valid episodes the merge took
+        (episodes, or event periods, less those dropped because they end before they start). Not the
+        merged periods: a repair that fixes an episode's dates can join two periods into one, and must
+        not count as a loss. Nor the fill's periods: a repair that inverts a person's only episode
+        would get that person a period from their first to their last record instead, and the count
+        must still see the episode lost (a person the fill covered who gets a valid episode adds one,
+        and leaving the fill makes no loss). The route
+        steps move records between tables after they were counted here, so moves change no total. The
+        eras the build derives are left out: they follow the condition and drug records counted here."""
         from .cdm.spec import load_cdm_spec
 
         cdm = load_cdm_spec()
         out: dict[str, int] = {}
+        merge = next((s for s in etl.steps if s.kind == "merge" and not s.error and "episodes" in s.stats), None)
         for s in etl.steps:
-            if not s.error and s.target_table and cdm.has_table(s.target_table):
-                out[s.target_table] = out.get(s.target_table, 0) + int(s.rows_inserted or 0)
+            if s.error or not s.target_table or not cdm.has_table(s.target_table) or _is_era_step(s):
+                continue
+            n = int(s.rows_inserted or 0)
+            if merge is not None and s.target_table == "observation_period":
+                if s is merge:
+                    n = int(s.stats.get("episodes") or 0) - int(s.stats.get("dropped_inverted") or 0)
+                else:
+                    continue  # the episodes (or event periods) the merge took, counted above; the fill's
+                    # periods are no measure of what was loaded (they make up for lost episodes)
+            out[s.target_table] = out.get(s.target_table, 0) + n
         return out
 
+    @staticmethod
+    def _links(etl: ETLRunResult) -> dict[str, tuple[int, int]]:
+        """Per CDM table, the records with a visit key and those linked to a visit of their person
+        (``stats['visit_links']``): a repair that makes visit keys NULL or breaks them loses links."""
+        out: dict[str, tuple[int, int]] = {}
+        for s in etl.steps:
+            links = s.stats.get("visit_links") if not s.error and s.target_table else None
+            if links:
+                with_key, linked = out.get(s.target_table, (0, 0))  # type: ignore[arg-type]
+                out[s.target_table] = (with_key + int(links.get("with_key") or 0),  # type: ignore[index]
+                                       linked + int(links.get("linked") or 0))
+        return out
+
+    @staticmethod
+    def _route_only(etl: ETLRunResult) -> set[str]:
+        """Tables that received records moved by domain but that no mapping or custom SQL loaded."""
+        moved = {m.to_table for s in etl.steps if not s.error for m in s.moved}
+        return moved - {s.target_table for s in etl.steps if s.kind in (None, "insert", "custom")}
+
     def add(self, etl: ETLRunResult, report: DQReport | None) -> None:
+        self.route_only |= self._route_only(etl)
         for table, n in self._rows(etl).items():
             self.rows[table] = max(self.rows.get(table, 0), n)
+        for table, (with_key, linked) in self._links(etl).items():
+            before = self.links.get(table, (0, 0))
+            self.links[table] = (max(before[0], with_key), max(before[1], linked))
         if report is not None:
             self.applicable |= {r.key for r in report.results if not r.not_applicable and r.check_level != "ETL"}
 
@@ -623,11 +717,32 @@ class _BuildHistory:
             n = now.get(table, 0)
             if before > 0 and n < LOSS_TOLERANCE * before:
                 out.append(f"{table} loaded {n} rows, {before} before")
+        links = self._links(etl)
+        for table, (with_key, linked) in sorted(self.links.items()):
+            now_key, now_linked = links.get(table, (0, 0))
+            if with_key > 0 and now_key < LOSS_TOLERANCE * with_key:
+                out.append(f"{table} has {now_key} records with a visit key, {with_key} before")
+            elif linked > 0 and now_linked < LOSS_TOLERANCE * linked:
+                out.append(f"{table} has {now_linked} records linked to their visit, {linked} before")
         if report is not None:
-            blanked = sorted(r.key for r in report.results if r.not_applicable and r.key in self.applicable)
+            # a table that only received records moved by domain empties when a repair maps their codes
+            # to concepts of the loaded tables' domains: that is not data lost; nor is an era table the
+            # build derives that empties (its condition or drug records are tracked themselves)
+            written = {s.target_table for s in etl.steps if s.kind in (None, "insert", "custom")}
+            exempt = ((self.route_only | self._route_only(etl)) - written) | {
+                s.target_table for s in etl.steps if _is_era_step(s)}
+            blanked = sorted(r.key for r in report.results
+                             if r.not_applicable and r.key in self.applicable and r.table not in exempt)
             if blanked:
                 out.append(f"{len(blanked)} check(s) no longer apply, e.g. {blanked[0]} (a field or table emptied)")
         return out
+
+
+def _is_era_step(s: TableLoadResult) -> bool:
+    """A step that derived an era table (``cdm.spec.DERIVED_ERAS``) from the loaded records."""
+    from .cdm.spec import DERIVED_ERAS
+
+    return s.kind == "derived" and s.target_table in DERIVED_ERAS
 
 
 def _mark_reverted(ws: Workspace, after_iteration: int) -> None:

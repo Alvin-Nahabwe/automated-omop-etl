@@ -259,7 +259,7 @@ def _describe_column(c: ColumnProfile, sem: SemanticType, coding: str | None) ->
         "numeric_measurement": f"Numeric value ({c.inferred_type})",
         "free_text": "Free text",
         "pii": "Direct identifier (PII), withheld",
-        "other": f"Column of type {c.inferred_type}",
+        "other": f"Time of day ({c.date_format})" if c.inferred_type == "time" else f"Column of type {c.inferred_type}",
     }[sem]
     return f"{what}; {null_pct:.0f}% null (inferred by name/type rules)."
 
@@ -325,7 +325,8 @@ def heuristic_annotations(profile: SourceProfile) -> SourceAnnotations:
 
 def _column_notes(t: TableProfile, c: ColumnProfile) -> list[str]:
     notes = []
-    if c.date_format and c.date_format not in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+    iso = ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S")
+    if c.date_format and c.date_format not in iso and c.inferred_type != "time":
         try:
             pg = f" (PostgreSQL template '{strftime_to_pg(c.date_format)}')"
         except ValueError:

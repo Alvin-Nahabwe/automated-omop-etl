@@ -60,11 +60,17 @@ def test_retention_is_not_netted_against_fan_out():
     assert (res.num_violated_rows, res.num_denominator_rows, res.pct_violated_rows) == (20, 100, 0.2)
     assert res.failed
     assert "20 of 100 records dropped" in res.description
-    assert "Another 30 rows were added by 1-to-many vocabulary mappings" in res.description
-    assert "110 rows inserted" in res.description
+    assert "30 of 110 rows inserted are extra rows added by 1-to-many vocabulary mappings" in res.description
+    # every count is "<n> of <m>", so the repair prompt suppresses the small ones (the fan-out and the
+    # rows inserted would otherwise give away a suppressed number of dropped records)
+    from omop_agent.quality.repair import _check_summary
+
+    _, text = _check_summary(retention(19, 19, 18), 5)
+    assert "<5 of 19 records dropped" in text and "<5 of 19 rows inserted are extra rows" in text
+    assert " 1 " not in text and "1 rows" not in text
 
     res = retention(100, 150, 100)  # fan-out only
-    assert res.num_violated_rows == 0 and not res.failed and "Another 50 rows" in res.description
+    assert res.num_violated_rows == 0 and not res.failed and "50 of 150 rows inserted are extra" in res.description
     res = retention(100, 96, 96)  # plain drops, no fan-out: 4% is under the 5% threshold
     assert res.num_violated_rows == 4 and not res.failed and "1-to-many" not in res.description
     # results written before retained_rows existed fall back to the net comparison
@@ -130,7 +136,10 @@ def test_tables_without_rows_get_one_summary(built):
     assert [r.key for r in report.results if r.table == "location"] == [f"{FIELD_SUMMARY}.location"]
     assert not [r for r in report.results if r.check_level == "FIELD" and r.not_applicable
                 and r.table not in {"person", "observation_period", "visit_occurrence", "condition_occurrence",
-                                    "drug_exposure", "measurement", "death", "cdm_source"}]
+                                    "drug_exposure", "measurement", "death", "condition_era", "cdm_source"}]
+    # drug_era is derived, but no drug of the fixture is mapped: summarised like a table without rows
+    assert [r.key for r in report.results if r.table == "drug_era" and r.check_level == "FIELD"] == []
+    assert "it has no rows" in results[f"{FIELD_SUMMARY}.drug_era"].description
     # a table the spec loads but that ended up empty is summarised too
     execute(conn, f"TRUNCATE {schemas.cdm}.death")
     empty = by_key(run_builtin_checks(conn, schemas, cfg, spec, etl).results)
@@ -138,9 +147,10 @@ def test_tables_without_rows_get_one_summary(built):
     assert not [k for k in empty if k.startswith("isRequired.death.")]
     conn.rollback()
 
-    # the result list stays small: a few hundred checks, not thousands of not-applicable rows
+    # the result list stays small: a few hundred checks, not thousands of not-applicable rows. Measured:
+    # 550 here (518 before the build derived eras; 585 when the drugs are mapped and drug_era has rows)
     n_na = sum(r.not_applicable for r in report.results)
-    assert len(report.results) < 600 and n_na < len(report.results) / 2
+    assert len(report.results) < 650 and n_na < len(report.results) / 2
 
 
 @pytest.mark.postgres
@@ -163,7 +173,10 @@ def test_checks_left_to_the_r_package(built):
         assert r.severity == check_catalog()[r.check_name].severity
     assert "fields of measurement" in results["cdmField.measurement"].description
     assert "plausibleGender.death" not in results  # no concept-level rows for death
-    assert "measureConditionEraCompleteness.condition_era" not in results  # condition_era is not populated
+    # the build derives condition_era, and the built-in engine checks its completeness (DQD 2.8.9)
+    era = results["measureConditionEraCompleteness.condition_era"]
+    assert not (era.not_applicable or era.error or era.failed) and era.num_denominator_rows > 0
+    assert era.check_level == "TABLE" and era.severity == check_catalog()[era.check_name].severity == "convention"
     assert "cdmTable.procedure_occurrence" not in results  # covered by the table's summary
 
 

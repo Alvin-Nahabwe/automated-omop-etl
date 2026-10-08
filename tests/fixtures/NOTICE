@@ -1,0 +1,14 @@
+era_reference.sql is a translation (SQL Server to PostgreSQL, with the changes listed at its top)
+of two files from OHDSI/ETL-Synthea (https://github.com/OHDSI/ETL-Synthea), branch main, commit
+9ee6eb1b933c70af7b80711332aa92327af1f7c5:
+
+  inst/sql/sql_server/cdm_version/v540/insert_condition_era.sql
+  inst/sql/sql_server/cdm_version/v540/insert_drug_era.sql
+
+which take their SQL from OHDSI/ETL-CMS (https://github.com/OHDSI/ETL-CMS),
+SQL/create_CDMv5_condition_era.sql and SQL/create_CDMv5_drug_era_non_stockpile.sql.
+
+Both projects are licensed under the Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0). Copyright OHDSI (Observational Health Data
+Sciences and Informatics). The file is used only by the tests, to compare the eras the build
+derives with the published scripts.

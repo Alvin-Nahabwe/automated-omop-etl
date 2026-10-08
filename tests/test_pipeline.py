@@ -49,6 +49,10 @@ def test_demo_end_to_end(demo_project):
     repairs = [RepairAction.model_validate(r) for r in json.loads((ws_root / "repairs.json").read_text())]
     fields = {(r.target_table, r.target_field) for r in repairs}
     assert ("visit_occurrence", "visit_end_date") in fields
+    # the missing visit end dates no longer fail the load: the build gives them the start date and
+    # reports it, and that report is what the agent repairs
+    visit_end = next(r for r in repairs if r.target_field == "visit_end_date")
+    assert visit_end.iteration == 1 and visit_end.trigger == "etlDefaultedValue.visit_occurrence.visit_end_date"
     assert ("condition_occurrence", "condition_concept_id") in fields
     spec = ETLSpec.model_validate(__import__("yaml").safe_load((ws_root / "etl_spec.yaml").read_text()))
     assert "COALESCE" in next(f.expression for f in spec.mapping_for("visit_occurrence").fields if f.target_field == "visit_end_date")
@@ -94,9 +98,16 @@ def test_remap_keeps_review_edits(demo_project):
         w = csv.DictWriter(fh, fieldnames=header)
         w.writeheader()
         w.writerows(rows)
+    # decisions of an older version (or of an earlier spec): no accepted domains of their own
+    stale = json.loads(p.ws.decisions_json.read_text())
+    for d in stale:
+        d["accepted_domains"] = []
+    p.ws.decisions_json.write_text(json.dumps(stale))
     decisions = p.map_vocabulary()  # re-run: keeps the manual decision, calls no LLM
     quinine = next(d for d in decisions if d.source_code == "Quinine inj 600mg")
     assert quinine.target_concept_id == 2000003010 and quinine.method == "manual"
+    # the kept decisions take the domains the spec accepts now (drug_exposure is routed by domain)
+    assert {tuple(d.accepted_domains) for d in decisions if d.source_vocabulary_id == "SRC_DRUG"} == {("Drug", "Device")}
     p.close()
 
 
@@ -175,6 +186,16 @@ def test_cli_init(tmp_path, monkeypatch):
     assert cfg.name == "APHRC: Nairobi HDSS" and cfg.source.type == "csv"
     assert cfg.target.url == "postgresql://postgres:@localhost:5432/omop"
     assert cfg.llm.model == "claude-opus-5-5" and cfg.privacy.min_cell_count == 5
+    assert (cfg.etl.timezone, cfg.etl.partial_dates, cfg.source.na_values) == (None, "widest", None)
+    # the commented settings work once uncommented
+    text = (tmp_path / "omop_agent.yaml").read_text()
+    assert "# timezone: Africa/Nairobi" in text and "# source_release_date: 2024-06-30" in text
+    on = (text.replace("# timezone:", "timezone:").replace("# na_values:", "na_values:")
+          .replace("# source_release_date:", "source_release_date:"))
+    (tmp_path / "on.yaml").write_text(on)
+    cfg = load_config(tmp_path / "on.yaml")
+    assert cfg.etl.timezone == "Africa/Nairobi" and cfg.source.na_values == ["NA", "NULL", "\\N", "."]
+    assert str(cfg.cdm_source.source_release_date) == "2024-06-30"
     bad = CliRunner().invoke(app, ["init", str(tmp_path / "x"), "--source-type", "excel"])
     assert bad.exit_code != 0
 
@@ -189,17 +210,20 @@ def test_harmful_repair_is_reverted(demo_project, tmp_path):
     shutil.copytree(FIXTURE_REPLAY, replay)
     it3 = replay / "repair" / "iteration_3.json"
     data = json.loads(it3.read_text())
+    # back to the design bug: outpatient visits have no end date again, so the build gives them their
+    # start date and fails etlDefaultedValue, one more repairable failure than the build before
     data["tool_calls"].append({"name": "update_field_mapping", "input": {
         "target_table": "visit_occurrence", "target_field": "visit_end_date", "kind": "expression",
-        "expression": "v.discharge_date::date", "rationale": "a change that compiles but fails at runtime",
+        "expression": "v.discharge_date::date", "rationale": "a change that leaves most visits without an end date",
     }})
     it3.write_text(json.dumps(data))
     cfg = load_config(demo_project)
     cfg.llm.replay_dir = replay
     report = Pipeline(cfg, log=lambda m: None).run_all()
     assert report.passed
-    events = [e["event"] for e in json.loads("[" + ",".join((cfg.workdir / "audit.jsonl").read_text().split("\n")[:-1]) + "]")]
-    assert "repair_reverted" in events
+    events = json.loads("[" + ",".join((cfg.workdir / "audit.jsonl").read_text().split("\n")[:-1]) + "]")
+    assert "repair_reverted" in [e["event"] for e in events]
+    assert not any(e["event"] == "etl_run" and not e["ok"] for e in events)  # every build loaded the visits
     spec = ETLSpec.model_validate(__import__("yaml").safe_load((cfg.workdir / "etl_spec.yaml").read_text()))
     end = next(f for f in spec.mapping_for("visit_occurrence").fields if f.target_field == "visit_end_date")
     assert "COALESCE" in end.expression
@@ -265,3 +289,65 @@ def test_official_dqd_runs_once_after_repairs_and_failures_are_visible(demo_proj
     report = Pipeline(cfg, log=logs.append).check()
     assert not report.passed and any(b.startswith("cdmField.person.gender_concept_id") for b in report.blocking_failures)
     p.close()
+
+
+def test_upgrade_notice_is_given_once(tmp_path, monkeypatch):
+    """The first build of a project last built by an older version (its steps carry no kind) says
+    once, in the log and the audit trail, what builds now do differently."""
+    import yaml
+
+    from omop_agent.config import ProjectConfig
+    from omop_agent.etl import runner
+    from omop_agent.models import ETLRunResult, TableLoadResult
+    from omop_agent.workspace import Workspace
+
+    cfg = ProjectConfig.model_validate({
+        "name": "t", "workdir": str(tmp_path / "work"), "source": {"type": "csv", "path": str(tmp_path)},
+        "target": {"url": "postgresql://unused"}, "llm": {"provider": "none"}})
+    ws = Workspace(cfg.workdir)
+    assert runner.upgrade_notice(ws) == []  # never built: nothing to announce
+    old = ETLRunResult(started_at="2025-01-01T00:00:00Z",
+                       steps=[TableLoadResult(target_table="person", step="person", rows_inserted=3)])
+    ws.save_json(ws.etl_run_json, old)
+    assert runner.upgrade_notice(ws) == list(runner.UPGRADE_BEHAVIOURS)
+
+    def fake_run_etl(conn, schemas, spec, cfg, ws):
+        new = ETLRunResult(started_at="2026-01-01T00:00:00Z", steps=[
+            TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=3),
+            TableLoadResult(target_table="drug_era", step="19_drug_era", kind="derived", blocking=False,
+                            error="permission denied for table concept_ancestor")])
+        ws.save_json(ws.etl_run_json, new)
+        return new
+
+    monkeypatch.setattr(runner, "run_etl", fake_run_etl)
+    monkeypatch.setattr(Pipeline, "conn", property(lambda self: None))
+    spec = ETLSpec.model_validate(yaml.safe_load((Path(__file__).parent / "fixtures" / "demo_etl_spec.yaml").read_text()))
+    logs: list[str] = []
+    p = Pipeline(cfg, log=logs.append)
+    # `build --no-repair` with a spec the validator refuses builds nothing: the notice is kept for the
+    # build that runs
+    from omop_agent.pipeline import SpecInvalid
+
+    def refused(self):
+        raise SpecInvalid("etl_spec.yaml has 1 error(s)")
+
+    monkeypatch.setattr(Pipeline, "validated_spec", refused)
+    with pytest.raises(SpecInvalid):
+        p.build()
+    assert not [e for e in ws.read_audit() if e["event"] == "upgrade_notice"]
+    assert not any("the first build of this project with the new version" in m for m in logs)
+    assert runner.upgrade_notice(ws) == list(runner.UPGRADE_BEHAVIOURS)
+    p.build(spec)
+    notices = [e for e in ws.read_audit() if e["event"] == "upgrade_notice"]
+    assert len(notices) == 1 and notices[0]["behaviours"] == list(runner.UPGRADE_BEHAVIOURS)
+    assert notices[0]["notice"] == runner.UPGRADE_NOTICE
+    assert sum("the first build of this project with the new version" in m for m in logs) == 1
+    assert any(m.endswith("1 errors (1 in steps that do not block the build)") for m in logs)
+    assert "  ✗ 19_drug_era (not blocking): permission denied for table concept_ancestor" in logs
+    # a build by the new version is not an upgrade, and the notice is given once even when the old
+    # result comes back (a build that failed before writing its own)
+    assert runner.upgrade_notice(ws) == []
+    ws.save_json(ws.etl_run_json, old)
+    assert runner.upgrade_notice(ws) == []
+    p.build(spec)
+    assert len([e for e in ws.read_audit() if e["event"] == "upgrade_notice"]) == 1

@@ -3,7 +3,9 @@
 Every source table is copied verbatim with every column typed ``text`` (the same stance
 White Rabbit takes when scanning). The profile records inferred types, and the ETL SQL casts
 explicitly, so CSV exports and database sources behave the same way downstream. Empty and
-whitespace-only values become NULL.
+whitespace-only values become NULL, and so do missing-value markers (``source.na_values``: by
+default NA, NULL, \\N and '.' for CSV files, none for databases), compared after trimming and
+case-sensitively. The manifest counts the markers per column (``na_markers``).
 
 A manifest (``staging_manifest.json``) keeps the original table/column names and any
 declared source types.
@@ -87,21 +89,36 @@ def _check_staging_schema(schemas: Schemas) -> None:
 
 
 def _create_and_copy(
-    conn: psycopg.Connection, schema: str, table: str, columns: list[str], rows: Iterable[Iterable[Any]]
-) -> int:
+    conn: psycopg.Connection,
+    schema: str,
+    table: str,
+    columns: list[str],
+    rows: Iterable[Iterable[Any]],
+    na_values: Iterable[str] = (),
+) -> tuple[int, list[dict[str, int]]]:
     """(Re)create ``schema.table`` with text columns and COPY ``rows`` in. Each row must have
-    exactly ``len(columns)`` values."""
+    exactly ``len(columns)`` values. Values equal to one of ``na_values`` after trimming are
+    stored as NULL. Returns the row count and, per column, how often each marker was seen."""
     execute(conn, f"DROP TABLE IF EXISTS {qi(schema)}.{qi(table)}")
     cols_sql = ", ".join(f"{qi(c)} text" for c in columns)
     execute(conn, f"CREATE TABLE {qi(schema)}.{qi(table)} ({cols_sql})")
     n = 0
+    na = frozenset(na_values)
+    markers: list[dict[str, int]] = [{} for _ in columns]
     col_list = ", ".join(qi(c) for c in columns)
     with conn.cursor() as cur:
         with cur.copy(f"COPY {qi(schema)}.{qi(table)} ({col_list}) FROM STDIN") as cp:
             for row in rows:
-                cp.write_row([_clean(v) for v in row])
+                values = [_clean(v) for v in row]
+                if na:
+                    for i, v in enumerate(values):
+                        if v is not None and v.strip() in na:
+                            m = markers[i]
+                            m[v.strip()] = m.get(v.strip(), 0) + 1
+                            values[i] = None
+                cp.write_row(values)
                 n += 1
-    return n
+    return n, markers
 
 
 def _decode_error_line(path: Path, encoding: str) -> tuple[int, str] | None:
@@ -219,6 +236,7 @@ def stage_csv(
             f"source.encoding '{cfg.source.encoding}' is not a known text encoding (e.g. utf-8, latin-1, cp1252)."
         ) from None
     files = sorted(p for p in Path(cfg.source.path).iterdir() if p.suffix.lower() in {".csv", ".tsv", ".txt"})
+    na_values = cfg.source.effective_na_values
     wanted = {t.lower() for t in cfg.source.tables} if cfg.source.tables else None
     manifest: dict[str, Any] = {}
     used_tables: set[str] = set()
@@ -232,7 +250,7 @@ def stage_csv(
         used_cols: set[str] = set()
         cols = [sanitize_identifier(h, used_cols) for h in header]
         try:
-            n = _create_and_copy(conn, schemas.src, table, cols, src.rows())
+            n, markers = _create_and_copy(conn, schemas.src, table, cols, src.rows(), na_values)
         finally:
             src.close()
         if strict and src.ragged:
@@ -245,7 +263,10 @@ def stage_csv(
             "ragged_too_few_fields": src.too_few,
             "ragged_example_lines": src.examples,
             "blank_lines": src.blank_lines,
-            "columns": [{"name": c, "source_name": h, "declared_type": None} for c, h in zip(cols, header)],
+            "columns": [
+                {"name": c, "source_name": h, "declared_type": None, "na_markers": m}
+                for c, h, m in zip(cols, header, markers)
+            ],
         }
     return manifest
 
@@ -271,13 +292,15 @@ def stage_database(cfg: ProjectConfig, conn: psycopg.Connection, schemas: Schema
             cols = [sanitize_identifier(c.name, used_cols) for c in t.columns]
             table = sanitize_identifier(name, used_tables)
             result = src.execution_options(stream_results=True, yield_per=10_000).execute(sa.select(t))
-            n = _create_and_copy(conn, schemas.src, table, cols, (tuple(r) for r in result))
+            n, markers = _create_and_copy(
+                conn, schemas.src, table, cols, (tuple(r) for r in result), cfg.source.effective_na_values
+            )
             manifest[table] = {
                 "source": f"{cfg.source.db_schema + '.' if cfg.source.db_schema else ''}{name}",
                 "rows": n,
                 "columns": [
-                    {"name": c, "source_name": col.name, "declared_type": str(col.type)}
-                    for c, col in zip(cols, t.columns)
+                    {"name": c, "source_name": col.name, "declared_type": str(col.type), "na_markers": m}
+                    for c, col, m in zip(cols, t.columns, markers)
                 ],
             }
     engine.dispose()
@@ -310,13 +333,24 @@ def stage_source(
     if ws is not None:
         (ws.root / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
         ragged = {t: m["ragged_rows"] for t, m in manifest.items() if m.get("ragged_rows")}
+        na = {t: n for t, m in manifest.items() if (n := na_marker_count(m))}
         ws.audit(
             "source_staged",
             tables={t: m["rows"] for t, m in manifest.items()},
             schema=schemas.src,
             **({"ragged_rows_skipped": ragged} if ragged else {}),
+            **({"na_markers_as_null": na} if na else {}),
         )
     return manifest
+
+
+def na_marker_count(entry: dict[str, Any], column: str | None = None) -> int:
+    """Missing-value markers staged as NULL in one manifest table entry (or one of its columns)."""
+    return sum(
+        sum((c.get("na_markers") or {}).values())
+        for c in entry.get("columns", [])
+        if column is None or c.get("name") == column
+    )
 
 
 def load_manifest(ws: Workspace) -> dict[str, Any] | None:

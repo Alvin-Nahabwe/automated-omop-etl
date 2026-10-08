@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 from omop_agent.config import PrivacyConfig, ProjectConfig
-from omop_agent.db import Schemas, execute, list_columns, list_tables, row_count
+from omop_agent.db import Schemas, execute, list_columns, list_tables, row_count, scalar
 from omop_agent.design.designer import DESIGN_SYSTEM, design_etl, reference_concepts_text
 from omop_agent.design.render import render_spec_md
 from omop_agent.design.validate import SpecIssue, sql_safety_issues, validate_spec, validate_table_mapping
@@ -289,6 +289,252 @@ def test_custom_sql_is_reviewed_and_guarded():
     assert sql_safety_issues(CustomSQL(name="x", target_table="death", sql=ok)) == []
 
 
+def test_sqlguard_denies_internal_counters():
+    from omop_agent.sqlguard import fragment_issues
+
+    # the build's own helper functions keep the counts of values it could not load as written
+    for sql in ("{etl}.omop_count('visit_end_date', 'defaulted')", "etl . omop_drop (ARRAY['x'], ARRAY[true])",
+                "{etl}.omop_as_date_at('visit_start_date', 'first', v.d)", "{etl}.omop_walk(v.d, ARRAY['ISO'], 'mid')",
+                'COALESCE(v.d, "etl"."omop_derived_date"(\'visit_end_date\', v.s))', "omop_default_int('x', 0)"):
+        assert any("internal function of the build" in x for x in fragment_issues(sql)), sql
+    # a quoted name is the function or schema it names
+    assert any("set_config()" in x for x in fragment_issues('"set_config"(\'a\', \'b\', true)'))
+    assert any("ETL SQL: pg_catalog" in x for x in fragment_issues('"pg_catalog"."set_config"(\'role\', \'none\', true)'))
+    assert fragment_issues('x."update" + x."pg_catalog"') == []  # quoted columns are fine
+    # a backslash escapes only in E'...' strings (standard_conforming_strings, pinned by the
+    # session settings), so a call between two '\' strings is seen
+    for sql, call in ((r"v.d + (length('\' || {etl}.omop_count('visit_end_date', 'defaulted')::text || '\') * 0)",
+                       "omop_count()"),
+                      (r"v.visit_type || ('\' || set_config('role', 'none', true) || '\')", "set_config()"),
+                      (r"name'\' || omop_count('x', 'defaulted')::text || '\'", "omop_count()")):
+        assert any(call in x for x in fragment_issues(sql)), sql
+    for sql in (r"regexp_replace(d.icd10, '\.', '')", r"E'it\'s ' || x", r"replace(x, '\', '/')"):
+        assert fragment_issues(sql) == [], sql
+    # a Unicode-escaped name can spell any function
+    for sql in (r"""U&"\006Fmop_count"('a', 'b')""", r"x || u&'\0041'"):
+        assert any("Unicode-escaped" in x for x in fragment_issues(sql)), sql
+    assert fragment_issues("x.u & 1") == []
+    # columns, literals and other functions are fine
+    for sql in ("v.omop_count + 1", "'omop_count(1)'", "{etl}.try_date(x.d)", "{etl}.try_integer(x.n)",
+                "{etl}.try_timestamp(x.d, 'DD/MM/YYYY HH24:MI', 'first')", "my_omop_code(x)", '"omop_code"'):
+        assert fragment_issues(sql) == [], sql
+    spec = set_field(load_ref(), "visit_occurrence", "visit_end_date",
+                     expression="COALESCE(v.discharge_date::date, {etl}.omop_derived_date('visit_end_date', v.visit_date::date))")
+    assert has(validate_spec(spec), "visit_occurrence", "visit_end_date", "may not call: omop_derived_date()")
+    spec = load_ref().model_copy(deep=True)
+    spec.custom_sql = [CustomSQL(name="x", target_table="death", sql="SELECT {etl}.omop_drop(ARRAY['a'], ARRAY[true])")]
+    assert "omop_drop()" in sql_safety_issues(spec.custom_sql[0])[0]
+
+
+def dated_profile(**formats: str) -> SourceProfile:
+    """The demo profile with the date formats the profiler detects (``table__column=format``
+    overrides one)."""
+    profile = demo_profile()
+    formats = {("individuals", "dob"): "%d/%m/%Y", ("clinic_visits", "visit_date"): "%Y-%m-%d",
+               ("clinic_visits", "discharge_date"): "%Y-%m-%d", ("deaths", "dod"): "%Y-%m-%d",
+               ("prescriptions", "date_prescribed"): "%Y/%m/%d",
+               **{tuple(k.split("__")): v for k, v in formats.items()}}
+    for t in profile.tables:
+        for c in t.columns:
+            c.date_format = formats.get((t.name, c.name))
+    return profile
+
+
+def _issues(spec: ETLSpec, severity: str, table: str | None = None, field: str | None = None,
+            profile: SourceProfile | None = None) -> list[str]:
+    return [i.message for i in validate_spec(spec, profile or dated_profile())
+            if i.severity == severity and (table is None or i.target_table == table)
+            and (field is None or i.target_field == field)]
+
+
+def _with_column(profile: SourceProfile, table: str, column: str, **changes) -> SourceProfile:
+    for c in profile.table(table).columns:
+        if c.name == column:
+            for k, v in changes.items():
+                setattr(c, k, v)
+    return profile
+
+
+def test_timestamps_with_offsets_need_the_site_time_zone():
+    """DTA3: 'Z' or several offsets in a column the spec reads, and etl.timezone unset: an error."""
+    from omop_agent.models import ValueFreq
+
+    ref = load_ref()
+    cfg = ProjectConfig.model_validate({"name": "t", "source": {"type": "csv", "path": "."},
+                                        "target": {"url": "postgresql://unused"}})
+    zoned = cfg.model_copy(update={"etl": cfg.etl.model_copy(update={"timezone": "Africa/Nairobi"})})
+
+    def offset_errors(offsets: list[str], config: ProjectConfig | None = cfg, spec: ETLSpec = ref,
+                      rare: int = 0) -> list[SpecIssue]:
+        profile = _with_column(dated_profile(), "clinic_visits", "visit_date", n_rare_offsets=rare,
+                               tz_offsets=[ValueFreq(value=o, count=50) for o in offsets])
+        return [i for i in validate_spec(spec, profile, cfg=config) if "etl.timezone" in i.message]
+
+    (issue,) = offset_errors(["+03:00", "Z"])
+    assert issue.severity == "error" and issue.target_table == "visit_occurrence"
+    assert issue.target_field == "visit_start_date"  # the first field that reads the column
+    assert "v.visit_date" in issue.message and "several time zone offsets ('+03:00', 'Z')" in issue.message
+    assert "Set etl.timezone" in issue.message
+    assert len(offset_errors(["Z"])) == 1 and "'Z' (UTC)" in offset_errors(["Z"])[0].message
+    assert offset_errors(["+03:00"]) == []  # one offset: every time is on one clock
+    # UTC written as an offset; one offset plus offsets too rare to list (counted only)
+    assert "'+00:00' (UTC)" in offset_errors(["+00:00"])[0].message
+    # the message does not claim the build ignores an offset an explicit AT TIME ZONE converts
+    message = offset_errors(["Z"])[0].message
+    assert "so it needs etl.timezone" in message and "AT TIME ZONE conversion aside" in message
+    assert "ignore its offset" not in message
+    (issue,) = offset_errors(["+03:00"], rare=2)
+    assert "several time zone offsets ('+03:00' and others seen too rarely to name)" in issue.message
+    assert "2 values" not in issue.message  # a count below min_cell_count is not quoted
+    assert offset_errors([], rare=3) == []  # rare offsets alone may all be one: not flagged
+    assert offset_errors(["+03:00", "Z"], zoned) == []  # converted to the site's zone
+    assert len(offset_errors(["Z"], None)) == 1  # without a config: the default (unset)
+    # a column the spec does not read does not matter
+    unread = set_field(ref, "visit_occurrence", "visit_start_date", expression="v.discharge_date::date")
+    unread = set_field(unread, "visit_occurrence", "visit_start_datetime", expression="NULL::timestamp", kind="constant")
+    assert offset_errors(["Z"], spec=unread) == []
+    # nor is the per-mapping validation (the designer's and repair agent's loops) told: they cannot fix it
+    profile = _with_column(dated_profile(), "clinic_visits", "visit_date", tz_offsets=[ValueFreq(value="Z", count=50)])
+    assert not [i for i in validate_table_mapping(ref.mapping_for("visit_occurrence"), ref, profile)
+                if "etl.timezone" in i.message]
+
+
+def test_new_profiled_formats_in_the_validator():
+    from omop_agent.profiling.profiler import EXCEL_NOTE
+
+    ref = load_ref()
+    # Excel day numbers: no date conversion reads them
+    excel = _with_column(dated_profile(), "clinic_visits", "visit_date", date_format=None, format_notes=[EXCEL_NOTE],
+                         inferred_type="date")
+    msgs = _issues(ref, "error", "visit_occurrence", "visit_start_date", profile=excel)
+    assert any("day numbers" in m and "DATE '1899-12-30' + v.visit_date::integer" in m for m in msgs)
+    fixed = set_field(ref, "visit_occurrence", "visit_start_date", expression="DATE '1899-12-30' + v.visit_date::integer")
+    assert _issues(fixed, "error", "visit_occurrence", "visit_start_date", profile=excel) == []
+    # SAS timestamps (05MAR2019:14:30:00) are not read by ::timestamp; Stata dates (05mar2019) are
+    sas = dated_profile(clinic_visits__visit_date="%d%b%Y:%H:%M:%S")
+    msgs = _issues(ref, "error", "visit_occurrence", "visit_start_datetime", profile=sas)
+    assert any("to_timestamp(v.visit_date, 'DDMonYYYY:HH24:MI:SS')" in m for m in msgs)
+    assert _issues(ref, "error", "visit_occurrence", profile=dated_profile(clinic_visits__visit_date="%d%b%Y")) == []
+    # a time of day joined to an ISO date reads with ::timestamp
+    timed = dated_profile(clinic_visits__discharge_date="%H:%M")
+    spec = set_field(ref, "visit_occurrence", "visit_start_datetime",
+                     expression="(v.visit_date || ' ' || v.discharge_date)::timestamp")
+    assert _issues(spec, "error", "visit_occurrence", "visit_start_datetime", profile=timed) == []
+
+
+def test_conversion_issues():
+    ref = load_ref()
+    assert errors(validate_spec(ref, dated_profile())) == []
+    # an ISO cast of a day-first column reads none of its values: an error naming the template
+    spec = set_field(ref, "person", "birth_datetime", expression="i.dob::timestamp")
+    (msg,) = _issues(spec, "error", "person", "birth_datetime")
+    assert "profiled as %d/%m/%Y" in msg and "to_timestamp(i.dob, 'DD/MM/YYYY')" in msg
+    two_digit_year = dated_profile(deaths__dod="%d-%b-%y")
+    assert any("to_date(x.dod, 'DD-Mon-YY')" in m
+               for m in _issues(ref, "error", "death", "death_date", profile=two_digit_year))
+    assert _issues(ref, "error", "death", profile=dated_profile(deaths__dod="%d-%b-%Y")) == []  # a month name
+    # also in the WHERE, a join condition and a key
+    spec = ref.model_copy(deep=True)
+    spec.mapping_for("person").where = "i.dob::date > DATE '1900-01-01'"
+    assert any("where: i.dob::date reads i.dob" in m for m in _issues(spec, "error", "person"))
+    spec = ref.model_copy(deep=True)
+    spec.mapping_for("death").joins.append(JoinSpec(table="individuals", alias="i", join_type="left",
+                                                    on="i.individual_id = x.individual_id AND i.dob::date < now()"))
+    assert any("join 'i' condition: i.dob::date reads i.dob" in m for m in _issues(spec, "error", "death"))
+    spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={"expression": "dob::date"})})
+    assert any(m.startswith("person_key: dob::date reads dob") for m in _issues(spec, "error"))
+    # so does try_date without a template, and custom SQL, which runs as written
+    spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={"expression": "{etl}.try_date(dob)"})})
+    assert any(m.startswith("person_key: {etl}.try_date(dob) reads dob") for m in _issues(spec, "error"))
+    spec = ref.model_copy(update={"custom_sql": [CustomSQL(
+        name="deaths_too", target_table="death", sql="INSERT INTO {cdm}.death (person_id, death_date, death_type_concept_id) "
+        "SELECT pm.person_id, d.dod::date, 32879 FROM {src}.\"deaths\" d JOIN {etl}.person_map pm ON pm.source_value = "
+        "d.individual_id")]})
+    assert any(m.startswith("custom SQL 'deaths_too': d.dod::date reads d.dod") and "to_date(d.dod, 'DD/MM/YYYY')" in m
+               for m in _issues(spec, "error", "death", profile=dated_profile(deaths__dod="%d/%m/%Y")))
+    # a branch of a regex guard on the same column: a warning, which says the template reads both
+    spec = set_field(ref, "person", "birth_datetime", expression="CASE WHEN i.dob ~ '^[0-9]{4}-' THEN i.dob::timestamp "
+                     "ELSE to_timestamp(i.dob, 'DD/MM/YYYY') END")
+    assert _issues(spec, "error", "person", "birth_datetime") == []
+    assert any("reads ISO values too" in m for m in _issues(spec, "warning", "person", "birth_datetime"))
+    # year-first and month-name formats an ISO cast reads: fine
+    assert _issues(set_field(ref, "drug_exposure", "drug_exposure_start_date", expression="p.date_prescribed::date"),
+                   "error", "drug_exposure") == []
+    # a strftime template is refused; another template than the profiled one is a warning
+    spec = set_field(ref, "person", "birth_datetime", expression="to_date(i.dob, '%d/%m/%Y')::timestamp")
+    assert any("strftime" in m for m in _issues(spec, "error", "person", "birth_datetime"))
+    spec = set_field(ref, "person", "birth_datetime", expression="to_date(i.dob, 'MM/DD/YYYY')::timestamp")
+    assert any("differs from the profiled format of i.dob (%d/%m/%Y, PostgreSQL 'DD/MM/YYYY')" in m
+               for m in _issues(spec, "warning", "person", "birth_datetime"))
+    assert not any("differs" in m for m in _issues(
+        set_field(ref, "person", "birth_datetime", expression="to_date(i.dob, 'FMDD/FMMM/YYYY')::timestamp"), "warning"))
+    # a conversion the build has to leave as written, and casts in keys and joins, are warnings
+    spec = set_field(ref, "person", "birth_datetime", expression="to_date(i.dob, i.sex)::timestamp")
+    assert any("is left as written by the build (the template is not a literal)" in m
+               for m in _issues(spec, "warning", "person", "birth_datetime"))
+    spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={"expression": "individual_id::int"})})
+    assert any("person_key: individual_id::int is evaluated as written" in m and "{etl}.try_integer" in m
+               for m in _issues(spec, "warning"))
+    spec = ref.model_copy(deep=True)
+    spec.mapping_for("drug_exposure").joins.append(JoinSpec(
+        table="clinic_visits", alias="cv", join_type="left", on="cv.visit_id = p.visit_id AND cv.visit_date::date = "
+        "p.date_prescribed::date"))
+    assert any("cv.visit_date::date is evaluated as written" in m and "{etl}.try_date" in m
+               for m in _issues(spec, "warning", "drug_exposure"))
+    spec = set_field(ref, "condition_occurrence", "condition_concept_id", expression="d.icd10::int")
+    assert any("vocab_code expression: d.icd10::int is evaluated as written" in m
+               for m in _issues(spec, "warning", "condition_occurrence", "condition_concept_id"))
+    # the uncounted functions are the way to write such a key
+    spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={
+        "expression": "{etl}.try_integer(individual_id)"})})
+    assert not any(m.startswith("person_key") for m in _issues(spec, "warning") + _issues(spec, "error"))
+    # (the person mapping now writes the key in another form than the person_key: its keys are
+    # another source of the person id map, which is reported)
+    assert any("writes the key as i.individual_id, not as the person_key" in m for m in _issues(spec, "warning"))
+    spec = ref.model_copy(update={"person_key": ref.person_key.model_copy(update={
+        "expression": "{etl}.try_date(dob, 'DD/MM/YYYY')::text"})})
+    assert not any(m.startswith("person_key") for m in _issues(spec, "warning") + _issues(spec, "error"))
+    # (the person mapping now writes the key in another form than the person_key: its keys are
+    # another source of the person id map, which is reported)
+    assert any("writes the key as i.individual_id, not as the person_key" in m for m in _issues(spec, "warning"))
+    # in a field, try_* is counted like a cast: nothing to warn about
+    spec = set_field(ref, "person", "birth_datetime", expression="{etl}.try_timestamp(i.dob, 'DD/MM/YYYY')")
+    assert _issues(spec, "warning", "person", "birth_datetime") == []
+    # a drug end date that ignores the mapped days_supply
+    spec = set_field(ref, "drug_exposure", "drug_exposure_end_date", expression="p.date_prescribed::date")
+    assert any("days_supply is mapped but drug_exposure_end_date does not use it" in m
+               for m in _issues(spec, "warning", "drug_exposure", "drug_exposure_end_date"))
+    assert not any("days_supply" in m for m in _issues(ref, "warning"))
+
+
+def test_design_prompt_date_rules(tmp_path):
+    from omop_agent.config import EtlConfig
+    from omop_agent.design.designer import design_system, staging_conventions
+
+    # required fields follow the CDM convention; a better fallback is the designer's to write
+    assert "Required fields must never be NULL" not in DESIGN_SYSTEM
+    assert "a required concept becomes 0; visit_end_date" in " ".join(DESIGN_SYSTEM.split())
+    assert "start + days_supply - 1" in DESIGN_SYSTEM
+    cfg = ProjectConfig.model_validate({"name": "t", "source": {"type": "csv", "path": str(tmp_path)},
+                                        "target": {"url": "postgresql://x/y"}})
+    text = " ".join(staging_conventions(cfg).split())
+    assert "<PARTIAL_DATES>" not in text and "<OFFSETS>" not in text
+    assert ("start dates take the first day, end dates the last day (the widest interval; an end computed from the "
+            "start's columns reads them as the start does), other dates the 15th") in text
+    assert "keep the time as written (no site time zone is configured" in text
+    # the prompt and the validator agree: such a column needs etl.timezone, AT TIME ZONE or not
+    assert "needs etl.timezone: the validator stops the build until a person sets it" in text
+    assert "only when you need another zone" not in text
+    assert "Do not add regex guards only to avoid cast errors" in text and "value_as_string" in text
+    assert "{etl}.try_date(x, 'DD/MM/YYYY')" in text and "Never pass a strftime pattern" in text
+    nairobi = cfg.model_copy(update={"etl": EtlConfig(timezone="Africa/Nairobi", partial_dates="reject")})
+    text = " ".join(staging_conventions(nairobi).split())
+    assert "converted to the site time zone (Africa/Nairobi)" in text and "left NULL (etl.partial_dates: reject)" in text
+    system = design_system("REF", "ICD10", None, nairobi)
+    assert system.startswith(DESIGN_SYSTEM) and "Africa/Nairobi" in system
+    assert design_system("REF", "ICD10", None) == design_system("REF", "ICD10", None, cfg)  # defaults without cfg
+
+
 def test_direct_identifiers_are_not_loaded():
     profile = demo_profile()
     spec = set_field(load_ref(), "person", "person_source_value", expression="i.first_name || ' ' || i.last_name")
@@ -407,6 +653,22 @@ def test_explain_and_source_table_errors(staged):
 
 
 @pytest.mark.postgres
+def test_explain_runs_under_the_build_session_settings(staged):
+    """EXPLAIN folds constants, under the session settings of the build (DateStyle 'ISO, YMD'):
+    a month-first date the server's own DateStyle would accept is an error, as in the build."""
+    conn, schemas, cfg = staged
+    server_style = scalar(conn, "SELECT current_setting('DateStyle')")
+    assert scalar(conn, "SELECT '03/04/2020'::date IS NOT NULL") is True  # the server's DateStyle reads it
+    spec = set_field(load_ref(), "death", "death_date", kind="expression", expression="'03/04/2020'::date")
+    issues = validate_table_mapping(spec.mapping_for("death"), spec, None, conn, schemas, cfg=cfg)
+    assert any("EXPLAIN failed" in i.message and "out of range" in i.message for i in errors(issues)), issues
+    assert has(validate_spec(spec, None, conn, schemas, cfg=cfg), "death", None, "EXPLAIN failed")
+    spec = set_field(load_ref(), "death", "death_date", kind="expression", expression="'2020/03/04'::date")
+    assert errors(validate_table_mapping(spec.mapping_for("death"), spec, None, conn, schemas, cfg=cfg)) == []
+    assert scalar(conn, "SELECT current_setting('DateStyle')") == server_style  # rolled back
+
+
+@pytest.mark.postgres
 def test_correlated_subquery_against_db(staged):
     conn, schemas, cfg = staged
     spec = set_field(load_ref(), "death", "death_date", expression=(
@@ -517,6 +779,32 @@ def test_design_reproduces_reference_spec(staged, tmp_path):
 
 
 @pytest.mark.postgres
+def test_design_drafts_in_load_order(staged, tmp_path):
+    """A plan that lists the records before the people: the person and visit mappings are drafted first,
+    so the prompts of the records show their keys, and the spec keeps the plan's order."""
+    conn, schemas, cfg = staged
+    ref = load_ref()
+    first = ["condition_occurrence", "drug_exposure"]
+    reordered = ref.model_copy(update={"table_mappings": [tm for tm in ref.table_mappings if tm.target_table in first]
+                                       + [tm for tm in ref.table_mappings if tm.target_table not in first]})
+    replay = tmp_path / "replay"
+    record_reference(replay, reordered)
+    ws = Workspace(tmp_path / "work")
+
+    spec = design_etl(profile_from_db(conn, schemas), None, cfg, ReplayLLM(replay, ws), conn, schemas, ws)
+    assert spec.model_dump() == reordered.model_dump()
+    calls = [json.loads(c.read_text()) for c in sorted((ws.root / "llm_calls").glob("*.json"))]
+    assert [c["key"] for c in calls] == [
+        "plan", "table:person", "table:visit_occurrence", "table:condition_occurrence", "table:drug_exposure",
+        "table:measurement", "table:death", "table:observation_period"]
+    prompts = {c["key"]: c["prompt"] for c in calls}
+    for key in ("table:condition_occurrence", "table:drug_exposure"):
+        assert "Person mappings drafted so far" in prompts[key] and "  - individuals (i): i.individual_id" in prompts[key]
+        assert "Visit mappings drafted so far" in prompts[key] and "  - clinic_visits (v): v.visit_id" in prompts[key]
+    assert "Person mappings drafted so far" not in prompts["table:person"]
+
+
+@pytest.mark.postgres
 def test_design_prompts_carry_the_notes(staged, tmp_path):
     conn, schemas, cfg = staged
     ref = load_ref()
@@ -597,7 +885,7 @@ def test_render_spec_md():
     md = render_spec_md(spec)
     assert md.startswith("# ETL specification")
     assert "**Person key:** `individuals`.`individual_id`" in md
-    assert "**Observation period:** loaded by a table mapping" in md
+    assert "**Observation periods:** loaded by a table mapping" in md
     assert "| 1 | individuals | → | person | 11 |" in md
     assert "### condition_occurrence ← `diagnoses` (d)" in md
     assert "| CDM field | kind | source / expression | vocabulary | rationale |" in md

@@ -16,6 +16,7 @@ from omop_agent.models import (
     ColumnProfile,
     DQReport,
     ETLRunResult,
+    ETLSpec,
     MappingDecision,
     RepairAction,
     SourceAnnotations,
@@ -31,6 +32,8 @@ from omop_agent.report.inspection import (
     collect_report_data,
     fmt_pct,
     md_escape,
+    render_html,
+    render_markdown,
     small_cell,
 )
 from omop_agent.workspace import Workspace
@@ -555,3 +558,230 @@ def test_report_counts_only_mappings_that_reach_the_cdm():
     ds = [d("a", "APPROVED", 1, 100), d("b", "UNCHECKED", 2, 50), d("c", "FLAGGED", 3, 30), d("e", "REJECTED", 4, 20)]
     assert _mapping_row("SRC", ds)["records_mapped"] == 150
     assert _mapping_row("SRC", ds, include_unchecked=False)["records_mapped"] == 100
+
+
+def _with_steps(ws: Workspace, *steps: TableLoadResult) -> None:
+    run = ws.load_json(ws.etl_run_json, ETLRunResult)
+    run.steps += list(steps)
+    ws.save_json(ws.etl_run_json, run)
+
+
+def test_steps_that_do_not_block_are_listed_apart(full_ws):
+    cfg, ws = full_ws
+    _passing_run(ws)
+    era = TableLoadResult(target_table="drug_era", step="19_drug_era", kind="derived", blocking=False,
+                          error="permission denied for table concept_ancestor")
+    route = TableLoadResult(target_table="measurement", step="14_route_measurement", kind="route", blocking=False,
+                            error="statement timeout")
+    _with_steps(ws, route, era)
+    data = collect_report_data(cfg, ws)
+    # the gate passes when only steps that do not block the build failed: so does the verdict
+    assert data["verdict"] == "PASSED", data["verdict_reasons"]
+    assert "1 of 3 ETL steps completed without error; the 2 that failed do not block the build" in data[
+        "verdict_reasons"]
+    assert data["verdict_notes"] == [
+        "14_route_measurement failed without failing the build: the measurement records whose concept belongs to "
+        "another domain stay where they were loaded (see the ETL run)",
+        "19_drug_era failed without failing the build: drug_era was not built (see the ETL run)"]
+    assert (data["etl"]["n_errors"], data["etl"]["n_blocking_errors"]) == (2, 0)
+    # a person is asked to fix them, though the build passed
+    fix = [s for s in data["next_steps"] if s["text"].startswith("Fix the")]
+    assert [s["text"][:72] for s in fix] == ["Fix the cause of the 2 ETL step(s) that failed without failing the build"]
+    assert not fix[0]["done"]
+    md, html = render_markdown(data), render_html(data)
+    assert "> **Steps that failed without failing the build:** 14_route_measurement failed" in md
+    assert "2 error(s) (2 in steps that do not block the build)" in md
+    assert "**ERROR (not blocking)** permission denied for table concept_ancestor" in md
+    assert "<strong>Steps that failed without failing the build.</strong>" in html
+    assert 'class="warned"' in html and "error, not blocking" in html
+
+    # the checks of an era table whose step failed fail for that reason, not because of its records
+    dq = ws.load_json(ws.dq_json, DQReport)
+    dq.results.append(_check("measurePersonCompleteness", "drug_era", check_level="TABLE", severity="convention",
+                             failed=True, num_violated_rows=400, num_denominator_rows=400))
+    ws.save_json(ws.dq_json, dq)
+    data = collect_report_data(cfg, ws)
+    assert [(g["table"], g["not_built"]) for g in data["dq"]["derived_failed"]] == [
+        ("drug_era", "step 19_drug_era failed")]
+    md, html = render_markdown(data), render_html(data)
+    assert "**Failed checks of drug_era (not built: step 19_drug_era failed)**" in md
+    assert "drug_era was not built (step 19_drug_era failed; see the ETL run), so its checks fail for that reason." in md
+    assert "The eras follow" not in md and "These checks are never sent to the repair agent." in md
+    assert "not built: step 19_drug_era failed" in html and "The eras follow" not in html
+
+    # a blocking error fails the verdict; the others are still listed apart
+    _with_steps(ws, TableLoadResult(target_table="death", step="10_death", kind="insert", error="boom"))
+    data = collect_report_data(cfg, ws)
+    assert data["verdict"] == "FAILED" and data["verdict_reasons"][0] == "1 ETL step(s) errored: 10_death"
+    assert len(data["verdict_notes"]) == 2
+    assert any(s["text"].startswith("Fix the 1 ETL step error(s)") for s in data["next_steps"])
+
+    # steps skipped because a step they require failed are not counted as completed
+    _passing_run(ws)
+    _with_steps(
+        ws,
+        TableLoadResult(target_table="route_prepare", step="11_route_prepare", kind="route", blocking=False,
+                        error="boom"),
+        *[TableLoadResult(target_table=t, step=f"{n}_route_{t}", kind="route", blocking=False,
+                          skipped="step route_prepare failed")
+          for n, t in ((12, "condition_occurrence"), (13, "drug_exposure"), (14, "measurement"))],
+    )
+    data = collect_report_data(cfg, ws)
+    assert data["verdict"] == "PASSED"
+    assert data["verdict_reasons"][1] == (
+        "1 of 5 ETL steps completed without error; 1 failed and 3 were skipped because of it, and none of these "
+        "steps blocks the build")
+    _passing_run(ws)
+    _with_steps(ws, era)
+    data = collect_report_data(cfg, ws)
+    assert data["verdict_reasons"][1] == (
+        "1 of 2 ETL steps completed without error; the one that failed does not block the build")
+
+
+def test_values_not_loaded_as_written(full_ws):
+    from omop_agent.report.inspection import _etl_section
+
+    cfg, ws = full_ws
+    _passing_run(ws)
+    _with_steps(
+        ws,
+        TableLoadResult(target_table="person", step="03_person_2", kind="insert", rows_inserted=10, source_rows=12,
+                        value_counts={"invalid": {"birth_datetime": 3}, "imputed": {"birth_datetime": 40},
+                                      "required_null": {"year_of_birth": 2}, "row": {"dropped": 2}}),
+        TableLoadResult(target_table="visit_occurrence", step="05_visit_occurrence", kind="insert", rows_inserted=5,
+                        value_counts={"defaulted": {"visit_end_date": 7}, "invalid": {"where": 1},
+                                      "offset_ignored": {"visit_start_datetime": 9}, "offset_converted": {}}),
+        TableLoadResult(target_table="measurement", step="09_measurement", kind="insert", error="x",
+                        value_counts={"invalid": {"value_as_number": 4}}),
+    )
+    run = ws.load_json(ws.etl_run_json, ETLRunResult)
+    rows = _etl_section(run)["value_rows"]
+    # per table and field in the CDM's field order (the filter first), the steps that failed left out
+    assert [(r["table"], r["field"], r["step"]) for r in rows] == [
+        ("person", "year_of_birth", "person_2"), ("person", "birth_datetime", "person_2"),
+        ("visit_occurrence", "(filter)", ""), ("visit_occurrence", "visit_start_datetime", ""),
+        ("visit_occurrence", "visit_end_date", "")]
+    assert (rows[0]["required_null"], rows[1]["invalid"], rows[1]["imputed"], rows[1]["defaulted"]) == (
+        "2", "3", "40", "")
+    assert (rows[3]["offset_ignored"], rows[4]["defaulted"]) == ("9", "7")
+    shared = _etl_section(run, 5, shareable=True)["value_rows"]
+    assert (shared[0]["required_null"], shared[1]["invalid"], shared[1]["imputed"], shared[3]["offset_ignored"]) == (
+        "<5", "<5", "40", "9")
+
+    md, html = (p.read_text() for p in build_report(cfg, ws))
+    assert "**Values not loaded as written**" in md
+    assert "| person.birth_datetime | person_2 | 3 | 40 |  |  |  |  |  |" in md
+    assert "| visit_occurrence.(filter) |  | 1 |" in md
+    assert "<h3>Values not loaded as written</h3>" in html and "<code>person.birth_datetime</code>" in html
+    md, _ = (p.read_text() for p in build_report(cfg, ws, shareable=True))
+    assert "| person.birth_datetime | person_2 | &lt;5 | 40 |" in md and 'Counts below 5 are shown as "&lt;5"' in md
+
+
+def test_reading_the_values(full_ws):
+    cfg, ws = full_ws
+    k = 5
+    ws.save_json(ws.profile_json, SourceProfile(source_type="csv", generated_at=T0, min_cell_count=k, tables=[
+        TableProfile(name="individuals", n_rows=400, columns=[
+            _col("dob", inferred_type="date", date_format="%d/%m/%Y",
+                 value_shapes=[ValueFreq(value="99/99/9999", count=380)], n_nonconforming=12,
+                 nonconforming_shapes=[ValueFreq(value="99-99-99", count=12)], n_partial_dates=3, n_na_markers=7),
+            _col("submitted", inferred_type="datetime", date_format="%Y-%m-%dT%H:%M:%S%z",
+                 tz_offsets=[ValueFreq(value="+03:00", count=50)], n_rare_offsets=2,
+                 format_notes=["most values carry +03:00"]),
+            _col("hh_id", value_shapes=[ValueFreq(value="AA99999", count=400)]),  # its shape alone: profile.md
+            _col("first_name", is_pii=True, n_na_markers=9),  # identifiers: counts in the profile only
+        ])]))
+    data = collect_report_data(cfg, ws)
+    assert data["source"]["reading"] == [
+        {"table": "individuals", "column": "dob", "type": "date", "format": "%d/%m/%Y", "shapes": "99/99/9999 ×380",
+         "nonconforming": "12", "nonconforming_shapes": "99-99-99 ×12", "partial": "<5", "offsets": "",
+         "na_markers": "7", "notes": ""},
+        {"table": "individuals", "column": "submitted", "type": "datetime", "format": "%Y-%m-%dT%H:%M:%S%z",
+         "shapes": "", "nonconforming": "", "nonconforming_shapes": "", "partial": "", "na_markers": "",
+         "offsets": "+03:00 ×50, <5 with rarer offsets", "notes": "most values carry +03:00"}]
+    md, html = render_markdown(data), render_html(data)
+    assert ("| individuals.dob | date | %d/%m/%Y | 99/99/9999 ×380 | 12 | 99-99-99 ×12 | &lt;5 |  | 7 |  |") in md
+    assert "+03:00 ×50, &lt;5 with rarer offsets" in md and "<h3>Reading the values</h3>" in html
+    assert "hh_id" not in md.split("**Reading the values**")[1].split("**Notes and questions")[0]
+    # a threshold raised after profiling applies at once, as in what Claude sees (privacy.llm_view)
+    strict = cfg.model_copy(update={"privacy": cfg.privacy.model_copy(update={"min_cell_count": 30})})
+    source = collect_report_data(strict, ws, shareable=True)["source"]
+    assert source["min_cell_count"] == 30
+    dob, submitted = source["reading"]
+    assert (dob["shapes"], dob["nonconforming"], dob["nonconforming_shapes"], dob["na_markers"]) == (
+        "99/99/9999 ×380", "<30", "", "<30")
+    assert submitted["offsets"] == "+03:00 ×50, <30 with rarer offsets"
+    shared = render_markdown(collect_report_data(strict, ws, shareable=True))
+    assert 'Counts below 30 are shown as "&lt;30"' in shared
+    assert "| individuals.dob | date | %d/%m/%Y | 99/99/9999 ×380 | &lt;30 |  | &lt;30 |  | &lt;30 |  |" in shared
+
+
+def test_design_section_says_what_the_build_does(full_ws):
+    from omop_agent.design.render import ONE_ROW_PER_KEY_TEXT, routing_text
+
+    cfg, ws = full_ws
+    data = collect_report_data(cfg, ws)
+    rules = data["design"]["rules"]
+    assert [r["label"] for r in rules] == ["One row per key", "Observation periods", "Routing by domain", "Eras"]
+    assert rules[0]["text"] == ONE_ROW_PER_KEY_TEXT
+    md, html = render_markdown(data), render_html(data)
+    assert "What the build does beyond the mappings:" in md
+    assert "- Observation periods: loaded by a table mapping, one row per episode; the build merges" in md
+    assert "<dt>Routing by domain</dt><dd>after loading, every condition_occurrence" in html
+    spec = ws.load_yaml(ws.spec_yaml, ETLSpec)
+    persons_only = spec.model_copy(update={"table_mappings": [spec.mapping_for("person")]})
+    assert routing_text(persons_only).startswith("on, but the spec loads none of the tables records are moved from")
+    assert routing_text(spec.model_copy(update={"route_by_domain": False})).startswith("off (route_by_domain: false)")
+
+
+def test_etl_rows_say_what_each_kind_of_step_did():
+    from omop_agent.report.inspection import _etl_section
+
+    run = ETLRunResult(started_at=T0, steps=[
+        TableLoadResult(target_table="person_map", step="01_person_map", kind="id_map", rows_inserted=40),
+        TableLoadResult(target_table="visit_map_prune", step="06_visit_map_prune", kind="prune", rows_inserted=3),
+        TableLoadResult(target_table="route_prepare", step="11_route_prepare", kind="route", blocking=False,
+                        rows_inserted=6),
+        TableLoadResult(target_table="measurement", step="14_route_measurement", kind="route", blocking=False,
+                        skipped="requires route_prepare, which failed"),
+        TableLoadResult(target_table="observation_period", step="15_observation_period", kind="derived",
+                        rows_inserted=9),
+        TableLoadResult(target_table="drug_era", step="19_drug_era", kind="derived", blocking=False, rows_inserted=7),
+    ])
+    steps = _etl_section(run)["steps"]
+    assert [s["table"] for s in steps] == ["person_map", "visit_map", "id_high_water", "measurement",
+                                           "observation_period", "drug_era"]
+    assert [s["rows"] for s in steps] == [None, None, None, None, 9, 7]
+    assert [s["id_keys"] for s in steps] == ["40 new keys", "3 keys retired", "", "", "", ""]
+    assert [s["derived"] for s in steps] == ["", "", "", "", "derived from each person's first and last record",
+                                             "derived from drug_exposure"]
+    assert steps[3]["skipped"] == "requires route_prepare, which failed" and steps[3]["retention"] is None
+    assert _etl_section(run, 5, shareable=True)["steps"][1]["id_keys"] == "<5 keys retired"
+    md = render_markdown({**_minimal_data(), "etl": _etl_section(run)})
+    assert "| 14_route_measurement | measurement | — | — | — |  |  | 0.0 s | skipped: requires route_prepare, which failed |" in md
+    assert "| 19_drug_era | drug_era | 7 | — | — | derived from drug_exposure |" in md
+
+
+def _minimal_data() -> dict:
+    """The report data of an empty workspace, to render one section."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(Path(d))
+        return collect_report_data(cfg, Workspace(cfg.workdir))
+
+
+def test_report_says_when_an_older_version_built_the_cdm(full_ws):
+    """After an update and before a rebuild, the CDM lacks this version's build behaviours that the
+    design section lists: the report says so (an older etl_run.json: steps without a kind)."""
+    cfg, ws = full_ws
+    run = ws.load_json(ws.etl_run_json, ETLRunResult)
+    assert run.steps and all(s.kind is None for s in run.steps)
+    data = collect_report_data(cfg, ws)
+    assert data["older_build"].startswith("The CDM was built by an earlier version of omop-agent")
+    assert "**Built by an earlier version:** The CDM was built" in render_markdown(data)
+    assert "<strong>Built by an earlier version.</strong>" in render_html(data)
+    ws.save_json(ws.etl_run_json, run.model_copy(update={
+        "steps": [s.model_copy(update={"kind": "insert"}) for s in run.steps]}))
+    data = collect_report_data(cfg, ws)
+    assert data["older_build"] == "" and "Built by an earlier version" not in render_markdown(data)

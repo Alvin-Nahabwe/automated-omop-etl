@@ -21,8 +21,8 @@ import json
 import psycopg
 import yaml
 
-from ..cdm.spec import load_cdm_spec
-from ..config import ProjectConfig
+from ..cdm.spec import DERIVED_ERAS, LOAD_ORDER, load_cdm_spec
+from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, fetch_all, qi, short_error
 from ..llm import LLMClient, LLMUnavailable
 from ..models import (
@@ -87,18 +87,42 @@ has no person are dropped.
 - Concept fields hold standard concepts from the domain the CDM field expects. Use 0 ("No \
 matching concept") when a source value exists but cannot be mapped. Only use concept ids that \
 appear in the reference list; anything else must come from a lookup (concept_map or \
-vocab_code), never from memory.
+vocab_code), never from memory. The main concept field of condition_occurrence, \
+procedure_occurrence, drug_exposure, device_exposure and measurement may also receive a concept \
+of another domain: the build then moves the record to that domain's table. A local code \
+(concept_map) of a condition may map to a Condition, Observation, Procedure or Measurement \
+concept; of a procedure to a Procedure, Observation or Measurement concept; of a measurement to a \
+Measurement or Observation concept; of a drug or a device to a Drug or Device concept. Only the \
+standard concept decides: unmapped records (concept 0) stay where you load them, and concepts of \
+other domains (values, units, types) are never moved.
 - Keep the verbatim source value in the matching *_source_value field, and fill \
 *_source_concept_id from the source vocabulary when a vocab_code lookup is used (0 otherwise).
-- Required fields must never be NULL. When a required date can be missing in the source, \
-derive a sensible fallback (for example an end date equal to the start date) and say so in \
-the rationale.
-- Observation periods are the spans during which a person's events would be recorded. Use a \
-source table of enrollment, residency or follow-up episodes when one exists; otherwise derive \
-them from the events.
-- Records go to the table of their content's domain: diagnoses to condition_occurrence, \
-prescriptions and dispensings to drug_exposure, lab results and vital signs to measurement, \
-other facts to observation.
+- Required fields: when a required value can be missing or unreadable, the build applies the \
+CDM convention and counts it: a required concept becomes 0; visit_end_date, \
+visit_detail_end_date and drug_exposure_end_date fall back to the start date; rows without a \
+required start date, birth year or death date are dropped. Write an explicit fallback when the \
+source offers a better one (for example start + days_supply - 1 for drug_exposure_end_date) \
+and say so in the rationale. Never give observation_period_end_date a fallback (see observation \
+periods).
+- Observation periods are the spans during which a person's events would be recorded. When a \
+source table records enrollment, residency or follow-up episodes, map it to observation_period \
+one row per episode: start = entry date, end = exit date, end NULL when the episode is still \
+open (never CURRENT_DATE, never the start date, never a placeholder date). The build merges each \
+person's overlapping and back-to-back periods, ends open ones at cdm_source.source_release_date \
+or at death, drops episodes that end before they start, and gives persons without a valid \
+episode a period from their first to their last event. So do not merge, de-duplicate or filter \
+episodes yourself and do not write correlated subqueries for it. Without such a table use \
+'from_events'.
+- Map each source table of events to the table of its content: diagnoses to \
+condition_occurrence, prescriptions and dispensings to drug_exposure, lab results and vital signs \
+to measurement, other facts to observation. After loading, the build moves every \
+condition_occurrence, procedure_occurrence, drug_exposure, device_exposure and measurement record \
+whose standard concept belongs to another of these domains or to Observation to that domain's \
+table (an ICD-10 Z code for antenatal care to observation, a procedure code to \
+procedure_occurrence); a measurement with a result whose concept is not a measurement or an \
+observation goes to observation, so the result is kept. So never split a source table by the \
+domain of its codes yourself (a second mapping of the same codes, or a filter on \
+{vocab}.concept.domain_id): those records would be loaded twice.
 
 Answer with the requested JSON structure only. Write SQL for PostgreSQL. Put the reasoning a \
 reviewer needs into the rationale fields, briefly.
@@ -106,13 +130,26 @@ reviewer needs into the rationale fields, briefly.
 
 STAGING_CONVENTIONS = """\
 Staging conventions for the SQL you write:
-- Every source table has been copied to schema {src} with all columns typed text. Cast \
-explicitly: ::date or ::timestamp for ISO dates (YYYY-MM-DD), ::integer or ::numeric for \
-numbers. For any other date format the profile shows the PostgreSQL template to use, for \
-example "format %d/%m/%Y (PostgreSQL: to_date(x, 'DD/MM/YYYY'))": write to_date(x, \
-'DD/MM/YYYY'). Never pass a strftime pattern such as '%d/%m/%Y' to to_date or to_timestamp: \
-PostgreSQL does not reject it and silently returns a wrong date.
-- Empty source values were loaded as NULL.
+- Every source table has been copied to schema {src} with all columns typed text. Convert \
+explicitly: ::date or ::timestamp for ISO dates (YYYY-MM-DD; the year-first YYYYMMDD and \
+YYYY/MM/DD read too), ::integer or ::numeric for numbers. For any other date format the profile \
+shows the PostgreSQL template to use, for example "format %d/%m/%Y (PostgreSQL: to_date(x, \
+'DD/MM/YYYY'))": write to_date(x, 'DD/MM/YYYY'); a ::date cast reads none of the values of such \
+a column. Never pass a strftime pattern such as '%d/%m/%Y' to to_date or to_timestamp: \
+PostgreSQL does not reject it and silently returns a wrong date, so the validator rejects it.
+- The build reads these conversions tolerantly: a value that cannot be read (31/02/2019, \
+'unknown', a number with text in it) becomes NULL and is counted per field, instead of failing \
+the whole table. Do not add regex guards only to avoid cast errors; do guard columns that \
+legitimately mix numbers and text (lab results), so that the text goes to value_as_string. \
+Casts in join conditions and in person_id, visit_id, vocab_code and concept_map expressions are \
+keys and are evaluated as written: where such a value can be unreadable, use \
+{etl}.try_date(x, 'DD/MM/YYYY') (or try_timestamp, try_integer, try_number), which gives NULL.
+- <PARTIAL_DATES>
+- <OFFSETS>
+- Empty source values, and the missing-value markers the profile counts (source.na_values, by \
+default NA, NULL, \\N and '.' in CSV files), were loaded as NULL. The profile also counts the \
+values that do not fit a column's type or date format, and lists value shapes (9 for a digit, \
+a / A for a letter): read them before you choose a template.
 - Refer to columns through the aliases you declare in source.alias and joins[].alias (for \
 example v.visit_date::date). Join other source tables by their bare name, and vocabulary or \
 ETL tables as {vocab}.<table> or {etl}.<table>. Inside an expression (a correlated subquery) \
@@ -126,7 +163,10 @@ kind person_id, because only the resulting integer person_id is stored.
 - Constant concept ids must come from the reference concept list, or be 0.
 - Use kind concept_map for local codes, labels and free-text categories. Name the \
 vocabulary 'SRC_<NAME>' (for example 'SRC_DRUG') and set target_domain to the OMOP domain of \
-the concepts they should map to; the codes are mapped to standard concepts in a later step.
+the concepts they should map to; the codes are mapped to standard concepts in a later step. For \
+the main concept field of an event table this is the table's own domain: the mapper also accepts \
+the other domains listed above for it. Give every field its own source vocabulary unless the \
+fields mean the same codes: one concept is chosen per code for every field that shares one.
 - Use kind vocab_code for codes that already belong to an OMOP vocabulary (ICD10, ICD10CM, \
 LOINC, RxNorm, SNOMED, ...). The expression must produce the code exactly as it appears in \
 concept.concept_code, so normalise the format in SQL when the profile shows it differs (for \
@@ -138,7 +178,39 @@ that every other table links through, so they are never auto_id: an auto_id pers
 follow row order and attach every event to the wrong person. Other tables' own primary keys \
 (condition_occurrence_id, drug_exposure_id, measurement_id, ...) use kind auto_id.
 - Use where to keep only the rows that belong in this table when one source table feeds \
-several CDM tables.
+several CDM tables, by what a row records (a visit type, a form), never by the domain of its \
+code: the build moves records by domain.
+- A correlated subquery ({src}.<table> inside an expression) runs once per source row, which is \
+slow on large tables; prefer a join. Observation period episodes never need one: the build merges \
+them.
+- Every person and visit_occurrence mapping adds the keys of the rows it loads to the person or \
+visit id map, so people and visits can come from several source tables (the HDSS register and a \
+clinic register; outpatient visits and admissions). A key found in two sources is one person \
+(visit), and the mappings of one table are applied in spec order: the first mapping that loads a \
+key wins outright, and a later mapping's rows of that key are skipped (counted); spanning, \
+dedup_order and the death ranking compare the rows of one mapping only. List the authoritative \
+source first (the HDSS register before a clinic register; the death source whose date should win) \
+and bring in what another source adds (a verbal autopsy's cause) through a join of that mapping. \
+When a source numbers its people or visits independently of the person_key or \
+visit_key table, prefix its keys (for example 'EMR:' || e.patient_no or 'IPD:' || a.admission_no), \
+here and in every mapping that refers to them.
+- person, death and visit_occurrence keep one row per key: person and death one per person, \
+visit_occurrence one per visit and person. Several rows of one visit (ward stays, diagnoses) may \
+feed one visit_occurrence mapping: the build keeps one row per visit and person, taking the earliest \
+start and the latest end of that mapping's rows (admitted_from from the first row, discharged_to \
+from the last). Rows that belong to a visit another mapping loads (the ward stays of an admission \
+table) must come through that mapping (as its driving table or a join), or go to visit_detail: a \
+mapping of their own adds nothing to the visits loaded before it. Rows of one visit \
+key that are separate stays (days apart) fail etlVisitGrain: the visit key must identify one \
+visit. Set dedup_order (an ORDER BY list over the aliases, best row first, for example \
+"x.verified = '1' DESC" or "i.reg_date::date DESC"; a missing or unreadable value ranks last) when \
+the rows of one key can disagree and one should win; otherwise the most complete row is kept (for \
+death, a date known to the day, then the latest).
+- A record links only to a visit of its own person, and only when its visit key gives exactly the \
+text of the visit mapping's key (case, padding, separators, prefix, date format): write it the same \
+way.
+- When visit numbers restart for each person, the visit key must include the person key, e.g. \
+v.individual_id || ':' || v.visit_no (in the visit_key, the visit mapping and every record).
 """
 
 
@@ -220,8 +292,37 @@ def _notes_text(annotations: SourceAnnotations | None) -> str:
     return "\n".join(f"- {n}" for n in annotations.notes)
 
 
-def design_system(reference: str, vocabularies: str, annotations: SourceAnnotations | None) -> str:
-    """The system prompt of every design call: instructions plus the shared reference material.
+def staging_conventions(cfg: ProjectConfig | None = None) -> str:
+    """``STAGING_CONVENTIONS`` with the date rules of this project (``cfg.etl``: the site time zone
+    and the partial-date rule; defaults without it)."""
+    etl = cfg.etl if cfg is not None else EtlConfig()
+    if etl.partial_dates == "widest":
+        partial = ("start dates take the first day, end dates the last day (the widest interval; an end computed "
+                   "from the start's columns reads them as the start does), other dates the 15th")
+    else:
+        partial = "they are left NULL (etl.partial_dates: reject)"
+    if etl.timezone:
+        offsets = (f"are converted to the site time zone ({etl.timezone}); write ::timestamptz AT TIME ZONE "
+                   "'<zone>' only when you need another zone")
+    else:
+        offsets = ("keep the time as written (no site time zone is configured, so the offset is ignored and "
+                   "counted). A column whose profile shows 'Z', '+00:00' or several offsets needs etl.timezone: "
+                   "the validator stops the build until a person sets it, whatever the expression, so write the "
+                   "plain conversion and say so in open_questions")
+    return STAGING_CONVENTIONS.replace("<PARTIAL_DATES>", (
+        "Dates with an unknown day or month (00/06/1975, 1975-00-00, or a template without DD or MM) are "
+        f"completed by the build and counted: {partial}. Birth and death dates follow THEMIS: year_of_birth and "
+        "month_of_birth keep the known parts, a missing birth day is the 1st and a year alone gives no "
+        "birth_datetime; a death date takes the last day of the known month or year. Write the plain conversion; "
+        "do not handle 00 days yourself."
+    )).replace("<OFFSETS>", f"Timestamps with an offset ('Z', '+03:00') {offsets}.")
+
+
+def design_system(
+    reference: str, vocabularies: str, annotations: SourceAnnotations | None, cfg: ProjectConfig | None = None
+) -> str:
+    """The system prompt of every design call: instructions plus the shared reference material
+    (``cfg`` gives the project's date rules, see ``staging_conventions``).
 
     It is identical for the plan and every table (and revision) call of a run, so the provider
     caches it once; table-specific content goes into the user prompt.
@@ -232,7 +333,7 @@ The reference material below applies to every request in this design.
 FIELD KINDS (TableMapping.fields[].kind)
 {inspect.cleandoc(FieldMapping.__doc__ or '')}
 
-{STAGING_CONVENTIONS}
+{staging_conventions(cfg)}
 VOCABULARIES LOADED: {vocabularies}
 
 NOTES ON THE SOURCE DATA (from the interpretation of the profile; they apply to every table \
@@ -276,16 +377,36 @@ def _cdm_tables_text() -> str:
     return "\n".join(lines)
 
 
-def _keys_text(person_key: KeySpec, visit_key: KeySpec | None) -> str:
+def _keys_text(person_key: KeySpec, visit_key: KeySpec | None, drafted: list[TableMapping] | None = None) -> str:
+    """The patient and visit keys every mapping must write the same way: the plan's keys, plus the
+    keys of the person and visit_occurrence mappings drafted so far (each adds its keys to the map)."""
+
+    def written(table: str, field: str) -> list[str]:
+        out = []
+        for tm in drafted or []:
+            fm = next((f for f in tm.fields if f.target_field == field and (f.expression or "").strip()), None)
+            if tm.target_table == table and fm is not None and fm.kind in ("person_id", "visit_id"):
+                out.append(f"  - {tm.source.table} ({tm.source.alias}): {' '.join((fm.expression or '').split())}")
+        return out
+
     lines = [
         f"Person key: {person_key.table}.{person_key.expression}. Fill person_id with kind person_id "
         "and the column that holds this patient key in the table you are mapping."
     ]
+    people = written("person", "person_id")
+    if people:
+        lines.append("Person mappings drafted so far (a record refers to a person with exactly the same key text as "
+                     "one of them):\n" + "\n".join(people))
     if visit_key is not None:
         lines.append(
             f"Visit key: {visit_key.table}.{visit_key.expression}. Fill visit_occurrence_id with kind "
-            "visit_id and the column that holds this visit key (NULL when a record has no visit)."
+            "visit_id and the column that holds this visit key (NULL when a record has no visit). Write it "
+            "exactly as the visit mapping does: a key that gives other text (case, padding, separators, prefix, "
+            "date format) leaves the record without a visit, and a record links only to a visit of its own person."
         )
+        visits = written("visit_occurrence", "visit_occurrence_id")
+        if visits:
+            lines.append("Visit mappings drafted so far (their visit keys):\n" + "\n".join(visits))
     else:
         lines.append("There is no visit key: leave visit_occurrence_id fields unmapped.")
     return "\n".join(lines)
@@ -297,14 +418,27 @@ Plan the ETL of the source dataset below into OMOP CDM v5.4.
 
 Decide:
 1. person_key: the source table that lists each individual once, and the SQL expression of \
-the patient key over that table's bare column names.
-2. visit_key: the source table of visits/encounters and its key expression, if there is one.
+the patient key over that table's bare column names. Plan one person mapping per source table \
+that lists people (for example the HDSS register, and a clinic register of patients who are not \
+in it): each adds the people it loads to the person id map.
+2. visit_key: the source table of visits/encounters and its key expression, if there is one. \
+Plan one visit_occurrence mapping per source of visits (outpatient visits, admissions): each adds \
+its visits to the visit id map. The ward stays of an admission are rows of that admission's \
+visit: load them through the admission's mapping (or as visit_detail), not as a mapping of their \
+own. If visit numbers restart for each person, \
+include the person key in the visit key.
 3. observation_period: 'table_mapping' if a source table records enrollment, residency or \
-follow-up periods (then plan an observation_period table from it), otherwise 'from_events'.
+follow-up episodes (then plan an observation_period table from it, one row per episode: the build \
+merges each person's episodes, ends open ones and gives persons without an episode a period from \
+their events), otherwise 'from_events'.
 4. tables: one entry per table mapping, in load order (person first). For each, the CDM \
 target table and its source tables (the first one provides the rows; any others are joined). \
-A CDM table may appear more than once when several source tables feed it. Only plan tables \
-the data supports.
+A CDM table may appear more than once when several source tables feed it; for person, death and \
+visit_occurrence the first mapping that loads a key wins outright, so list the authoritative \
+source first. Only plan tables \
+the data supports. Do not plan mappings that only split a source table by the domain of its \
+codes: the build moves each record to the table of its concept's domain. Do not plan \
+condition_era or drug_era: the build derives them from the condition and drug records.
 5. unmapped_source_tables: source tables you leave out, with the reason in open_questions.
 6. assumptions you made and open_questions for the data owner.
 
@@ -324,6 +458,7 @@ def _table_prompt(
     profile: SourceProfile,
     annotations: SourceAnnotations | None,
     cfg: ProjectConfig,
+    drafted: list[TableMapping] | None = None,
 ) -> str:
     cdm = load_cdm_spec()
     others = [f"{t.target_table} <- {', '.join(t.source_tables)}" for t in plan.tables if t is not pt]
@@ -336,7 +471,7 @@ Why this table was planned: {pt.rationale}
 Other planned mappings: {'; '.join(others) or 'none'}
 Observation period strategy: {plan.observation_period}
 
-{_keys_text(plan.person_key, plan.visit_key)}
+{_keys_text(plan.person_key, plan.visit_key, drafted)}
 
 TARGET TABLE
 {cdm.describe(pt.target_table)}
@@ -376,7 +511,8 @@ def _need_llm(e: Exception) -> RuntimeError:
 
 
 def _normalise_plan(plan: TablePlan) -> TablePlan:
-    """Keep only CDM targets, make sure person is planned, and a consistent period strategy."""
+    """Keep only CDM targets (not the era tables the build derives), make sure person is planned,
+    and a consistent period strategy."""
     cdm = load_cdm_spec()
     tables: list[PlannedTable] = []
     notes: list[str] = []
@@ -384,6 +520,10 @@ def _normalise_plan(plan: TablePlan) -> TablePlan:
         name = pt.target_table.strip().lower()
         if not cdm.has_table(name) or cdm.table(name).schema_class != "CDM":
             notes.append(f"The plan named '{pt.target_table}', which is not a CDM v5.4 table; it was skipped.")
+            continue
+        if name in DERIVED_ERAS:  # a mapping into an era table would replace the build's OHDSI eras
+            notes.append(f"The plan named {name}, which the build derives from {DERIVED_ERAS[name]} with the OHDSI "
+                         "era logic; it was skipped.")
             continue
         if not pt.source_tables:
             notes.append(f"The plan for {name} named no source table; it was skipped.")
@@ -399,10 +539,18 @@ def _normalise_plan(plan: TablePlan) -> TablePlan:
             ),
         )
     update: dict = {"tables": tables, "open_questions": plan.open_questions + notes}
-    if plan.observation_period == "table_mapping" and not any(t.target_table == "observation_period" for t in tables):
+    planned_op = any(t.target_table == "observation_period" for t in tables)
+    if plan.observation_period == "table_mapping" and not planned_op:
         update["observation_period"] = "from_events"
         update["assumptions"] = plan.assumptions + [
             "No observation_period mapping was planned, so observation periods are derived from events."
+        ]
+    elif plan.observation_period == "from_events" and planned_op:
+        # the planned episodes are the periods; persons without one get a period from their events
+        update["observation_period"] = "table_mapping"
+        update["assumptions"] = plan.assumptions + [
+            "An observation_period mapping was planned, so observation periods come from it ('table_mapping'); "
+            "persons without a valid episode get a period from their first to their last event."
         ]
     return plan.model_copy(update=update)
 
@@ -418,7 +566,7 @@ def design_etl(
     max_revisions: int = 2,
 ) -> ETLSpec:
     """Plan, map each table, validate and revise. Returns the spec (also saved to ``ws``)."""
-    system = design_system(reference_concepts_text(conn, schemas), _vocabularies_text(conn, schemas), annotations)
+    system = design_system(reference_concepts_text(conn, schemas), _vocabularies_text(conn, schemas), annotations, cfg)
 
     try:
         plan = llm.structured(
@@ -432,22 +580,29 @@ def design_etl(
         raise _need_llm(e) from e
     plan = _normalise_plan(plan)
 
-    # one mapping per planned table
+    # one mapping per planned table, drafted in CDM load order (the person and visit mappings before
+    # the records that refer to their keys, which their prompts list) but kept in plan order (the
+    # order among the mappings of one table is their priority). The keys of the calls follow the
+    # plan order, so recorded answers replay whatever the drafting order
     keys: list[str] = []
-    prompts: list[str] = []
-    mappings: list[TableMapping] = []
     seen: dict[str, int] = {}
     for pt in plan.tables:
         seen[pt.target_table] = seen.get(pt.target_table, 0) + 1
-        key = f"table:{pt.target_table}" + (f":{seen[pt.target_table]}" if seen[pt.target_table] > 1 else "")
-        prompt = _table_prompt(pt, plan, profile, annotations, cfg)
+        keys.append(f"table:{pt.target_table}" + (f":{seen[pt.target_table]}" if seen[pt.target_table] > 1 else ""))
+    rank = {t: i for i, t in enumerate(LOAD_ORDER)}
+    draft_order = sorted(range(len(plan.tables)), key=lambda i: (rank.get(plan.tables[i].target_table, len(rank)), i))
+    prompts: list[str] = [""] * len(plan.tables)
+    drafted: dict[int, TableMapping] = {}
+    for i in draft_order:
+        pt = plan.tables[i]
+        prompt = _table_prompt(pt, plan, profile, annotations, cfg, [drafted[j] for j in sorted(drafted)])
         try:
-            tm = llm.structured(stage="design", key=key, system=system, prompt=prompt, output=TableMapping)
+            tm = llm.structured(stage="design", key=keys[i], system=system, prompt=prompt, output=TableMapping)
         except LLMUnavailable as e:
             raise _need_llm(e) from e
-        keys.append(key)
-        prompts.append(prompt)
-        mappings.append(tm.model_copy(update={"target_table": pt.target_table}))
+        prompts[i] = prompt
+        drafted[i] = tm.model_copy(update={"target_table": pt.target_table})
+    mappings = [drafted[i] for i in range(len(plan.tables))]
 
     open_questions = list(plan.open_questions)
     if plan.unmapped_source_tables:
@@ -464,10 +619,8 @@ def design_etl(
     # validate each mapping; send the ones with errors back with the findings
     for i in range(len(mappings)):
         for n in range(1, max_revisions + 1):
-            errors = [
-                x for x in validate_table_mapping(spec.table_mappings[i], spec, profile, conn, schemas, cfg.privacy)
-                if x.severity == "error"
-            ]
+            issues = validate_table_mapping(spec.table_mappings[i], spec, profile, conn, schemas, cfg.privacy, cfg=cfg)
+            errors = [x for x in issues if x.severity == "error"]
             if not errors:
                 break
             rkey = f"{keys[i]}:revision{n}"
@@ -488,7 +641,7 @@ def design_etl(
             if ws is not None:
                 ws.audit("design_revision", key=rkey, issues=[str(x) for x in errors])
 
-    issues = validate_spec(spec, profile, conn, schemas, cfg.privacy)
+    issues = validate_spec(spec, profile, conn, schemas, cfg.privacy, cfg=cfg)
     if ws is not None:
         save_design(ws, spec, issues)
         ws.audit(

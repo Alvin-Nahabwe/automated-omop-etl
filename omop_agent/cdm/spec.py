@@ -68,6 +68,103 @@ TABLE_DOMAIN = {
     "specimen": "Specimen",
 }
 
+# The era tables the build derives (``ETLSpec.derive_eras``, ``etl.compiler.derived_era_tables``)
+# and the event table each is derived from.
+DERIVED_ERAS = {"condition_era": "condition_occurrence", "drug_era": "drug_exposure"}
+
+# Routing by domain (etl.routing): the event tables whose records the build moves to the table of
+# their standard concept's domain, and every table a record can be moved to. observation is a
+# destination only: DQD has no fkDomain check on observation_concept_id.
+ROUTE_SOURCES = ("condition_occurrence", "procedure_occurrence", "drug_exposure", "device_exposure", "measurement")
+ROUTE_TABLES = ROUTE_SOURCES + ("observation",)
+# The event domain of each route table; a concept of any other domain (Meas Value, Unit, Type
+# Concept, Visit, ...) is never moved.
+DOMAIN_TABLE = {
+    "Condition": "condition_occurrence",
+    "Procedure": "procedure_occurrence",
+    "Drug": "drug_exposure",
+    "Device": "device_exposure",
+    "Measurement": "measurement",
+    "Observation": "observation",
+}
+# The domains a local code (concept_map) of the main concept field of each route source may be
+# mapped to (its own first): the record then moves to the table of that domain. A diagnosis list
+# also holds observations (ICD-10 Z codes), procedures and findings, but a procedure or a test name
+# must never map to a disease, so only condition accepts Condition; drugs and devices accept each
+# other (a vaccine, a dressing). observation (not routed) and every other concept field accept
+# their own domain only.
+ACCEPTED_DOMAINS: dict[str, tuple[str, ...]] = {
+    "condition_occurrence": ("Condition", "Observation", "Procedure", "Measurement"),
+    "procedure_occurrence": ("Procedure", "Observation", "Measurement"),
+    "measurement": ("Measurement", "Observation"),
+    "drug_exposure": ("Drug", "Device"),
+    "device_exposure": ("Device", "Drug"),
+}
+# The field of each route table that plays each role: a moved record keeps a value only where the
+# destination has a field of the same role (etl.routing.pair_fields).
+_SHARED_ROLES = {"person_id": "person_id", "provider_id": "provider_id", "visit_occurrence_id": "visit_occurrence_id",
+                 "visit_detail_id": "visit_detail_id"}
+EVENT_FIELD_ROLES: dict[str, dict[str, str]] = {
+    "condition_occurrence": {
+        "id": "condition_occurrence_id", "concept": "condition_concept_id",
+        "start_date": "condition_start_date", "start_datetime": "condition_start_datetime",
+        "end_date": "condition_end_date", "end_datetime": "condition_end_datetime",
+        "type": "condition_type_concept_id", "stop_reason": "stop_reason",
+        "source_value": "condition_source_value", "source_concept": "condition_source_concept_id",
+        **_SHARED_ROLES,
+    },
+    "procedure_occurrence": {
+        "id": "procedure_occurrence_id", "concept": "procedure_concept_id",
+        "start_date": "procedure_date", "start_datetime": "procedure_datetime",
+        "end_date": "procedure_end_date", "end_datetime": "procedure_end_datetime",
+        "type": "procedure_type_concept_id", "quantity": "quantity",
+        "source_value": "procedure_source_value", "source_concept": "procedure_source_concept_id",
+        **_SHARED_ROLES,
+    },
+    "drug_exposure": {
+        "id": "drug_exposure_id", "concept": "drug_concept_id",
+        "start_date": "drug_exposure_start_date", "start_datetime": "drug_exposure_start_datetime",
+        "end_date": "drug_exposure_end_date", "end_datetime": "drug_exposure_end_datetime",
+        "type": "drug_type_concept_id", "stop_reason": "stop_reason", "quantity": "quantity",
+        "source_value": "drug_source_value", "source_concept": "drug_source_concept_id",
+        "unit_source_value": "dose_unit_source_value",
+        **_SHARED_ROLES,
+    },
+    "device_exposure": {
+        "id": "device_exposure_id", "concept": "device_concept_id",
+        "start_date": "device_exposure_start_date", "start_datetime": "device_exposure_start_datetime",
+        "end_date": "device_exposure_end_date", "end_datetime": "device_exposure_end_datetime",
+        "type": "device_type_concept_id", "quantity": "quantity",
+        "source_value": "device_source_value", "source_concept": "device_source_concept_id",
+        "unit": "unit_concept_id", "unit_source_value": "unit_source_value",
+        "unit_source_concept": "unit_source_concept_id",
+        **_SHARED_ROLES,
+    },
+    "measurement": {
+        "id": "measurement_id", "concept": "measurement_concept_id",
+        "start_date": "measurement_date", "start_datetime": "measurement_datetime",
+        "type": "measurement_type_concept_id",
+        "value_number": "value_as_number", "value_concept": "value_as_concept_id",
+        "unit": "unit_concept_id", "unit_source_value": "unit_source_value",
+        "unit_source_concept": "unit_source_concept_id", "value_source_value": "value_source_value",
+        "source_value": "measurement_source_value", "source_concept": "measurement_source_concept_id",
+        "event_id": "measurement_event_id", "event_field": "meas_event_field_concept_id",
+        **_SHARED_ROLES,
+    },
+    "observation": {
+        "id": "observation_id", "concept": "observation_concept_id",
+        "start_date": "observation_date", "start_datetime": "observation_datetime",
+        "type": "observation_type_concept_id",
+        "value_number": "value_as_number", "value_string": "value_as_string", "value_concept": "value_as_concept_id",
+        "unit": "unit_concept_id", "unit_source_value": "unit_source_value", "value_source_value": "value_source_value",
+        "source_value": "observation_source_value", "source_concept": "observation_source_concept_id",
+        "event_id": "observation_event_id", "event_field": "obs_event_field_concept_id",
+        **_SHARED_ROLES,
+    },
+}
+# Roles that hold a result: a record with one moves only to a table that has a place for it.
+VALUE_ROLES = ("value_number", "value_concept", "value_string", "value_source_value")
+
 
 def _flag(v: str | None) -> bool:
     return (v or "").strip().lower() in {"true", "yes", "1"}

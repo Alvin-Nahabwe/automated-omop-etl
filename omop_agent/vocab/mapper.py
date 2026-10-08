@@ -19,6 +19,15 @@ names or phone numbers are never collected as terms. For each source vocabulary:
 5. every chosen id is checked against the vocabulary. An id that is not a valid standard
    concept of the target domain is rejected, and the term is FLAGGED for review.
 
+A term of the main concept field of a table the build routes by domain (``etl.routing``) may
+also map to a concept of the table's other accepted domains (``SourceTerm.accepted_domains``: a
+diagnosis list holds observations and procedures too); the record then moves to the table of
+the concept's domain. Its target domain is searched as for any term, and each other accepted
+domain adds its best few candidates on top of the target domain's (one retrieval serves all of
+them). The exact-match and lexical shortcuts pick only concepts of the target domain, and a
+model's choice of another domain is never approved automatically. Neither is any concept of a
+source vocabulary whose fields expect different domains (``SourceTerm.auto_approve``).
+
 Without an LLM (provider ``none``, no replay recording, or ``privacy.send_values_to_llm: false``,
 which keeps every source value out of prompts) the best lexical candidate is kept as an
 UNCHECKED suggestion when its score is at least ``LEXICAL_MIN_SCORE``.
@@ -41,6 +50,7 @@ from rapidfuzz import fuzz
 
 from ..config import PrivacyConfig, ProjectConfig
 from ..db import Schemas, execute, fetch_all, short_error
+from ..etl.routing import VocabularyDomains, vocabulary_domains
 from ..llm import LLMClient, LLMError, LLMUnavailable
 from ..models import (
     ConceptCandidate,
@@ -65,7 +75,13 @@ LEXICAL_MIN_SCORE = 0.85  # lexical fallback threshold when no LLM is available
 DECISION_CANDIDATES = 5  # candidates kept on each decision for the reviewer
 EXHAUSTIVE_DOMAIN_SIZE = 3000  # domains up to this many standard concepts are scored in full
 TRGM_WORD_THRESHOLD = 0.3  # pg_trgm.word_similarity_threshold used to retrieve candidates
+# Candidates are first retrieved at this higher threshold, which the trigram index answers much faster on
+# a full vocabulary; a domain whose pool that does not fill is retrieved again at TRGM_WORD_THRESHOLD
+# (the pools are the same either way: see _Searcher._trigram). Drug names usually fill their pools at
+# this threshold; for most other terms some accepted domain does not, and both retrievals run.
+TRGM_FIRST_THRESHOLD = 0.5
 POOL_SIZE = 300  # rows retrieved by trigram/ILIKE search before Python re-scoring
+ALSO_ACCEPTED_CANDIDATES = 3  # candidates added from each other accepted domain of a term
 MAX_RETRY_PHRASES = 3
 LLM_DISABLED_BY_PRIVACY = "LLM mapping is disabled by privacy.send_values_to_llm"
 
@@ -101,6 +117,11 @@ finds something better.
 property matches them: g/dL, mg/dL and g/L are mass concentrations ([Mass/volume]), mmol/L and \
 umol/L are molar ([Moles/volume]), and so on. Prefer a concept that names the specimen (e.g. \
 in Blood) over a generic one when the term implies it.
+- Some terms also accept concepts of other domains ("also accepted"), for example a \
+diagnosis list that holds observations and procedures; each candidate then shows its domain. \
+Prefer a concept of the target domain. Choose one of another accepted domain only when the term \
+clearly means that kind of thing (an ICD-10 Z code for antenatal care is an observation, not a \
+condition): the record then moves to that domain's table, and a reviewer checks the choice.
 - Keep each rationale to one or two sentences.
 
 Return exactly one choice per source term, with source_code copied exactly as given."""
@@ -119,12 +140,13 @@ _BARE = re.compile(r"(?<![\w.])([A-Za-z_][A-Za-z0-9_]*)(?![\w.]|\s*\()")
 def _field_pii(tm: TableMapping, fm: FieldMapping, profile: SourceProfile | None, privacy: PrivacyConfig) -> list[str]:
     """``table.column`` direct identifiers read by one field's expression.
 
-    Uses :func:`omop_agent.privacy.pii_references` on the field alone (the mapping's WHERE and
-    join conditions filter rows but do not become terms), and also catches unqualified column
-    names and PII-like names when no profile is available.
+    Uses :func:`omop_agent.privacy.pii_references` on the field alone (the mapping's WHERE,
+    dedup_order and join conditions select rows but do not become terms), and also catches
+    unqualified column names and PII-like names when no profile is available.
     """
     only = tm.model_copy(
-        update={"fields": [fm], "where": None, "joins": [j.model_copy(update={"on": ""}) for j in tm.joins]}
+        update={"fields": [fm], "where": None, "dedup_order": None,
+                "joins": [j.model_copy(update={"on": ""}) for j in tm.joins]}
     )
     hits = list(pii_references(only, profile, privacy))
     tables = [tm.source.table] + [j.table for j in tm.joins]
@@ -170,6 +192,7 @@ def _units_by_code(
     fm: FieldMapping,
     expr: str,
     privacy: PrivacyConfig | None,
+    cfg: ProjectConfig | None = None,
 ) -> dict[str, list[ValueFreq]]:
     """Units recorded with each code of a measurement/observation concept field (the mapper needs
     them to tell, e.g., Glucose [Mass/volume] from [Moles/volume]). Only (code, unit) pairs seen at
@@ -185,11 +208,11 @@ def _units_by_code(
     k = (privacy or PrivacyConfig()).min_cell_count
     sql = (
         f"SELECT code, unit, COUNT(*) AS n FROM (\nSELECT {paren(expr)}::text AS code, {paren(unit.expression or '')}::text AS unit\n"
-        f"{source_from_sql(tm)}\n) q\nWHERE code IS NOT NULL AND unit IS NOT NULL AND btrim(unit) <> ''\n"
+        f"{source_from_sql(tm, cfg.etl if cfg else None)}\n) q\nWHERE code IS NOT NULL AND unit IS NOT NULL AND btrim(unit) <> ''\n"
         f"GROUP BY code, unit HAVING COUNT(*) >= {int(k)} ORDER BY code, n DESC"
     )
     try:
-        rows = query_rows(conn, schemas.render(sql))
+        rows = query_rows(conn, schemas.render(sql), cfg)
     except psycopg.Error:
         return {}  # context is optional: never block mapping on it
     out: dict[str, list[ValueFreq]] = {}
@@ -212,6 +235,14 @@ def pii_concept_fields(
     return list(_pii_fields(spec, profile, privacy).values())
 
 
+def source_vocabulary_domains(
+    spec: ETLSpec, profile: SourceProfile | None = None, privacy: PrivacyConfig | None = None
+) -> dict[str, VocabularyDomains]:
+    """Per source vocabulary of the ``concept_map`` fields that :func:`collect_terms` reads, the
+    target domain and the domains its targets may belong to (``etl.routing.vocabulary_domains``)."""
+    return vocabulary_domains(spec, skip=set(_pii_fields(spec, profile, privacy)))
+
+
 def collect_terms(
     conn: psycopg.Connection,
     schemas: Schemas,
@@ -219,6 +250,8 @@ def collect_terms(
     profile: SourceProfile | None = None,
     privacy: PrivacyConfig | None = None,
     ws: Workspace | None = None,
+    *,
+    cfg: ProjectConfig | None = None,
 ) -> list[SourceTerm]:
     """Distinct values (with frequencies) of every ``concept_map`` expression in the spec.
 
@@ -231,11 +264,22 @@ def collect_terms(
     A field whose expression reads a direct identifier is skipped, so its values can never
     reach the LLM or the mapping files: see :func:`pii_concept_fields` for the list (also
     audited as ``vocab_pii_fields_skipped`` when ``ws`` is given). ``privacy`` defaults to
-    :class:`PrivacyConfig`, i.e. the default PII name patterns.
+    :class:`PrivacyConfig`, i.e. the default PII name patterns. The source is read under the build's
+    session settings (``cfg``: time zone and imputation cap; defaults without it).
+
+    Every term of a source vocabulary gets its target domain and accepted domains
+    (:func:`source_vocabulary_domains`), merged over every field that uses the vocabulary, also
+    those whose read of the source repeats another one. When those fields expect concepts of
+    different domains the audit records ``vocab_domain_conflict``.
     """
     skip = _pii_fields(spec, profile, privacy)
     if skip and ws is not None:
         ws.audit("vocab_pii_fields_skipped", fields=list(skip.values()))
+    domains = vocabulary_domains(spec, skip=set(skip))
+    for vocab, vd in sorted(domains.items()):
+        if vd.conflict and ws is not None:
+            ws.audit("vocab_domain_conflict", source_vocabulary_id=vocab, fields=vd.fields,
+                     accepted_domains=vd.accepted, detail=vd.conflict)
     merged: dict[tuple[str, str], SourceTerm] = {}
     seen_reads: set[tuple[str, str]] = set()
     for i, tm in enumerate(spec.table_mappings):
@@ -244,25 +288,26 @@ def collect_terms(
             if fm.kind != "concept_map" or not expr or not vocab or (i, j) in skip:
                 continue
             sql = (
-                f"SELECT code, COUNT(*) AS n FROM (\nSELECT {paren(expr)}::text AS code\n{source_from_sql(tm)}\n) q\n"
+                f"SELECT code, COUNT(*) AS n FROM (\nSELECT {paren(expr)}::text AS code\n"
+                f"{source_from_sql(tm, cfg.etl if cfg else None)}\n) q\n"
                 "WHERE code IS NOT NULL AND btrim(code) <> '' GROUP BY code"
             )
             if (vocab, sql) in seen_reads:  # the same records, read again for another field
                 continue
             seen_reads.add((vocab, sql))
             try:
-                rows = query_rows(conn, schemas.render(sql))
+                rows = query_rows(conn, schemas.render(sql), cfg)
             except psycopg.Error as e:
                 raise ValueError(
                     f"{tm.target_table}.{fm.target_field}: could not read source codes: {short_error(e)}"
                 ) from e
-            units = _units_by_code(conn, schemas, tm, fm, expr, privacy)
+            units = _units_by_code(conn, schemas, tm, fm, expr, privacy, cfg)
+            vd = domains[vocab]
             for r in rows:
                 key = (vocab, r["code"])
                 if key in merged:
                     t = merged[key]
                     t.frequency = max(t.frequency, int(r["n"]))
-                    t.target_domain = t.target_domain or fm.target_domain
                     t.units = t.units or units.get(r["code"], [])
                 else:
                     merged[key] = SourceTerm(
@@ -270,7 +315,9 @@ def collect_terms(
                         source_code=r["code"],
                         source_name=r["code"],
                         frequency=int(r["n"]),
-                        target_domain=fm.target_domain,
+                        target_domain=vd.target_domain,
+                        accepted_domains=list(vd.accepted),
+                        auto_approve=vd.auto_approve,
                         units=units.get(r["code"], []),
                     )
     return sorted(merged.values(), key=lambda t: (t.source_vocabulary_id, -t.frequency, t.source_code))
@@ -367,6 +414,16 @@ class _Hit:
     names: list[str] = field(default_factory=list)  # concept name first, then synonyms
 
 
+def _by_name(h: _Hit, q: str) -> _Hit:
+    """``h``, a concept of another accepted domain, scored by its names only: a concept code equal to
+    a short local code ('TB', 'CR': HCPCS modifiers in Observation) says nothing of its meaning, so
+    such a match must not rank above the target domain's concepts (``_Searcher.search``)."""
+    if not h.names:
+        return h
+    score = round(max(text_score(q, normalize(n)) for n in h.names), 3)
+    return h if score >= h.candidate.score else _Hit(h.candidate.model_copy(update={"score": score}), h.names)
+
+
 def _exact_key(text: str) -> str:
     return " ".join(text.lower().split())
 
@@ -429,7 +486,30 @@ class _Searcher:
                 )
         return self._pools[domain]
 
-    def _trigram_rows(self, q: str, codes: list[str], domain: str | None) -> list[dict]:
+    def _trigram(self, q: str, codes: list[str], domains: list[str | None]) -> list[dict]:
+        """The trigram pools of ``domains`` (one None: any domain): per domain the ``POOL_SIZE``
+        concepts of highest word similarity (ties by concept_id). They are first retrieved at
+        ``TRGM_FIRST_THRESHOLD``, which on a full vocabulary matches far fewer names and synonyms
+        than ``TRGM_WORD_THRESHOLD``; the domains whose pool that leaves short are retrieved again at
+        ``TRGM_WORD_THRESHOLD``. The pools are those of a retrieval at ``TRGM_WORD_THRESHOLD``: a pool
+        that fills at the higher threshold holds the concepts of highest similarity, all at or above
+        it, ranked as in the lower one."""
+
+        def fetch(wanted: list[str | None], threshold: float) -> list[dict]:
+            if len(wanted) == 1:
+                return self._trigram_rows(q, codes, wanted[0], threshold)
+            return self._trigram_rows_each(q, codes, [d for d in wanted if d is not None], threshold)
+
+        rows = fetch(domains, TRGM_FIRST_THRESHOLD)
+        full = {d for d in domains if sum(d is None or r["domain_id"] == d for r in rows) >= POOL_SIZE}
+        short = [d for d in domains if d not in full]
+        if not short:
+            return rows
+        kept = [r for r in rows if r["domain_id"] in full]
+        return kept + fetch(short, TRGM_WORD_THRESHOLD)
+
+    def _trigram_rows(self, q: str, codes: list[str], domain: str | None,
+                      threshold: float = TRGM_WORD_THRESHOLD) -> list[dict]:
         dom = self._domain_sql(domain)
         sql = f"""
 SELECT {_CONCEPT_COLS},
@@ -450,8 +530,43 @@ WHERE c.standard_concept = 'S' AND c.invalid_reason IS NULL {dom}
 GROUP BY {_CONCEPT_COLS}
 ORDER BY max(h.ws) DESC, c.concept_id
 LIMIT %(pool)s"""
-        setup = f"SET LOCAL pg_trgm.word_similarity_threshold = {float(TRGM_WORD_THRESHOLD)}"
+        setup = f"SET LOCAL pg_trgm.word_similarity_threshold = {float(threshold)}"
         return self._rows(sql, {"q": q, "codes": codes, "domain": domain, "pool": POOL_SIZE}, setup)
+
+    def _trigram_rows_each(self, q: str, codes: list[str], domains: list[str],
+                           threshold: float = TRGM_WORD_THRESHOLD) -> list[dict]:
+        """``_trigram_rows`` for several domains in one query: per domain the same ``POOL_SIZE``
+        rows as a query of that domain alone (ranked alike, ties by concept_id), but the trigram
+        scans of the names and synonyms, which do not depend on the domain, run once. The concept's
+        columns come from the one join of the candidates with the concept table (a second join
+        would read the whole table when it has no index on concept_id)."""
+        top = _CONCEPT_COLS.replace("c.", "top.")
+        sql = f"""
+SELECT {top},
+       ARRAY(SELECT s.concept_synonym_name FROM {self.v}.concept_synonym s WHERE s.concept_id = top.concept_id)
+           AS synonyms
+FROM (
+    SELECT {_CONCEPT_COLS},
+           ROW_NUMBER() OVER (PARTITION BY c.domain_id ORDER BY max(h.ws) DESC, c.concept_id) AS rn
+    FROM (
+        SELECT c.concept_id, word_similarity(%(q)s, lower(c.concept_name)) AS ws
+        FROM {self.v}.concept c
+        WHERE %(q)s <%% lower(c.concept_name) AND c.standard_concept = 'S' AND c.invalid_reason IS NULL
+          AND c.domain_id = ANY(%(domains)s)
+        UNION ALL
+        SELECT s.concept_id, word_similarity(%(q)s, lower(s.concept_synonym_name))
+        FROM {self.v}.concept_synonym s
+        WHERE %(q)s <%% lower(s.concept_synonym_name)
+        UNION ALL
+        SELECT c.concept_id, 1.0 FROM {self.v}.concept c WHERE c.concept_code = ANY(%(codes)s)
+    ) h
+    JOIN {self.v}.concept c ON c.concept_id = h.concept_id
+    WHERE c.standard_concept = 'S' AND c.invalid_reason IS NULL AND c.domain_id = ANY(%(domains)s)
+    GROUP BY {_CONCEPT_COLS}
+) top
+WHERE top.rn <= %(pool)s"""
+        setup = f"SET LOCAL pg_trgm.word_similarity_threshold = {float(threshold)}"
+        return self._rows(sql, {"q": q, "codes": codes, "domains": domains, "pool": POOL_SIZE}, setup)
 
     def _ilike_rows(self, q: str, codes: list[str], domain: str | None) -> list[dict]:
         tokens = list(dict.fromkeys(t for t in q.split() if len(t) >= 3))
@@ -479,24 +594,65 @@ LIMIT %(pool)s"""
         return self._rows(sql, params)
 
     # ---- search ------------------------------------------------------------------------
-    def search(self, text: str, domain: str | None, limit: int = 10) -> list[_Hit]:
-        domain = self.domain(domain)
-        key = (text, domain, limit)
-        if key in self._cache:
-            return self._cache[key]
+    def search(self, text: str, domain: str | None, limit: int = 10, also: Sequence[str] = ()) -> list[_Hit]:
+        """The ``limit`` best concepts of ``domain`` (None: any domain) for ``text``, plus the
+        ``ALSO_ACCEPTED_CANDIDATES`` best of each other accepted domain (``also``), each domain
+        ranked as if searched on its own (so the target domain's candidates are those of a search
+        without ``also``), best first; on a tie the target domain's concept comes first. The
+        domains too large to score in full are retrieved together (``_trigram``)."""
+        prefer = self.domain(domain)
+        others = [d for d in dict.fromkeys(self.domain(a) for a in also) if d is not None and d != prefer]
+        if prefer is None or not others:
+            return self._search_each(text, [(prefer, limit)])[0]
+        found = self._search_each(text, [(prefer, limit)] + [(d, ALSO_ACCEPTED_CANDIDATES) for d in others])
+        q = normalize(text.strip())
+        merged = found[0] + [_by_name(h, q) for hits in found[1:] for h in hits]
+        merged.sort(key=lambda h: (-h.candidate.score, h.candidate.domain_id != prefer, h.candidate.concept_id))
+        return merged
+
+    def _search_each(self, text: str, wanted: list[tuple[str | None, int]]) -> list[list[_Hit]]:
+        """For each (domain, limit) of ``wanted`` (domains spelled by ``domain``), the ``limit`` best
+        concepts of that domain for ``text``. A small domain is scored in full; the large ones
+        are retrieved by trigram (``_trigram``: one query for all of them, and one more for those
+        whose pool its higher threshold leaves short) or ILIKE, ``POOL_SIZE`` rows each, and
+        re-scored in Python."""
         raw = text.strip()
         q = normalize(raw)
         codes = list(dict.fromkeys(c for c in (raw, raw.upper(), raw.lower()) if c))
-        rows = self._pool(domain)
-        if rows is None:
-            rows = []
+        rows_of: dict[str | None, list[dict]] = {}
+        large: list[str | None] = []
+        for domain, limit in wanted:
+            if (text, domain, limit) in self._cache or domain in rows_of or domain in large:
+                continue
+            pool = self._pool(domain)
+            if pool is not None:
+                rows_of[domain] = pool
+            else:
+                large.append(domain)
+        if large:
+            fetched: list[dict] = []
             if self.trigram and q:
                 try:
-                    rows = self._trigram_rows(q, codes, domain)
+                    fetched = self._trigram(q, codes, large)
                 except psycopg.Error:
                     self.trigram = False  # pg_trgm not reachable on the search_path: use ILIKE
-            if not self.trigram:
-                rows = self._ilike_rows(q, codes, domain)
+            if self.trigram:
+                for d in large:
+                    rows_of[d] = [r for r in fetched if d is None or r["domain_id"] == d]
+            else:
+                for d in large:
+                    rows_of[d] = self._ilike_rows(q, codes, d)
+        out = []
+        for domain, limit in wanted:
+            key = (text, domain, limit)
+            if key not in self._cache:
+                self._cache[key] = self._scored(rows_of[domain], q, raw)[:limit]
+            out.append(self._cache[key])
+        return out
+
+    @staticmethod
+    def _scored(rows: list[dict], q: str, raw: str) -> list[_Hit]:
+        """``rows`` as hits scored against the normalised text ``q`` (and the code ``raw``), best first."""
         hits = []
         for r in rows:
             names = [r["concept_name"], *(s for s in (r.get("synonyms") or []) if s)]
@@ -517,8 +673,7 @@ LIMIT %(pool)s"""
             )
             hits.append(_Hit(cand, names))
         hits.sort(key=lambda h: (-h.candidate.score, h.candidate.concept_id))
-        self._cache[key] = hits[:limit]
-        return self._cache[key]
+        return hits
 
     def lookup(self, concept_id: int) -> dict | None:
         rows = self._rows(
@@ -529,33 +684,51 @@ LIMIT %(pool)s"""
 
 
 def search_candidates(
-    conn: psycopg.Connection, schemas: Schemas, text: str, domain: str | None, limit: int = 10
+    conn: psycopg.Connection, schemas: Schemas, text: str, domain: str | None, limit: int = 10,
+    also: Sequence[str] = (),
 ) -> list[ConceptCandidate]:
     """Standard, valid concepts that lexically match ``text`` (names, synonyms, exact codes).
 
-    Optionally restricted to ``domain``. Scores are in 0..1, best first. An exact concept_code
+    Optionally restricted to ``domain``; ``also`` adds the best few of other accepted domains
+    (``SourceTerm.accepted_domains``). Scores are in 0..1, best first. An exact concept_code
     match scores at least 0.95 (0.9 when only the case differs).
     """
-    return [h.candidate for h in _Searcher(conn, schemas).search(text, domain, limit)]
+    return [h.candidate for h in _Searcher(conn, schemas).search(text, domain, limit, also)]
 
 
 def check_concept(
-    conn: psycopg.Connection, schemas: Schemas, concept_id: int, domain: str | None = None
+    conn: psycopg.Connection, schemas: Schemas, concept_id: int, domain: str | Sequence[str] | None = None
 ) -> tuple[ConceptCandidate | None, str | None]:
-    """(candidate, None) if ``concept_id`` is a valid standard concept (of ``domain``), else (None, reason)."""
+    """(candidate, None) if ``concept_id`` is a valid standard concept (of ``domain``, or of one
+    of the domains it lists), else (None, reason)."""
     row = _Searcher(conn, schemas).lookup(concept_id)
     return _validate_row(row, concept_id, domain)
 
 
-def _validate_row(row: dict | None, concept_id: int, domain: str | None) -> tuple[ConceptCandidate | None, str | None]:
+def accepted_domains(d: SourceTerm | MappingDecision) -> list[str]:
+    """The domains a target of the term may belong to: its accepted domains, else its target
+    domain alone ([]: any domain)."""
+    return list(d.accepted_domains) or ([d.target_domain] if (d.target_domain or "").strip() else [])
+
+
+def _in_target_domain(t: SourceTerm | MappingDecision, c: ConceptCandidate) -> bool:
+    """``c`` belongs to the term's target domain (any concept does when it has none)."""
+    return not (t.target_domain or "").strip() or c.domain_id.lower() == (t.target_domain or "").strip().lower()
+
+
+def _validate_row(
+    row: dict | None, concept_id: int, domain: str | Sequence[str] | None
+) -> tuple[ConceptCandidate | None, str | None]:
     if row is None:
         return None, f"concept_id {concept_id} does not exist in the vocabulary"
     if row["standard_concept"] != "S":
         return None, f"concept_id {concept_id} ({row['concept_name']}) is not a standard concept"
     if row["invalid_reason"]:
         return None, f"concept_id {concept_id} ({row['concept_name']}) is no longer valid"
-    if domain and row["domain_id"].lower() != domain.strip().lower():
-        return None, f"concept_id {concept_id} ({row['concept_name']}) is in domain {row['domain_id']}, not {domain}"
+    domains = [d.strip() for d in ([domain] if isinstance(domain, str) else domain or []) if d and d.strip()]
+    if domains and row["domain_id"].lower() not in {d.lower() for d in domains}:
+        expected = domains[0] if len(domains) == 1 else ", ".join(domains[:-1]) + " or " + domains[-1]
+        return None, f"concept_id {concept_id} ({row['concept_name']}) is in domain {row['domain_id']}, not {expected}"
     return (
         ConceptCandidate(
             concept_id=row["concept_id"],
@@ -581,6 +754,21 @@ def _chunks(items: Sequence, size: int) -> Iterable[Sequence]:
         yield items[i : i + size]
 
 
+def _shown(t: SourceTerm, hits: list[_Hit], k: int) -> list[_Hit]:
+    """The candidates of ``t`` shown to the model or kept for the reviewer: the first ``k`` of its
+    target domain (of any domain without one) and, on top of them, the
+    ``ALSO_ACCEPTED_CANDIDATES`` best of each other accepted domain, in the order of ``hits``. So
+    the other domains never take the target domain's places."""
+    taken: dict[str, int] = {}
+    out = []
+    for h in hits:
+        group = "" if _in_target_domain(t, h.candidate) else h.candidate.domain_id.lower()
+        if taken.get(group, 0) < (ALSO_ACCEPTED_CANDIDATES if group else k):
+            taken[group] = taken.get(group, 0) + 1
+            out.append(h)
+    return out
+
+
 def _decision(t: SourceTerm, hits: list[_Hit], **kw) -> MappingDecision:
     return MappingDecision(
         source_vocabulary_id=t.source_vocabulary_id,
@@ -588,9 +776,14 @@ def _decision(t: SourceTerm, hits: list[_Hit], **kw) -> MappingDecision:
         source_name=t.source_name,
         frequency=t.frequency,
         target_domain=t.target_domain,
-        candidates=[h.candidate for h in hits[:DECISION_CANDIDATES]],
+        accepted_domains=list(t.accepted_domains),
+        candidates=[h.candidate for h in _shown(t, hits, DECISION_CANDIDATES)],
         **kw,
     )
+
+
+MIXED_DOMAINS_NOTE = (" (The fields that use this source vocabulary expect concepts of different domains, so a reviewer "
+                  "checks every code.)")
 
 
 def _target(c: ConceptCandidate) -> dict:
@@ -603,8 +796,10 @@ def _target(c: ConceptCandidate) -> dict:
 
 
 def _exact_match(t: SourceTerm, hits: list[_Hit]) -> MappingDecision | None:
+    """The one concept of the target domain whose name or synonym equals the term (concepts of
+    the term's other accepted domains are never picked without a reviewer or the model)."""
     key = _exact_key(t.source_name)
-    matches = [(h, n) for h in hits for n in h.names if _exact_key(n) == key]
+    matches = [(h, n) for h in hits if _in_target_domain(t, h.candidate) for n in h.names if _exact_key(n) == key]
     ids = {h.candidate.concept_id for h, _ in matches}
     if len(ids) != 1:
         return None
@@ -616,14 +811,16 @@ def _exact_match(t: SourceTerm, hits: list[_Hit]) -> MappingDecision | None:
         **_target(h.candidate),
         equivalence="EQUAL",
         confidence=1.0,
-        status="APPROVED",
+        status="APPROVED" if t.auto_approve else "UNCHECKED",
         method="exact",
-        rationale=f"The source term equals {how} of the only matching standard concept.",
+        rationale=f"The source term equals {how} of the only matching standard concept."
+        + ("" if t.auto_approve else MIXED_DOMAINS_NOTE),
     )
 
 
 def _lexical(t: SourceTerm, hits: list[_Hit], why: str) -> MappingDecision:
-    top = hits[0].candidate if hits else None
+    """The best lexical match of the target domain as an UNCHECKED suggestion (no LLM)."""
+    top = next((h.candidate for h in hits if _in_target_domain(t, h.candidate)), None)
     if top is not None and top.score >= LEXICAL_MIN_SCORE:
         return _decision(
             t,
@@ -649,14 +846,26 @@ def _format_term(i: int, t: SourceTerm, hits: list[_Hit], k: int, phrases: list[
     if t.source_name != t.source_code:
         lines.append(f"   description: {json.dumps(t.source_name, ensure_ascii=False)}")
     lines.append(f"   frequency: {t.frequency}")
-    lines.append(f"   target domain: {t.target_domain or 'any'}")
+    others = [d for d in t.accepted_domains if d.lower() != (t.target_domain or "").lower()]
+    if others:
+        lines.append(f"   target domain: {t.target_domain} (also accepted: {', '.join(others)}; the record is moved to "
+                     "the table of the chosen concept's domain)")
+    else:
+        lines.append(f"   target domain: {t.target_domain or 'any'}")
     if t.units:
         lines.append("   units recorded with it: " + "; ".join(f"{json.dumps(u.value, ensure_ascii=False)} ×{u.count}" for u in t.units))
     if phrases:
         lines.append(f"   searched again for: {'; '.join(phrases)}")
-    if hits:
+    shown = _shown(t, hits, k)
+    if others or len({h.candidate.domain_id for h in shown}) > 1:  # other domains accepted: show each candidate's
+        lines.append("   candidates (concept_id | name | domain | class | vocabulary | score):")
+        for h in shown:
+            c = h.candidate
+            lines.append(f"   {c.concept_id} | {c.concept_name} | {c.domain_id} | {c.concept_class_id} | "
+                         f"{c.vocabulary_id} | {c.score:.2f}")
+    elif shown:
         lines.append("   candidates (concept_id | name | class | vocabulary | score):")
-        for h in hits[:k]:
+        for h in shown:
             c = h.candidate
             lines.append(
                 f"   {c.concept_id} | {c.concept_name} | {c.concept_class_id} | {c.vocabulary_id} | {c.score:.2f}"
@@ -766,7 +975,7 @@ class _VocabMapper:
         cand = next((h.candidate for h in hits if h.candidate.concept_id == cid), None)
         if cand is None:
             row = self.s.lookup(cid)
-            cand, why = _validate_row(row, cid, t.target_domain)
+            cand, why = _validate_row(row, cid, accepted_domains(t))
             if cand is None:
                 self.stats["rejected_ids"] += 1
                 return _decision(
@@ -778,7 +987,12 @@ class _VocabMapper:
                     confidence=0.0,
                     rationale=f"Rejected the model's choice: {why}. Model rationale: {ch.rationale}",
                 )
-        auto = ch.confidence >= self.cfg.mapping.auto_approve_confidence
+        # a concept of another accepted domain moves the record to another table: a reviewer decides
+        in_domain = _in_target_domain(t, cand)
+        auto = ch.confidence >= self.cfg.mapping.auto_approve_confidence and in_domain and t.auto_approve
+        note = "" if in_domain else (f" (A {cand.domain_id} concept, not {t.target_domain}: the record moves to the "
+                                     f"table of the {cand.domain_id} domain; review it.)")
+        note += "" if t.auto_approve else MIXED_DOMAINS_NOTE
         return _decision(
             t,
             hits,
@@ -787,7 +1001,7 @@ class _VocabMapper:
             confidence=ch.confidence,
             status="APPROVED" if auto else "UNCHECKED",
             method="llm",
-            rationale=ch.rationale,
+            rationale=ch.rationale + note,
         )
 
     def run(self, terms: list[SourceTerm]) -> dict[str, MappingDecision]:
@@ -797,7 +1011,7 @@ class _VocabMapper:
         exact: dict[str, MappingDecision] = {}  # used when the LLM gives no answer
         pending: list[SourceTerm] = []
         for t in ordered:
-            hits = self.s.search(t.source_name, t.target_domain, self.k)
+            hits = self.s.search(t.source_name, t.target_domain, self.k, t.accepted_domains)
             self.hits[t.source_code] = hits
             if t.frequency < min_cell:
                 out[t.source_code] = _decision(
@@ -844,14 +1058,16 @@ class _VocabMapper:
         for t in retry:
             merged = {h.candidate.concept_id: h for h in self.hits[t.source_code]}
             for p in phrases[t.source_code]:
-                for h in self.s.search(p, t.target_domain, self.k):
+                for h in self.s.search(p, t.target_domain, self.k, t.accepted_domains):
                     old = merged.get(h.candidate.concept_id)
                     if old is None or h.candidate.score > old.candidate.score:
                         merged[h.candidate.concept_id] = h
-            self.hits[t.source_code] = sorted(
-                merged.values(), key=lambda h: (-h.candidate.score, h.candidate.concept_id)
+            self.hits[t.source_code] = sorted(  # as _Searcher.search: on a tie the target domain first
+                merged.values(),
+                key=lambda h, t=t: (-h.candidate.score, not _in_target_domain(t, h.candidate), h.candidate.concept_id),
             )
-            out[t.source_code].candidates = [h.candidate for h in self.hits[t.source_code][:DECISION_CANDIDATES]]
+            out[t.source_code].candidates = [h.candidate for h in _shown(t, self.hits[t.source_code],
+                                                                         DECISION_CANDIDATES)]
         self.stats["retried"] = len(retry)
         for n, batch in enumerate(_chunks(retry, self.cfg.mapping.llm_batch_size), 1):
             ans = self._call(f"{self.svid}:retry{n}", build_prompt(self.svid, batch, self.hits, self.k, phrases))

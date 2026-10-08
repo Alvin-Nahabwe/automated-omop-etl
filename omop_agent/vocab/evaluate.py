@@ -16,8 +16,11 @@ from __future__ import annotations
 import psycopg
 from pydantic import BaseModel, Field
 
-from ..config import ProjectConfig
+from ..config import EtlConfig, ProjectConfig
 from ..db import Schemas, fetch_all, qi, ql, short_error
+from ..etl.compiler import CompileError, where_sql
+from ..etl.routing import accepted_domains_for
+from ..etl.session import apply_session
 from ..models import ETLSpec, FieldMapping, TableMapping, ValueFreq
 from .loader import vocabulary_inventory, vocabulary_version
 
@@ -103,32 +106,40 @@ def source_ref(table: str) -> str:
     return "{src}." + qi(table)
 
 
-def source_from_sql(tm: TableMapping) -> str:
+def source_from_sql(tm: TableMapping, etl: EtlConfig | None = None) -> str:
     """``FROM <source> <alias> [JOIN ...] [WHERE ...]`` of a table mapping, placeholders unrendered.
 
-    Mirrors the FROM clause the ETL compiler generates, so counts here match what the ETL reads.
+    Mirrors the FROM clause the ETL compiler generates, so counts here match what the ETL reads:
+    the WHERE's casts are the build's tolerant, uncounted conversions (``etl`` gives the
+    partial-date rule), so a value that cannot be read does not fail the query.
     """
     lines = [f"FROM {source_ref(tm.source.table)} {qi(tm.source.alias)}"]
     for j in tm.joins:
         jt = "INNER" if j.join_type == "inner" else "LEFT"
         lines.append(f"{jt} JOIN {source_ref(j.table)} {qi(j.alias)} ON {j.on.strip()}")
-    if tm.where and tm.where.strip():
-        lines.append(f"WHERE {paren(tm.where)}")
+    try:
+        where = where_sql(tm, etl, counted=False)
+    except CompileError:  # a template the build refuses: the validator reports it
+        where = tm.where
+    if where and where.strip():
+        lines.append(f"WHERE {paren(where)}")
     return "\n".join(lines)
 
 
-def code_counts_sql(tm: TableMapping, expression: str) -> str:
+def code_counts_sql(tm: TableMapping, expression: str, etl: EtlConfig | None = None) -> str:
     """``code, n``: frequency of each value of ``expression`` (as text) over the mapping's rows."""
-    return f"SELECT {paren(expression)}::text AS code, COUNT(*) AS n\n{source_from_sql(tm)}\nGROUP BY 1"
+    return f"SELECT {paren(expression)}::text AS code, COUNT(*) AS n\n{source_from_sql(tm, etl)}\nGROUP BY 1"
 
 
-def query_rows(conn: psycopg.Connection, sql: str) -> list[dict]:
-    """Run a read-only statement in a savepoint that is always rolled back.
+def query_rows(conn: psycopg.Connection, sql: str, cfg: ProjectConfig | None = None) -> list[dict]:
+    """Run a read-only statement in a savepoint that is always rolled back, under the session
+    settings of the build (``etl.session``), so spec expressions read dates as the ETL does.
 
     An error (a bad expression in the spec, say) leaves the caller's transaction usable. The
     statement is sent without parameters, so ``%`` in spec expressions needs no escaping.
     """
     with conn.transaction(force_rollback=True):
+        apply_session(conn, cfg)
         return fetch_all(conn, sql)
 
 
@@ -163,9 +174,13 @@ def _required(spec: ETLSpec, present: set[str]) -> list[RequiredVocabulary]:
         vocabs = DOMAIN_VOCABULARIES.get(domain.lower())
         if vocabs:
             alt = f"; {' or '.join(vocabs)} accepted" if len(vocabs) > 1 else ""
+            # a field routed by domain also accepts concepts of other domains (their records move):
+            # the target domain's vocabulary is still the one most codes need
+            also = accepted_domains_for(spec, tm, fm)[1:]
+            routed = f"; {', '.join(also)} concepts also accepted" if also else ""
             need(
                 vocabs[0],
-                f"{domain} targets for {fm.vocabulary} ({tm.target_table}.{fm.target_field}){alt}",
+                f"{domain} targets for {fm.vocabulary} ({tm.target_table}.{fm.target_field}){alt}{routed}",
                 vocabs[1:],
             )
     for vocab in INFRASTRUCTURE_VOCABULARIES:
@@ -182,13 +197,13 @@ def _required(spec: ETLSpec, present: set[str]) -> list[RequiredVocabulary]:
 
 
 def _coverage(
-    conn: psycopg.Connection, schemas: Schemas, tm: TableMapping, fm: FieldMapping, min_cell_count: int
+    conn: psycopg.Connection, schemas: Schemas, tm: TableMapping, fm: FieldMapping, cfg: ProjectConfig
 ) -> CodeCoverage:
     vocab = fm.vocabulary.strip()  # type: ignore[union-attr]
     v = "{vocab}"
     sql = f"""
 WITH codes AS (
-{code_counts_sql(tm, fm.expression or "")}
+{code_counts_sql(tm, fm.expression or "", cfg.etl)}
 )
 SELECT k.code, k.n,
        EXISTS (SELECT 1 FROM {v}.concept c
@@ -210,7 +225,7 @@ ORDER BY k.n DESC, k.code"""
         concept_role=fm.concept_role,
     )
     try:
-        rows = query_rows(conn, schemas.render(sql))
+        rows = query_rows(conn, schemas.render(sql), cfg)
     except psycopg.Error as e:
         return CodeCoverage(
             **base,
@@ -230,7 +245,7 @@ ORDER BY k.n DESC, k.code"""
         codes_mapped_to_standard=sum(1 for r in rows if r["mapped"]),
         records=sum(int(r["n"]) for r in rows),
         records_mapped=sum(int(r["n"]) for r in rows if r[ok_key]),
-        unmatched=[u for u in unmatched if u.count >= min_cell_count][:MAX_UNMATCHED],
+        unmatched=[u for u in unmatched if u.count >= cfg.privacy.min_cell_count][:MAX_UNMATCHED],
     )
 
 
@@ -272,7 +287,7 @@ def evaluate_vocabulary(
     ev.required = _required(spec, present)
 
     fields = _vocab_fields(spec, "vocab_code")
-    ev.coverage = [_coverage(conn, schemas, tm, fm, cfg.privacy.min_cell_count) for tm, fm in fields]
+    ev.coverage = [_coverage(conn, schemas, tm, fm, cfg) for tm, fm in fields]
 
     # ---- issues ----------------------------------------------------------------------
     if inventory and not ev.loaded:

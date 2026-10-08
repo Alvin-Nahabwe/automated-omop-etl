@@ -52,8 +52,10 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..cdm.spec import load_cdm_spec
-from ..config import ProjectConfig
-from ..db import Schemas, execute, rollback_only, short_error
+from ..config import PrivacyConfig, ProjectConfig
+from ..db import Schemas, execute, fetch_one, rollback_only, short_error
+from ..etl.compiler import LAYER_1_MARKER, SPEC_KINDS
+from ..etl.session import apply_session
 from ..llm.base import AgentTool, LLMClient, LLMError, LLMUnavailable
 from ..models import (
     CheckResult,
@@ -71,6 +73,7 @@ from ..privacy import name_rule, pii_columns, pii_references, profile_prompt_tex
 from ..profiling.profiler import KEY_MAX_LISTED_DISTINCT, _is_key_column
 from ..sqlguard import fragment_issues, strip_literals
 from ..workspace import Workspace, utcnow
+from .checks import derived_tables, repairable
 
 MAX_FAILURES_IN_PROMPT = 30
 COUNT_TIMEOUT_MS = 30_000
@@ -85,10 +88,13 @@ The ETL is defined by an ETL spec. Each table mapping compiles to one
 with one field mapping per CDM field. Source columns are all text, so cast explicitly. Field kinds:
   column / expression / constant  a PostgreSQL expression over the source aliases, cast to the CDM type
   person_id    the source patient key, resolved through the person id map (rows without a person are
-               dropped). Every person_id field must use this kind.
+               dropped). Every person_id field must use this kind. Every person mapping adds the keys of
+               its rows to the map, so people can come from several source tables.
   visit_id     the source visit key, resolved through the visit id map. An optional field (e.g.
                condition_occurrence.visit_occurrence_id) keeps the row with NULL when there is no match;
-               the required visit_occurrence primary key drops rows without a visit.
+               the required visit_occurrence primary key drops rows without a visit. A record links only
+               to a visit of its own person, and only when its visit key is written exactly as in the
+               visit mapping (same text: case, padding, separators, prefix, date format).
   auto_id      generated surrogate key (only for the table's own primary key; never for person.person_id
                or visit_occurrence.visit_occurrence_id, which come from the id maps)
   vocab_code   a code of an OMOP vocabulary: expression = the code as in concept_code, vocabulary = its
@@ -97,10 +103,56 @@ with one field mapping per CDM field. Source columns are all text, so cast expli
                source_vocabulary_id, target_domain = the OMOP domain of the targets; concept_role 'source'
                returns the map's source_concept_id
   null         leave the field NULL
-Concept lookups yield 0 when a source value exists but has no mapping. Source and join tables are staged
-source table names (or {src}., {vocab}., {etl}.-qualified names). Spec SQL must be a single expression or
-condition: no statement separators, no catalog, file or session functions, and no direct identifiers
-(names, phone numbers, national ids, addresses, GPS): those are never loaded into the CDM.
+person, death and visit_occurrence keep one row per key (person and death: one per person; visit_occurrence:
+one per visit and person, from the earliest start to the latest end of its rows). A mapping's dedup_order (an
+ORDER BY list over its aliases, best row first, e.g. "x.verified = '1' DESC"; a missing or unreadable value
+ranks last) says which row of a key is loaded; without one the most complete row is (for death, a date
+known to the day, then the latest). It ranks the rows of its own mapping only: between the mappings of one
+table, the first in spec order that loads a key wins, and later mappings skip that key. Set it when
+etlKeyConflict reports person rows that disagree on sex or birth year, ranking the row that should win first. Who exists in the CDM is decided by people: changes to a
+person_id expression (in any table, unless the mapping cannot run at all), to the key of person or
+visit_occurrence, to the filter of person, visit_occurrence or death, and new mappings into those tables
+are refused. A record that names another person's visit, or a key no visit mapping reads (etlVisitLinkage,
+etlVisitLinkLoss), is fixed in its visit_id expression so that it gives the visit mapping's key, never by
+changing its person_id and never by making the visit key NULL: an edit that takes the visit key away from
+records that have one is refused.
+Concept lookups yield 0 when a source value exists but has no mapping. Casts (::date, ::numeric, ...)
+and to_date / to_timestamp in column and expression fields and in the filter are tolerant: a value that
+cannot be read as written (31/02/2019, a date in another layout than the template, a number with text in
+it) becomes NULL and is counted per field (etlInvalidValue) instead of failing the whole table. Fix the
+expression when the source holds the value in another form (the to_date template the profile shows; a
+regex guard for a column that mixes numbers and text, so the text goes to value_as_string), never by
+filtering rows, and never by hiding the values: {etl}.try_date and the other try_* functions are counted
+like a cast in a field or the filter, and a regex guard that makes unreadable dates or numbers NULL
+before the cast only hides them. A date with an unknown day or month (00/06/1975) <PARTIAL_DATES> and is
+reported as etlPartialDate. A required value that comes out NULL follows the CDM convention
+automatically and is counted: required concepts default to 0 and visit_end_date, visit_detail_end_date
+and drug_exposure_end_date to the start date (etlDefaultedValue tells you where a better fallback may
+exist); a row without another required value (a start date, year_of_birth, death_date) is dropped
+(etlRequiredFieldNull), and an edit that makes such a field NULL for more rows is refused because it
+would drop those records. observation_period is loaded one row per episode, with a NULL end for an
+episode that is still open: the build merges each person's overlapping and back-to-back episodes,
+ends open ones at cdm_source.source_release_date or at death, drops episodes that end before they
+start (etlObservationPeriodMerge) and gives persons without a valid episode a period from their
+events; never write merging, filters or a fallback into the observation_period end date (an edit that
+opens episodes with an exit date, or closes open ones, is refused). When the spec routes by domain (the
+"Routing by domain" line of the prompt says whether it does), after loading the build moves every
+condition_occurrence, procedure_occurrence, drug_exposure, device_exposure and measurement record whose
+standard concept belongs to another event domain (Condition, Procedure, Drug, Device, Measurement,
+Observation) to that domain's table (route_* steps, etlDomainRouting; a measurement with a result goes to
+observation). Never route records by hand: a mapping that filters or joins on the domain of
+{vocab}.concept, or a second mapping of the same codes into another table, loads records twice and is
+refused. fkDomain failures that remain on those tables come from concepts outside the six event domains
+(a value, unit or type concept in the main concept field: fix the lookup) or from records the build could
+not move (its route step failed). Steps named
+*_map_prune, route_*, observation_period_merge, observation_period_fill, condition_era, drug_era and
+cdm_source (and observation_period when periods are 'from_events') are generated by the build and
+cannot be changed with the tools; the eras are built from the condition and drug records as loaded,
+so a new mapping into condition_era or drug_era is refused (fix those records instead). Source and join
+tables are staged source table names (or {src}., {vocab}., {etl}.-qualified names). Spec SQL must be a
+single expression or condition: no statement separators, no catalog, file or session functions, and no
+direct identifiers (names, phone numbers, national ids, addresses, GPS): those are never loaded into the
+CDM.
 
 How to work:
 1. Diagnose the root cause of each failure before changing anything. Read the mapping and its compiled
@@ -235,7 +287,7 @@ class ReplaceTableMappingInput(_ToolInput):
     mapping_yaml: str = Field(
         ...,
         description="The complete new TableMapping as YAML, in the format get_table_mapping returns "
-        "(target_table, source {table, alias}, joins, where, fields, rationale).",
+        "(target_table, source {table, alias}, joins, where, dedup_order, fields, rationale).",
     )
     rationale: str = Field(..., description="Why this change fixes the failure.")
     mapping_index: int = Field(
@@ -280,10 +332,12 @@ def _same_logic(a: FieldMapping, b: FieldMapping) -> bool:
 
 
 def _same_mapping_logic(a: TableMapping, b: TableMapping) -> bool:
-    """Same source, joins, filter and field logic (rationales and field order aside)."""
+    """Same source, joins, filter, dedup_order and field logic (rationales and field order aside)."""
     if a.target_table.lower() != b.target_table.lower() or (a.source, a.joins) != (b.source, b.joins):
         return False
     if (a.where or "").strip() != (b.where or "").strip():
+        return False
+    if (a.dedup_order or "").strip() != (b.dedup_order or "").strip():
         return False
     fa = {f.target_field: f for f in a.fields}
     fb = {f.target_field: f for f in b.fields}
@@ -300,6 +354,8 @@ def _mapping_diff(old: TableMapping | None, new: TableMapping) -> str:
         parts.append("joins changed")
     if (old.where or "") != (new.where or ""):
         parts.append(f"where: {old.where or '(none)'} → {new.where or '(none)'}")
+    if (old.dedup_order or "").strip() != (new.dedup_order or "").strip():
+        parts.append(f"dedup_order: {old.dedup_order or '(none)'} → {new.dedup_order or '(none)'}")
     old_f = {f.target_field: f for f in old.fields}
     new_f = {f.target_field: f for f in new.fields}
     for name, fm in new_f.items():
@@ -450,7 +506,10 @@ def cdm_column_denial(state: RepairState, table: str, column: str) -> str | None
 
 LOGICAL_SCHEMAS = ("src", "cdm", "vocab", "etl")
 ETL_COUNTABLE = ("source_to_concept_map",)
-ETL_DENIED = ("person_map", "visit_map")
+ETL_DENIED = ("person_map", "visit_map", "person_map_retired", "visit_map_retired")
+# ETL tables that only generated steps use. Their columns are generic words ('name', 'value') that
+# spec SQL never names, so redact_error does not treat them as identifiers.
+_ETL_BOOKKEEPING = ("id_high_water", "build_facts")
 
 
 @lru_cache(maxsize=1)
@@ -546,6 +605,7 @@ def count_records(state: RepairState, inp: CountRecordsInput) -> str:
     k = state.min_cell_count
     try:
         with _readonly(state.conn):
+            apply_session(state.conn, state.cfg)  # compare dates and times as the build does
             resolved = _resolve_table(state, inp.table)
             if isinstance(resolved, str):
                 return resolved
@@ -671,8 +731,11 @@ def _static_identifiers() -> frozenset[str]:
     names = {t.name for t in cdm.tables.values()} | {f.name for t in cdm.tables.values() for f in t.fields}
     names |= {f"xpk_{t.name}" for t in cdm.tables.values()}  # official primary key constraint names
     for table, ddl in ETL_TABLES.items():
-        names |= {table, f"{table}_pkey"} | set(re.findall(r"^\s+(\w+)\s", ddl, re.M))
-    names |= {"person_map_person_id_key", "visit_map_visit_occurrence_id_key"}
+        names |= {table, f"{table}_pkey"}
+        if table not in _ETL_BOOKKEEPING:
+            names |= set(re.findall(r"^\s+(\w+)\s", ddl, re.M))
+    names |= {"person_map_person_id_key", "visit_map_visit_occurrence_id_key",
+              "person_map_retired_person_id_key", "visit_map_retired_visit_occurrence_id_key"}
     return frozenset(n.lower() for n in names)
 
 
@@ -765,9 +828,11 @@ def _table_ref_issue(state: RepairState, ref: str) -> str | None:
 
 def _pii_tokens(state: RepairState, tm: TableMapping) -> list[str]:
     """Direct-identifier columns of the mapping's source tables named anywhere in its SQL (also
-    unqualified); complements ``privacy.pii_references``, which follows alias.column references."""
+    unqualified); complements ``privacy.pii_references``, which follows alias.column references.
+    A column ``privacy.not_pii_columns`` clears is not one, whatever its name."""
     pii = pii_columns(state.profile, state.cfg.privacy)
-    texts = [f.expression for f in tm.fields] + [tm.where] + [j.on for j in tm.joins]
+    cleared = {e.strip().lower() for e in state.cfg.privacy.not_pii_columns}
+    texts = [f.expression for f in tm.fields] + [tm.where, tm.dedup_order] + [j.on for j in tm.joins]
     tokens = set().union(*(_tokens(t) for t in texts))
     hits: list[str] = []
     for ref in [tm.source.table] + [j.table for j in tm.joins]:
@@ -776,7 +841,7 @@ def _pii_tokens(state: RepairState, tm: TableMapping) -> list[str]:
             continue
         cols = set(pii.get(table.lower(), set()))
         cols |= {c.lower() for c in _columns_of(state.conn, state.schemas.src, table) if _pii_pattern(c, state)}
-        hits += [f"{table}.{c}" for c in sorted(tokens & cols)]
+        hits += [f"{table}.{c}" for c in sorted(tokens & cols) if f"{table.lower()}.{c}" not in cleared]
     return hits
 
 
@@ -788,10 +853,22 @@ _ID_MAP_KEYS = {
 
 def mapping_issues(state: RepairState, tm: TableMapping) -> list[str]:
     """Why ``tm`` may not be applied (empty when it may); checked before compiling."""
+    from ..design.validate import loading_view
+
     issues: list[str] = []
     for fm in tm.fields:
         issues += [f"{fm.target_field} expression {i}" for i in fragment_issues(fm.expression)]
     issues += [f"where {i}" for i in fragment_issues(tm.where)]
+    issues += [f"dedup_order {i}" for i in fragment_issues(tm.dedup_order)]
+    if tm.dedup_order:
+        from ..design.validate import dedup_order_issue, paren_problem
+
+        problem = paren_problem(tm.dedup_order)
+        if problem:
+            issues.append(f"dedup_order has unbalanced parentheses ({problem}); it must be an ORDER BY list")
+        volatile = dedup_order_issue(tm.dedup_order)
+        if volatile:
+            issues.append(volatile)
     for j in tm.joins:
         issues += [f"join {j.alias} condition {i}" for i in fragment_issues(j.on)]
     with _readonly(state.conn):
@@ -799,11 +876,16 @@ def mapping_issues(state: RepairState, tm: TableMapping) -> list[str]:
             issue = _table_ref_issue(state, ref)
             if issue:
                 issues.append(issue)
-        pii = list(dict.fromkeys(pii_references(tm, state.profile, state.cfg.privacy) + _pii_tokens(state, tm)))
+        # what the mapping loads, as the validator judges it: a person or visit key resolved through the
+        # id maps, a filter, a join condition or the dedup_order may read an identifier (a clinic's
+        # patient_no keys its patients), a value field may not
+        loading = loading_view(tm)
+        pii = list(dict.fromkeys(pii_references(loading, state.profile, state.cfg.privacy)
+                                 + _pii_tokens(state, loading)))
     if pii:
         issues.append(
-            f"reads direct-identifier (PII) column(s) {', '.join(pii)}; direct identifiers must never be loaded "
-            "into the CDM"
+            f"loads direct-identifier (PII) column(s) {', '.join(pii)} into a CDM field; direct identifiers must never "
+            "be loaded into the CDM (a person_id or visit_id key, a filter or a join may read them)"
         )
     target = tm.target_table.lower()
     for fm in tm.fields:
@@ -816,20 +898,176 @@ def mapping_issues(state: RepairState, tm: TableMapping) -> list[str]:
     return issues
 
 
-def validate_mapping(tm: TableMapping, spec: ETLSpec, conn: psycopg.Connection, schemas: Schemas) -> str | None:
-    """None if ``tm`` compiles and its INSERT EXPLAINs cleanly, else the error."""
+def validate_mapping(
+    tm: TableMapping,
+    spec: ETLSpec,
+    conn: psycopg.Connection,
+    schemas: Schemas,
+    cfg: ProjectConfig | None = None,
+    old: TableMapping | None = None,
+) -> str | None:
+    """None if ``tm`` compiles and its INSERT EXPLAINs cleanly (under the build's session
+    settings), else the error. With ``old`` (the mapping ``tm`` replaces) the edit is also
+    dry-run: a change that makes a required field whose NULL drops the row (a start date,
+    year_of_birth, death_date) NULL for rows where it was not would drop those records, one that
+    makes a record's visit key NULL would hide the records that lose their visit, and one that
+    opens closed observation period episodes or closes open ones on their start date would change
+    observation time, which the repair agent may not do (``drop_guard``)."""
+    from ..cdm.ddl import create_etl_tables
     from ..etl.compiler import compile_table
 
+    etl = cfg.etl if cfg is not None else None
     try:
-        sql = compile_table(tm, spec, schemas)
+        sql = compile_table(tm, spec, schemas, etl=etl)
     except Exception as e:  # CompileError, or anything else the compiler trips over
         return f"does not compile: {e}"
     try:
         with rollback_only(conn):
+            create_etl_tables(conn, schemas)  # the INSERT calls the ETL helper functions
+            apply_session(conn, cfg)
             execute(conn, "EXPLAIN\n" + sql.rstrip().rstrip(";"))
     except psycopg.Error as e:
         return f"EXPLAIN failed: {redact_error(short_error(e), sql, known_identifiers(None, schemas))}"
+    return drop_guard(old, tm, spec, conn, schemas, cfg) if old is not None else None
+
+
+def repair_system(cfg: ProjectConfig | None = None) -> str:
+    """``REPAIR_SYSTEM`` with the partial-date rule of this project (``cfg.etl.partial_dates``)."""
+    if cfg is not None and cfg.etl.partial_dates == "reject":
+        rule = ("is left NULL (etl.partial_dates: reject; birth and death dates follow THEMIS: the known year and "
+                "month of birth are kept, a death date takes the last day of the known period)")
+    else:
+        rule = ("is completed by a fixed rule (a start date takes the first day, an end date the last, other dates "
+                "the 15th; birth and death dates follow THEMIS)")
+    return REPAIR_SYSTEM.replace("<PARTIAL_DATES>", rule)
+
+
+def drop_guard(
+    old: TableMapping, new: TableMapping, spec: ETLSpec, conn: psycopg.Connection, schemas: Schemas,
+    cfg: ProjectConfig | None = None,
+) -> str | None:
+    """Why the edit ``old`` -> ``new`` may not be applied because it would drop records, take their
+    visit key away, or change which observation period episodes are open (None: it may). For each
+    changed required field whose NULL drops the row, and each changed visit key of a record's visit
+    link, the rows where it becomes NULL are counted (``etl.compiler.nulling_count_sql``; for an
+    open end, the episodes it opens or closes, ``_open_end_issue``) under ``COUNT_TIMEOUT_MS``;
+    when the old value does not fit the new mapping's sources (a renamed alias), the NULLs of each
+    mapping over its own rows are compared instead (not for an open end). A count that times out
+    or fails lets the edit through: the build history still reverts a build that lost records.
+    It also refuses the opposite edit (``_filled_issue``): giving such a field a value of its own
+    (a literal, a constant, the build date) for rows whose source has none, which brings back
+    records the CDM convention leaves out with an invented value."""
+    from ..etl.compiler import nulling_count_sql
+
+    filled = _filled_issue(old, new, conn, schemas, cfg)
+    if filled:
+        return filled
+    try:
+        counts = nulling_count_sql(old, new, spec, schemas, etl=cfg.etl if cfg is not None else None,
+                                   na_values=cfg.source.effective_na_values if cfg is not None else ())
+    except Exception:  # validate_mapping compiled it already; nothing to guard
+        return None
+    k = cfg.privacy.min_cell_count if cfg is not None else PrivacyConfig().min_cell_count
+    for name, sql in counts.items():
+        row = _guard_count(conn, schemas, cfg, sql.rows)
+        if sql.what == "open":
+            issue = _open_end_issue(row, new.target_table, name, k) if row is not None else None
+            if issue:
+                return issue
+            continue
+        if row is not None:
+            n = int(row["n"])
+        else:
+            new_t = _guard_count(conn, schemas, cfg, sql.new_totals)
+            old_t = _guard_count(conn, schemas, cfg, sql.old_totals) if sql.old_totals else None
+            if new_t is None or old_t is None:
+                continue
+            n = (int(new_t["n"]) - int(new_t["v"])) - (int(old_t["n"]) - int(old_t["v"]))
+        if n > 0 and sql.what == "visit_key":
+            return (
+                f"it would take the visit key away from {_small_count(n, k)} rows of {new.target_table}: "
+                f"{new.target_table}.{name} becomes NULL for them (their key is not NULL with the current mapping), "
+                "which hides records that lose their visit instead of linking them. Keep the key: write it so that it "
+                "gives the visit mapping's key (etlVisitLinkage counts the records whose key links to no visit of "
+                "their person)"
+            )
+        if n > 0:
+            return (
+                f"it would drop {_small_count(n, k)} rows of {new.target_table}: the required field "
+                f"{new.target_table}.{name} becomes NULL for them (it is not NULL with the current mapping), and a "
+                "record without it cannot be loaded. Keep the rows: fix the expression so it still gives a value "
+                "for them"
+            )
     return None
+
+
+def _filled_issue(
+    old: TableMapping, new: TableMapping, conn: psycopg.Connection, schemas: Schemas, cfg: ProjectConfig | None,
+) -> str | None:
+    """Why an edit may not give a required field whose NULL drops the row (year_of_birth, a start
+    date, death_date) a value of its own: with every source column NULL the new expression still
+    gives one (``etl.compiler.filled_without_source_sql``: a COALESCE onto 1900, a constant, the
+    build date) and the old one did not. Such rows are left out by the CDM convention; a value the
+    source does not hold would bring them back (people with an invented birth year, deaths with an
+    invented date). A query that cannot run lets the edit through."""
+    from ..etl.compiler import filled_without_source_sql
+
+    try:
+        queries = filled_without_source_sql(old, new, schemas, etl=cfg.etl if cfg is not None else None)
+    except Exception:
+        return None
+    for name, (new_sql, old_sql) in queries.items():
+        now = _guard_count(conn, schemas, cfg, new_sql)
+        if now is None or not now.get("filled"):
+            continue
+        was = _guard_count(conn, schemas, cfg, old_sql) if old_sql is not None else None
+        if old_sql is not None and (was is None or was.get("filled")):
+            continue  # the old expression gave such rows a value too (or cannot be judged)
+        return (
+            f"it would give {new.target_table}.{name} a value of its own for rows whose source has none (the new "
+            "expression is not NULL when every source column is NULL: a literal, a constant or the build date). A "
+            f"record without {name} is left out by the CDM convention and counted (etlRequiredFieldNull); a value "
+            "the source does not hold would bring it back with an invented value, which changes who or what exists "
+            "in the CDM. Read the value from the source (another column, another layout), or leave it for a person "
+            "to decide"
+        )
+    return None
+
+
+def _open_end_issue(row: dict, table: str, name: str, k: int) -> str | None:
+    """Why an edit of an open end (``etl.compiler.nulling_count_sql``, what 'open') changes which
+    episodes are open: it opens episodes with real, differing exit dates (one placeholder exit date
+    shared by all of them may become NULL), or closes open ones on their start date."""
+    opened, values, closed = int(row.get("n") or 0), int(row.get("v") or 0), int(row.get("m") or 0)
+    if opened and values > 1:
+        return (
+            f"it would turn {_small_count(opened, k)} closed episodes of {table} into open ones that run to the "
+            f"release date (or death): {table}.{name} becomes NULL for them where the current mapping reads an exit "
+            "date. Keep the exit dates: an episode that ends before it starts is dropped and counted "
+            "(etlObservationPeriodMerge), so fix how its dates are read, or leave it for a person to decide. (A "
+            "placeholder exit date, one value for every such episode, may become NULL.)"
+        )
+    if closed:
+        return (
+            f"it would close {_small_count(closed, k)} open episodes of {table} on their start date: {table}.{name} "
+            "gets the start date where the current mapping has no exit date. Leave the end NULL for open episodes: "
+            "the build ends them at the release date or at death"
+        )
+    return None
+
+
+def _guard_count(conn: psycopg.Connection, schemas: Schemas, cfg: ProjectConfig | None, sql: str) -> dict | None:
+    """One read-only count of ``drop_guard`` under ``COUNT_TIMEOUT_MS`` (None: it failed or timed out)."""
+    from ..cdm.ddl import create_etl_tables
+
+    try:
+        with rollback_only(conn, COUNT_TIMEOUT_MS):
+            create_etl_tables(conn, schemas)  # the count calls the ETL helper functions
+            apply_session(conn, cfg)
+            execute(conn, "SET LOCAL transaction_read_only = on")
+            return dict(fetch_one(conn, sql) or {}) or None
+    except psycopg.Error:
+        return None
 
 
 def _norm_sql(text: str | None) -> str:
@@ -839,8 +1077,9 @@ def _norm_sql(text: str | None) -> str:
 def data_loss_issues(old: TableMapping | None, new: TableMapping) -> list[str]:
     """Edits that can only remove records or data, which the repair agent may not make: a new or
     changed filter, a new or changed inner join, a different source table, or a populated field
-    turned to NULL. (An added mapping may filter: it adds records, for example to route the
-    observation-domain codes of a source table to observation.)"""
+    turned to NULL. (An added mapping may filter: it adds records, for example the visits of a
+    clinic not loaded yet. It must not route records by the domain of their concept: the build
+    moves them itself, so such a mapping loads them twice, see ``routing_issues``.)"""
     if old is None:
         return []
     out: list[str] = []
@@ -869,6 +1108,104 @@ def data_loss_issues(old: TableMapping | None, new: TableMapping) -> list[str]:
     return out
 
 
+def routing_issues(old: TableMapping | None, new: TableMapping, spec: ETLSpec, new_spec: ETLSpec) -> list[str]:
+    """Edits that route records by the domain of their concept by hand while the build routes them
+    (``ETLSpec.route_by_domain``), which load records twice: a filter on the domain of
+    {vocab}.concept that the mapping did not have (``etl.routing.hand_routing_issue``), or a new
+    or retargeted mapping that reads the same codes from the same rows of a source table as one
+    into another event table (``etl.routing.shared_codes``). The pairs are compared by source and
+    target tables, so an edit of mappings that were already a pair (the same fix made to both) is
+    not refused."""
+    from ..etl.routing import hand_routing_issue, shared_codes, source_table_pairs
+
+    out: list[str] = []
+    issue = hand_routing_issue(new, new_spec)
+    if issue and (old is None or hand_routing_issue(old, spec) is None):
+        out.append(f"{new.target_table}: {issue}")
+    before = source_table_pairs(spec)
+    out += [p.message for p in shared_codes(new_spec) if p.key not in before]
+    return out
+
+
+def era_issues(spec: ETLSpec, new: TableMapping, old: TableMapping | None = None) -> list[str]:
+    """A new mapping into an era table while the build derives eras (``ETLSpec.derive_eras``): it
+    would replace the OHDSI era step (``etl.compiler.derived_era_tables``), or load the eras of an
+    era table that the spec's own SQL loads a second time; either is for a person to decide. An
+    edit of a mapping the spec already has into an era table (``old``: it replaced the step
+    before) is allowed like any other."""
+    from ..cdm.spec import DERIVED_ERAS
+    from ..etl.compiler import derived_era_tables, spec_era_tables
+
+    t = new.target_table.lower()
+    if not spec.derive_eras or t not in DERIVED_ERAS or (old is not None and old.target_table.lower() == t):
+        return []
+    source = DERIVED_ERAS[t]
+    if t in derived_era_tables(spec):
+        return [f"the build derives {t} from {source} with the OHDSI era logic (derive_eras), and a mapping into {t} "
+                f"would replace it: fix the {source} records (their concepts and dates) instead"]
+    if t in spec_era_tables(spec):
+        return [f"the spec's own SQL already loads {t}, and a new mapping into it would load its eras twice: fix the "
+                f"{source} records instead"]
+    return [f"the build derives {t} from the {source} records (derive_eras), and the spec loads none: load the "
+            f"{source} records instead of mapping into {t}"]
+
+
+def observation_period_end_issues(old: TableMapping | None, new: TableMapping) -> list[str]:
+    """An edit of observation_period_end_date that closes the episodes the source leaves open, or
+    opens those it closes (``design.validate.observation_period_end_issue``: a fallback onto the start
+    date, a date literal or the build date, a constant, or a NULL that depends on the start date),
+    which the repair agent may not make: it would change observation time to make a check pass. An
+    end the edit leaves as it was is not judged again (it was approved with the spec)."""
+    if new.target_table.lower() != "observation_period":
+        return []
+    from ..design.validate import observation_period_end_issue
+
+    def end(tm: TableMapping | None) -> tuple[str, str] | None:
+        fm = next((f for f in tm.fields if f.target_field == "observation_period_end_date"), None) if tm else None
+        return (fm.kind, _norm_sql(fm.expression)) if fm is not None else None
+
+    if old is not None and end(old) == end(new):
+        return []
+    issue = observation_period_end_issue(new)
+    return [f"observation_period.observation_period_end_date: {issue}"] if issue else []
+
+
+# Tables whose rows decide who exists in the CDM (people, visits, deaths).
+IDENTITY_TABLES = ("person", "visit_occurrence", "death")
+_KEY_FIELDS = {"person": ("person_id", "person_id"), "visit_occurrence": ("visit_occurrence_id", "visit_id")}
+
+
+def identity_issues(old: TableMapping | None, new: TableMapping, *, old_runs: bool = True) -> list[str]:
+    """Edits that change who exists in the CDM or whose records are whose, which only a person may
+    decide: a changed person_id expression (in any table: it re-attributes records), a changed key
+    of person or visit_occurrence, a new mapping into person, visit_occurrence or death, and a
+    removed or changed filter of those tables (a new or changed filter is also data loss). When
+    the old mapping cannot run at all (``old_runs`` False: it does not compile or EXPLAIN, e.g. a
+    misspelled key column), it never loaded a record, so its keys may be fixed."""
+    target = new.target_table.lower()
+    if old is None:
+        if target in IDENTITY_TABLES:
+            return [f"it adds a mapping into {target}, which decides who (or which visits and deaths) exist in "
+                    "the CDM"]
+        return []
+    out: list[str] = []
+    before = {f.target_field: f for f in old.fields}
+    after = {f.target_field: f for f in new.fields}
+    key_field, key_kind = _KEY_FIELDS.get(target, (None, None))
+    for name in sorted(set(before) | set(after)) if old_runs else []:
+        a, b = before.get(name), after.get(name)
+        ids = {f.kind for f in (a, b) if f is not None} & {"person_id", "visit_id"}
+        if "person_id" not in ids and not (name == key_field and key_kind in ids):
+            continue
+        if a is None or b is None or (a.kind, _norm_sql(a.expression)) != (b.kind, _norm_sql(b.expression)):
+            what = "the key" if name == key_field else "the person key"
+            out.append(f"it changes {what} of {target}.{name} ({_fm_text(a)} → {_fm_text(b)}), which re-attributes "
+                       "records or changes who exists in the CDM")
+    if target in IDENTITY_TABLES and old.where and _norm_sql(old.where) != _norm_sql(new.where):
+        out.append(f"it {'changes' if new.where else 'removes'} the filter of {target} (where: {old.where})")
+    return out
+
+
 def _apply(
     state: RepairState,
     pos: int | None,
@@ -878,23 +1215,65 @@ def _apply(
     change: str,
     rationale: str,
 ) -> str:
-    loss = data_loss_issues(state.spec.table_mappings[pos] if pos is not None else None, new_tm)
+    old_tm = state.spec.table_mappings[pos] if pos is not None else None
+    eras = era_issues(state.spec, new_tm, old_tm)
+    if eras:
+        return ("REJECTED: " + "; ".join(eras) + ". Describe the change you would make in your summary, for a person "
+                "to decide.")
+    loss = data_loss_issues(old_tm, new_tm)
     if loss:
         return (
             "REJECTED: " + "; ".join(loss) + ". The repair agent may not remove records or data to make a check "
             "pass. If records really should be excluded, leave the spec as it is and explain why in your summary, "
             "for a person to decide."
         )
-    issues = mapping_issues(state, new_tm)
-    if issues:
-        return "REJECTED: " + "; ".join(issues)
+    periods = observation_period_end_issues(old_tm, new_tm)
+    if periods:
+        return (
+            "REJECTED: " + "; ".join(periods) + ". The repair agent may not change how long people are observed to "
+            "make a check pass. If the exit dates are read wrongly, fix how they are read; otherwise leave the spec as "
+            "it is and explain in your summary, for a person to decide."
+        )
+    if pos is None:
+        from ..etl.routing import same_table_twin
+
+        twin = same_table_twin(state.spec, new_tm)
+        if twin is not None:
+            index = sum(1 for tm in state.spec.table_mappings[:twin]
+                        if tm.target_table.lower() == new_tm.target_table.lower())  # its mapping_index
+            return (
+                f"REJECTED: {new_tm.target_table} mapping #{index} already reads the same codes from "
+                f"{new_tm.source.table}: a source row both mappings select would be loaded twice (no check counts "
+                "records loaded twice). Change that mapping instead (with update_field_mapping, e.g. a CASE "
+                "expression for the rows that need another value), or describe the change in your summary, for a "
+                "person to decide."
+            )
     mappings = list(state.spec.table_mappings)
     if pos is None:
         mappings.append(new_tm)
     else:
         mappings[pos] = new_tm
     new_spec = state.spec.model_copy(update={"table_mappings": mappings}, deep=True)
-    error = validate_mapping(new_tm, new_spec, state.conn, state.schemas)
+    routed = routing_issues(old_tm, new_tm, state.spec, new_spec)
+    if routed:
+        return (
+            "REJECTED: " + "; ".join(routed) + ". The build moves every record to the table of its concept's domain "
+            "itself. Leave the mappings as they are; fix a wrong concept in its lookup."
+        )
+    issues = mapping_issues(state, new_tm)
+    if issues:
+        return "REJECTED: " + "; ".join(issues)
+    identity = identity_issues(old_tm, new_tm)
+    if identity and old_tm is not None and validate_mapping(old_tm, state.spec, state.conn, state.schemas,
+                                                            state.cfg) is not None:
+        identity = identity_issues(old_tm, new_tm, old_runs=False)  # it never loaded a record
+    if identity:
+        return (
+            "REJECTED: " + "; ".join(identity) + ". Who exists in the CDM, and whose records are whose, is decided "
+            "by people: leave the spec as it is and describe the change you would make in your summary, for a "
+            "person to decide."
+        )
+    error = validate_mapping(new_tm, new_spec, state.conn, state.schemas, state.cfg, old=old_tm)
     if error:
         return f"REJECTED: {error}"
     state.spec = new_spec
@@ -935,7 +1314,7 @@ def build_repair_tools(state: RepairState) -> list[AgentTool]:
         from ..etl.compiler import compile_table
 
         try:
-            text += "\n-- compiled SQL\n" + compile_table(tm, state.spec, state.schemas)
+            text += "\n-- compiled SQL\n" + compile_table(tm, state.spec, state.schemas, etl=state.cfg.etl)
         except Exception as e:
             text += f"\n-- the mapping does not compile: {e}"
         return text
@@ -1078,22 +1457,43 @@ def build_repair_tools(state: RepairState) -> list[AgentTool]:
 
 
 def repair_triggers(
-    dq: DQReport | None, etl_result: ETLRunResult | None, cfg: ProjectConfig
+    dq: DQReport | None, etl_result: ETLRunResult | None, cfg: ProjectConfig, spec: ETLSpec | None = None
 ) -> tuple[list[TableLoadResult], list[CheckResult]]:
-    """ETL step errors if there are any; otherwise the DQ failures in ``repair_severities``."""
-    if etl_result is not None and etl_result.errors():
-        return etl_result.errors(), []
+    """The errors of blocking steps that run spec SQL, if there are any; otherwise the repairable DQ
+    failures in ``repair_severities`` (``checks.repairable``). Errors of steps the build generates
+    (id-map pruning, routing, eras, ...) and errors a spec change cannot fix (a missing privilege,
+    ``TableLoadResult.repairable``) are never given to the agent: its tools cannot change them; nor
+    are the checks of the era tables the build derived, or that ``spec`` loads itself while the
+    build derives eras (``checks.derived_tables``)."""
+    if etl_result is not None:
+        fixable = [
+            s for s in etl_result.blocking_errors() if (s.kind is None or s.kind in SPEC_KINDS) and s.repairable
+        ]
+        if fixable:
+            return fixable, []
     if dq is None:
         return [], []
     severities = set(cfg.quality.repair_severities)
     order = {"fatal": 0, "convention": 1, "characterization": 2}
-    failures = [r for r in dq.results if (r.failed or r.error) and r.severity in severities and not r.not_applicable]
+    derived = derived_tables(etl_result, spec)
+    failures = [r for r in dq.results if repairable(r, severities, derived=derived)]
     return [], sorted(failures, key=lambda r: (order.get(r.severity, 3), -r.pct_violated_rows))
 
 
 def _clip(text: str | None, n: int) -> str:
     text = (text or "").strip()
     return text if len(text) <= n else text[:n] + "\n... (truncated)"
+
+
+def _clip_sql(sql: str | None, n: int) -> str:
+    """``_clip`` for the SQL of a step or check. A table mapping's INSERT computes the spec's values
+    in its innermost layer, at the end of the text, after the column list and the outer SELECTs:
+    when it is too long, it is shown from that layer."""
+    text = (sql or "").strip()
+    start = text.find(LAYER_1_MARKER)
+    if len(text) > n and start > 0:
+        text = "-- (the INSERT column list and the outer SELECTs are left out)\n" + text[start:]
+    return _clip(text, n)
 
 
 def _small_count(n: int | None, k: int) -> str:
@@ -1103,21 +1503,42 @@ def _small_count(n: int | None, k: int) -> str:
     return f"<{k}" if 0 < n < k else str(n)
 
 
+# "<n> of <m>" in a check description: the form in which descriptions give counts (not inside a date
+# or a decimal number)
+_COUNT_PAIR = re.compile(r"(?<![\w.<-])(\d+) of (\d+)\b(?![.-]\d)")
+
+
 def _check_summary(r: CheckResult, k: int) -> tuple[str, str]:
-    """(one-line summary, description) with violated/denominator counts below k suppressed."""
+    """(one-line summary, description) with counts below k suppressed: the violated and denominator
+    counts, and every other "<n> of <m>" count of the description."""
     v, d = r.num_violated_rows, r.num_denominator_rows
+    description = _COUNT_PAIR.sub(lambda m: f"{_small_count(int(m[1]), k)} of {_small_count(int(m[2]), k)}",
+                                  r.description)
     if not (0 < v < k or 0 < d < k):
         head = (
             f"{r.key} ({r.severity}): {v} of {d} ({r.pct_violated_rows:.2%}) violated, threshold {r.threshold_pct:g}%"
         )
-        return head, r.description
+        return head, description
     pct = f"<{k / d:.2%}" if d >= k and v < k else "percentage withheld"
     head = (
         f"{r.key} ({r.severity}): {_small_count(v, k)} of {_small_count(d, k)} ({pct}) violated, threshold "
         f"{r.threshold_pct:g}% (counts below {k} are not shown)"
     )
-    description = r.description.replace(f"{v} of {d}", f"{_small_count(v, k)} of {_small_count(d, k)}")
     return head, description
+
+
+def _routing_line(spec: ETLSpec) -> str:
+    """The prompt line on routing by domain (``ETLSpec.route_by_domain``), which the system prompt
+    describes as it works when it is on."""
+    from ..design.render import routing_text
+
+    if spec.route_by_domain:
+        return f"Routing by domain: on: {routing_text(spec)}. Never route records by hand."
+    return ("Routing by domain: off (route_by_domain: false): records stay in the table that loads them and nothing "
+            "is moved, so the rules above on the build moving records and on routing by hand do not apply. An fkDomain "
+            "failure for a main concept of another event domain (an ICD-10 Z code with an Observation concept in "
+            "condition_occurrence) is then expected and not a wrong lookup: leave a correct lookup as it is, and leave "
+            "routing for a person to decide.")
 
 
 def build_repair_prompt(
@@ -1141,7 +1562,7 @@ def build_repair_prompt(
             if s.source_rows is not None:
                 lines.append(f"   source rows: {_small_count(s.source_rows, k)}")
             if s.sql:
-                lines.append("   failing SQL:\n```sql\n" + _clip(s.sql, 4000) + "\n```")
+                lines.append("   failing SQL:\n```sql\n" + _clip_sql(s.sql, 4000) + "\n```")
     else:
         lines.append(
             f"The data-quality checks found {len(checks)} failure(s) with a severity the pipeline repairs "
@@ -1159,7 +1580,7 @@ def build_repair_prompt(
             lines.append(f"{i}. {head}")
             lines.append(f"   {r.check_level} check: {description}")
             if r.sql:
-                lines.append("   check SQL:\n```sql\n" + _clip(r.sql, 1500) + "\n```")
+                lines.append("   check SQL:\n```sql\n" + _clip_sql(r.sql, 1500) + "\n```")
         if len(checks) > MAX_FAILURES_IN_PROMPT:
             lines.append(f"... and {len(checks) - MAX_FAILURES_IN_PROMPT} more failures (fix the ones above first).")
     lines.append("\nTABLE MAPPINGS IN THE ETL SPEC")
@@ -1169,16 +1590,29 @@ def build_repair_prompt(
         counts[tm.target_table] = idx + 1
         joins = f" + {', '.join(f'{j.table} {j.alias}' for j in tm.joins)}" if tm.joins else ""
         where = f" WHERE {tm.where}" if tm.where else ""
+        order = f" dedup_order {tm.dedup_order}" if (tm.dedup_order or "").strip() else ""
         lines.append(
             f"- {tm.target_table} (mapping_index {idx}) <- {{src}}.{tm.source.table} {tm.source.alias}{joins}{where}"
-            f" [{len(tm.fields)} fields]"
+            f"{order} [{len(tm.fields)} fields]"
         )
     if spec.custom_sql:
         lines.append(
             "Custom SQL steps (the tools cannot edit these; describe needed changes for a human): "
             + ", ".join(f"{c.name} -> {c.target_table}" for c in spec.custom_sql)
         )
-    lines.append(f"Observation periods: {spec.observation_period}.")
+    if spec.observation_period == "table_mapping":
+        lines.append(
+            "Observation periods: table_mapping (one row per episode). The build merges each person's episodes, ends "
+            "open ones (NULL end) at cdm_source.source_release_date or at death, and gives persons without a valid "
+            "episode a period from their events (steps *_observation_period_merge and *_observation_period_fill, "
+            "generated); never write merging, filters or a fallback into the observation_period end date: leave it "
+            "NULL for open episodes."
+        )
+    else:
+        lines.append("Observation periods: from_events (one period per person from their first to their last record, "
+                     "generated by the build).")
+    lines.append(_routing_line(spec))
+    lines.append(_eras_line(spec))
     lines.append(
         "\nDiagnose the root cause of each failure, inspect with the tools, and fix the ETL spec (not the data) "
         "with the smallest change that follows OMOP conventions. Do not paper over real data problems: never "
@@ -1187,6 +1621,32 @@ def build_repair_prompt(
         "remains for a human."
     )
     return "\n".join(lines)
+
+
+def _eras_line(spec: ETLSpec) -> str:
+    """How the spec's era tables are built, for the repair prompt."""
+    from ..cdm.spec import DERIVED_ERAS
+    from ..etl.compiler import derived_era_tables, spec_era_tables
+
+    derived, own = derived_era_tables(spec), sorted(spec_era_tables(spec))
+    parts = []
+    if derived:
+        one = len(derived) == 1
+        records = " and ".join(DERIVED_ERAS[t].split("_")[0] for t in derived)  # condition, drug
+        parts.append(f"{' and '.join(derived)} {'is' if one else 'are'} derived by the build from "
+                     f"{' and '.join(DERIVED_ERAS[t] for t in derived)} with the OHDSI era logic "
+                     f"(step{'' if one else 's'} {', '.join('*_' + t for t in derived)}, generated): never add a "
+                     f"mapping into {'it' if one else 'them'}; {'its' if one else 'their'} checks are not yours to fix, "
+                     f"fix the {records} records instead")
+    if own:
+        one = len(own) == 1
+        parts.append(f"{' and '.join(own)} {'is' if one else 'are'} loaded by the spec's own SQL"
+                     + (f" in place of the build's era step: {'its' if one else 'their'} checks are not yours to fix (a "
+                        "person decides whether the build should derive the eras instead), and you may change that SQL "
+                        "only to fix an error that stops it from running" if spec.derive_eras else ""))
+    if not spec.derive_eras:
+        parts.append("the build derives no eras (derive_eras: false)")
+    return "Eras: " + ("; ".join(parts) if parts else "none (no condition or drug records are loaded)") + "."
 
 
 SPEC_HEADER = """\
@@ -1221,7 +1681,7 @@ def repair_spec(
     profile: SourceProfile | None,
 ) -> tuple[ETLSpec, list[RepairAction]]:
     """Let the repair agent fix ``spec`` for the current failures. Returns (new spec, actions)."""
-    etl_errors, checks = repair_triggers(dq, etl_result, cfg)
+    etl_errors, checks = repair_triggers(dq, etl_result, cfg, spec)
     if not etl_errors and not checks:
         return spec, []
 
@@ -1250,7 +1710,7 @@ def repair_spec(
         result = llm.run_agent(
             stage="repair",
             key=f"iteration:{iteration}",
-            system=REPAIR_SYSTEM,
+            system=repair_system(cfg),
             prompt=prompt,
             tools=build_repair_tools(state),
             max_iterations=cfg.llm.max_agent_iterations,

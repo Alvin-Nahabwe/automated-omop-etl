@@ -40,8 +40,11 @@ from ..approvals import (
     gate_state,
     mapping_changes,
     record_approval,
+    without_default_lines,
 )
 from ..db import Schemas, connect
+from ..design.render import build_rules, tables_filled
+from ..etl.compiler import key_sources
 from ..models import ConceptCandidate, DQReport, ETLSpec, MappingDecision
 from ..runlock import RunInProgress, run_lock
 from ..vocab.review import import_review, update_review_row
@@ -235,6 +238,27 @@ def create_app(
         finally:
             conn.close()
 
+    def spec_domains(proj: Project) -> dict | None:
+        """Per source vocabulary, the domains the project's current spec accepts (``import_review``
+        refreshes the decisions with them first, as the command line does, so an edit is checked
+        against the spec as it is now); None without a readable spec."""
+        from ..models import SourceAnnotations, SourceProfile
+        from ..privacy import apply_overrides
+        from ..vocab.mapper import source_vocabulary_domains
+
+        ws = proj.ws
+        if not ws.spec_yaml.exists():
+            return None
+        try:
+            spec = ws.load_yaml(ws.spec_yaml, ETLSpec)
+            profile = None
+            if ws.profile_json.exists():
+                ann = ws.load_json(ws.annotations_json, SourceAnnotations) if ws.annotations_json.exists() else None
+                profile = apply_overrides(ws.load_json(ws.profile_json, SourceProfile), proj.cfg.privacy, ann)  # type: ignore[union-attr]
+            return source_vocabulary_domains(spec, profile, proj.cfg.privacy)  # type: ignore[union-attr]
+        except (OSError, ValueError, yaml.YAMLError):  # pydantic's ValidationError is a ValueError
+            return None
+
     def redirect(url: str) -> RedirectResponse:
         return RedirectResponse(url, status_code=303)
 
@@ -402,7 +426,9 @@ def create_app(
         user = need(request)
         proj = configured(project_or_404(pid))
         ws = proj.ws
-        ctx: dict[str, Any] = {"project": proj, "gate": gate_state(ws, "design"), "spec": None, "spec_error": None}
+        ctx: dict[str, Any] = {"project": proj, "gate": gate_state(ws, "design"), "spec": None, "spec_error": None,
+                               "key_sources": {"person": [], "visit": []}, "rules": [],
+                               "tables": {"mapped": [], "derived": [], "moved": []}}
         if ws.spec_yaml.exists():
             text = ws.spec_yaml.read_text()
             ctx["spec_text"] = text
@@ -410,11 +436,20 @@ def create_app(
                 ctx["spec"] = ETLSpec.model_validate(yaml.safe_load(text))
             except (ValidationError, yaml.YAMLError) as e:
                 ctx["spec_error"] = str(e)[:3000]
+            else:  # the other mappings whose keys go into the person and visit id maps
+                ctx["key_sources"] = {
+                    what: [{"table": tm.source.table, "expression": expr} for tm, expr, _ in key_sources(ctx["spec"], t)]
+                    for what, t in (("person", "person"), ("visit", "visit_occurrence"))
+                }
+                ctx["rules"] = build_rules(ctx["spec"])  # one row per key, periods, routing, eras
+                ctx["tables"] = tables_filled(ctx["spec"])
             approved = approved_snapshot(ws, "design")
             if approved is not None and not ctx["gate"].current:
+                # lines that only write a field this version added at its default are not a change
                 ctx["diff"] = list(
                     difflib.unified_diff(
-                        approved.splitlines(), text.splitlines(), "approved", "current", lineterm="", n=2
+                        without_default_lines(approved).splitlines(), without_default_lines(text).splitlines(),
+                        "approved", "current", lineterm="", n=2,
                     )
                 )
         issues_path = ws.root / "design_issues.json"
@@ -462,8 +497,9 @@ def create_app(
         schemas = Schemas.from_config(proj.cfg.target)  # type: ignore[union-attr]
         search_results = None
         search_error = None
+        domains = spec_domains(proj)
         with vocab_conn(proj) as conn:
-            decisions = import_review(ws, conn, schemas) if conn is not None else import_review(ws)
+            decisions = import_review(ws, conn, schemas, domains=domains)
             vocabs = sorted({d.source_vocabulary_id for d in decisions})
             in_vocab = [d for d in decisions if not vocab or d.source_vocabulary_id == vocab]
             counts = _counts(in_vocab)
@@ -482,7 +518,8 @@ def create_app(
                     from ..vocab.mapper import search_candidates
 
                     try:
-                        found = search_candidates(conn, schemas, q.strip()[:200], open_term.target_domain, limit=15)
+                        found = search_candidates(conn, schemas, q.strip()[:200], open_term.target_domain, limit=15,
+                                                  also=open_term.accepted_domains)
                         search_results = [c for c in found if c.score >= SEARCH_MIN_SCORE]
                     except Exception as e:  # e.g. the vocabulary is not loaded yet
                         search_error = f"Search failed: {type(e).__name__}"
@@ -527,8 +564,9 @@ def create_app(
     def _save_decision(request, proj: Project, user: User, form: dict, svid: str, code: str, action: str, back: str):
         ws = proj.ws
         schemas = Schemas.from_config(proj.cfg.target)  # type: ignore[union-attr]
+        domains = spec_domains(proj)
         with vocab_conn(proj) as conn:
-            decisions = import_review(ws, conn, schemas) if conn is not None else import_review(ws)
+            decisions = import_review(ws, conn, schemas, domains=domains)
             d = next((x for x in decisions if x.source_vocabulary_id == svid and x.source_code == code), None)
             if d is None:
                 raise HTTPException(404, "That source code is not in the mappings.")
@@ -547,21 +585,23 @@ def create_app(
                     target = int(form.get("concept_id", str(d.target_concept_id)))
                 except ValueError:
                     raise HTTPException(400, "The selected concept is not a number.")
-                if target != d.target_concept_id:
-                    if target == 0:
+                if target == 0:
+                    if target != d.target_concept_id:
                         changes.update(target_concept_id="0", target_concept_name="", target_domain_id="", target_vocabulary_id="")
-                    else:
-                        concept = next((c for c in d.candidates if c.concept_id == target), None)
-                        if conn is not None:
-                            from ..vocab.mapper import check_concept
+                else:  # every approval of a concept is checked, also of the one the decision holds (it may be
+                    # one the domain check rejected, or one of a domain the design no longer accepts)
+                    concept = next((c for c in d.candidates if c.concept_id == target), None)
+                    if conn is not None:
+                        from ..vocab.mapper import accepted_domains, check_concept
 
-                            concept, why = check_concept(conn, schemas, target, d.target_domain)
-                            if concept is None:
-                                flash(request, "error", f"Not saved: {why}.")
-                                return redirect(back)
-                        elif concept is None:
-                            flash(request, "error", "Not saved: the vocabulary database cannot be reached to check that concept.")
+                        concept, why = check_concept(conn, schemas, target, accepted_domains(d))
+                        if concept is None:
+                            flash(request, "error", f"Not saved: {why}.")
                             return redirect(back)
+                    elif concept is None and target != d.target_concept_id:
+                        flash(request, "error", "Not saved: the vocabulary database cannot be reached to check that concept.")
+                        return redirect(back)
+                    if concept is not None:  # also the same concept: the review file may hold a rejected id
                         changes.update(
                             target_concept_id=str(concept.concept_id), target_concept_name=concept.concept_name,
                             target_domain_id=concept.domain_id, target_vocabulary_id=concept.vocabulary_id,

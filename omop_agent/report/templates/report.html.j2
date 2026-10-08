@@ -67,6 +67,7 @@ code { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; 
 .facts div { min-width: 0; }
 .facts dt { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
 .facts dd { margin: 2px 0 0; overflow-wrap: anywhere; }
+.facts.rules { grid-template-columns: 1fr; margin-top: 6px; }
 
 .toc ol { columns: 3 200px; margin: 0; padding-left: 20px; color: var(--muted); }
 .toc li { margin: 2px 0; }
@@ -85,6 +86,7 @@ td.wrap { overflow-wrap: anywhere; min-width: 16ch; }
 td.err { color: var(--text); overflow-wrap: anywhere; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 tr.total td { font-weight: 650; border-top: 2px solid var(--border); background: transparent; }
 tr.blocking td:first-child { box-shadow: inset 4px 0 0 var(--critical); }
+tr.warned td:first-child { box-shadow: inset 4px 0 0 var(--warning); }
 
 .barcell { width: 38%; min-width: 120px; vertical-align: middle; }
 .bar { display: block; height: 12px; max-width: 100%; background: var(--bar); border-radius: 0 4px 4px 0; }
@@ -136,6 +138,14 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
   <div class="callout warn"><strong>Not fully reviewed.</strong> The data-quality checks passed, but a person still needs to review this before the CDM is used:
     <ul class="plain">{% for c in verdict_caveats %}<li>{{ c }}</li>{% endfor %}</ul>
   </div>
+  {% endif %}
+  {% if verdict_notes %}
+  <div class="callout warn"><strong>Steps that failed without failing the build.</strong>
+    <ul class="plain">{% for n in verdict_notes %}<li>{{ n }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+  {% if older_build %}
+  <div class="callout warn"><strong>Built by an earlier version.</strong> {{ older_build }}</div>
   {% endif %}
   <dl class="facts">
     <div><dt>Project</dt><dd>{{ project.name }}</dd></div>
@@ -212,13 +222,14 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
   {% if source.pii %}
   <ul class="plain">{% for c in source.pii %}<li><code>{{ c.table }}.{{ c.column }}</code>: {{ c.reason }}</li>{% endfor %}</ul>
   {% else %}{{ empty('None detected.') }}{% endif %}
-  <h3>Date formats detected</h3>
-  {% if source.date_formats %}
+  <h3>Reading the values</h3>
+  {% if source.reading %}
   <div class="tw"><table>
-    <thead><tr><th>Column</th><th>Format</th><th>Type</th></tr></thead>
-    <tbody>{% for d in source.date_formats %}<tr><td><code>{{ d.table }}.{{ d.column }}</code></td><td><code>{{ d.format }}</code></td><td>{{ d.type }}</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>Column</th><th>Type</th><th>Format</th><th>Shapes</th><th class="n">Do not fit</th><th>Their shapes</th><th class="n">Partial dates</th><th>Offsets</th><th class="n">NA markers</th><th>Notes</th></tr></thead>
+    <tbody>{% for d in source.reading %}<tr><td><code>{{ d.table }}.{{ d.column }}</code></td><td>{{ d.type }}</td><td>{% if d.format %}<code>{{ d.format }}</code>{% endif %}</td><td class="wrap">{{ d.shapes }}</td><td class="n">{{ d.nonconforming }}</td><td class="wrap">{{ d.nonconforming_shapes }}</td><td class="n">{{ d.partial }}</td><td class="wrap">{{ d.offsets }}</td><td class="n">{{ d.na_markers }}</td><td class="wrap">{{ d.notes }}</td></tr>{% endfor %}</tbody>
   </table></div>
-  {% else %}{{ empty('None detected.') }}{% endif %}
+  <p class="muted">Date formats, and the profile's scan of each whole column. A shape writes a value with 9 for each digit and a / A for each letter. Do not fit: values that do not fit the column's type or format (the build reads them as NULL and counts them). Partial dates have an unknown day or month, or no day; the build completes or rejects them as <code>etl.partial_dates</code> says. Offsets: the time zone offsets written after the times (<code>etl.timezone</code> decides how the build reads them). NA markers: values staged as NULL (<code>source.na_values</code>). Counts below {{ source.min_cell_count }} are shown as &lt;{{ source.min_cell_count }}; direct identifiers are left out.</p>
+  {% else %}{{ empty('Nothing to report: no dates, and every value fits its column\'s type.') }}{% endif %}
   {% else %}{{ empty('Not run: no profile.json in the workspace.') }}{% endif %}
   <h3>Notes and questions from the profile interpretation</h3>
   {% if annotations is none %}{{ empty('Not run: no annotations.json in the workspace.') }}
@@ -235,7 +246,9 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     <div class="stat"><div class="v">{{ design.n_fields }}</div><div class="k">field mappings</div></div>
     <div class="stat"><div class="v">{{ design.open_questions|length }}</div><div class="k">open questions</div></div>
   </div>
-  <p>CDM {{ design.cdm_version }} · person key <code>{{ design.person_key }}</code> · visit key {% if design.visit_key %}<code>{{ design.visit_key }}</code>{% else %}none{% endif %} · observation period: {{ design.observation_period }}</p>
+  <p>CDM {{ design.cdm_version }} · person key <code>{{ design.person_key }}</code>{% if design.person_key_also %} (also from <code>{{ design.person_key_also }}</code>){% endif %} · visit key {% if design.visit_key %}<code>{{ design.visit_key }}</code>{% if design.visit_key_also %} (also from <code>{{ design.visit_key_also }}</code>){% endif %}{% else %}none{% endif %} · observation period: {{ design.observation_period }}</p>
+  <h3>What the build does beyond the mappings</h3>
+  <dl class="facts rules">{% for r in design.rules %}<div><dt>{{ r.label }}</dt><dd>{{ r.text }}</dd></div>{% endfor %}</dl>
   <p class="muted">Fields by kind: {% for k in design.kinds_total %}{{ k.kind }} {{ k.n }}{{ ' · ' if not loop.last else '' }}{% endfor %}</p>
   <div class="tw"><table>
     <thead><tr><th>Target</th><th>Source</th><th>Joins / filter</th><th class="n">Fields</th><th>Kinds</th><th>Rationale</th></tr></thead>
@@ -244,7 +257,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
       <tr>
         <td><strong>{{ t.target }}</strong></td>
         <td>← <code>{{ t.source }}</code></td>
-        <td class="wrap">{% for j in t.joins %}<code>{{ j }}</code><br>{% endfor %}{% if t.where %}<code>where {{ t.where }}</code>{% endif %}</td>
+        <td class="wrap">{% for j in t.joins %}<code>{{ j }}</code><br>{% endfor %}{% if t.where %}<code>where {{ t.where }}</code>{% endif %}{% if t.dedup_order %}{% if t.joins or t.where %}<br>{% endif %}one row per key by <code>{{ t.dedup_order }}</code>{% endif %}</td>
         <td class="n">{{ t.n_fields }}</td><td class="wrap">{{ t.kinds }}</td><td class="wrap">{{ t.rationale }}</td>
       </tr>
     {% endfor %}
@@ -325,18 +338,45 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
   <div class="stats">
     <div class="stat"><div class="v">{{ etl.steps|length }}</div><div class="k">steps</div></div>
     <div class="stat"><div class="v">{{ etl.total_rows|num }}</div><div class="k">rows loaded</div></div>
-    <div class="stat"><div class="v">{{ etl.n_errors }}</div><div class="k">errors</div></div>
+    {% if etl.derived_rows %}<div class="stat"><div class="v">{{ etl.derived_rows|num }}</div><div class="k">rows derived by the build (observation periods, eras)</div></div>{% endif %}
+    {% if etl.moved_rows %}<div class="stat"><div class="v">{{ etl.moved_rows }}</div><div class="k">moved to the table of their concept's domain</div></div>{% endif %}
+    <div class="stat"><div class="v">{{ etl.n_errors }}</div><div class="k">errors{% if etl.n_errors > etl.n_blocking_errors %} ({{ etl.n_errors - etl.n_blocking_errors }} not blocking){% endif %}</div></div>
     <div class="stat"><div class="v">{{ etl.duration|secs }}</div><div class="k">duration</div></div>
   </div>
   <p class="muted">Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }}{% endif %}.</p>
   <div class="tw"><table>
-    <thead><tr><th>Step</th><th>Table</th><th class="n">Rows inserted</th><th class="n">Source rows</th><th class="n">Retention</th><th class="n">Time</th><th>Error</th></tr></thead>
+    <thead><tr><th>Step</th><th>Table</th><th class="n">Rows inserted</th><th class="n">Source rows</th><th class="n">Retention</th><th>Statistics</th><th>Visit links</th><th class="n">Time</th><th>Error</th></tr></thead>
     <tbody>
     {% for s in etl.steps %}
-      <tr{% if s.error %} class="blocking"{% endif %}><td>{{ s.step }}</td><td>{{ s.table }}</td><td class="n">{{ s.rows|num }}</td><td class="n">{{ s.source_rows|num }}</td><td class="n">{{ s.retention|pct }}</td><td class="n">{{ s.seconds|secs }}</td><td class="err">{% if s.error %}{{ badge('error', 'fail') }} {{ s.error }}{% endif %}</td></tr>
+      <tr{% if s.error and s.blocking %} class="blocking"{% elif s.error or s.skipped %} class="warned"{% endif %}><td>{{ s.step }}</td><td>{{ s.table }}</td><td class="n">{{ s.rows|num }}</td><td class="n">{{ s.source_rows|num }}</td><td class="n">{{ s.retention|pct }}</td><td class="wrap">{{ s.one_row_per_key or s.periods or s.moved or s.derived or s.id_keys or s.fan_out }}</td><td class="wrap">{{ s.visit_links }}</td><td class="n">{{ s.seconds|secs }}</td><td class="err">{% if s.error %}{{ badge('error', 'fail') if s.blocking else badge('error, not blocking', 'warn') }} {{ s.error }}{% elif s.skipped %}{{ badge('skipped', 'warn') }} {{ s.skipped }}{% endif %}</td></tr>
     {% endfor %}
     </tbody>
   </table></div>
+  <p class="muted">Retention: source rows kept per source row, as etlRecordRetention counts them (rows that lost to another row of their key are not lost, and the extra rows of a code mapped to several concepts do not count). Statistics: for steps that keep one row per key, source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays; for the observation-period merge, the episodes loaded and the periods they became (episodes that end before they start are dropped; open episodes end at the source release date, configured or derived from the exit dates, or at death; overlapping and back-to-back episodes merge; the persons with overlapping episodes, or with an open episode followed by a later one, are counted for review), and the persons without a period that the fill gave one from their events; for the route steps, the records they moved to the table of their concept's domain (they load none, so they have no retention); for the eras, the table they are derived from; for the id-map steps, the new keys they numbered, and for the pruning steps the keys they retired (people and visits not loaded; they keep their ids for when they return); for other mappings, the extra rows their codes with several concepts added (1-to-many). Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.</p>
+  {% if etl.moved %}
+  <h3>Records moved to the table of their concept's domain</h3>
+  <div class="tw"><table>
+    <thead><tr><th>From</th><th>To</th><th>Concept domain</th><th class="n">Records</th><th class="n">With a value dropped</th></tr></thead>
+    <tbody>
+    {% for m in etl.moved %}
+      <tr><td>{{ m.from_table }}</td><td>{{ m.to_table }}</td><td>{{ m.domain_id }}</td><td class="n">{{ m.rows }}</td><td class="n">{{ m.dropped }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  <p class="muted">A record whose standard concept belongs to another domain is moved after loading; a measurement with a result whose concept is not a measurement or an observation goes to observation. With a value dropped: moved records that had a value the destination table has no place for (a measurement's range or operator, a drug's days_supply or route, ...).</p>
+  {% endif %}
+  {% if etl.value_rows %}
+  <h3>Values not loaded as written</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Field</th><th>Step</th><th class="n">Unreadable</th><th class="n">Partial date completed</th><th class="n">Partial date left NULL</th><th class="n">Required value defaulted</th><th class="n">Row dropped (required value NULL)</th><th class="n">Offset ignored</th><th class="n">Offset converted</th></tr></thead>
+    <tbody>
+    {% for v in etl.value_rows %}
+      <tr><td><code>{{ v.table }}.{{ v.field }}</code></td><td>{{ v.step }}</td><td class="n">{{ v.invalid }}</td><td class="n">{{ v.imputed }}</td><td class="n">{{ v.partial_null }}</td><td class="n">{{ v.defaulted }}</td><td class="n">{{ v.required_null }}</td><td class="n">{{ v.offset_ignored }}</td><td class="n">{{ v.offset_converted }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  <p class="muted">Counted per source row. Unreadable: a value the field's conversion could not read (a date such as 31/02/2019, text in a number); the conversion gives NULL, so the field is NULL unless its expression falls back to another value (COALESCE). Partial date: a date with an unknown day or month, completed by the field's rule (<code>etl.partial_dates</code>; birth and death dates follow THEMIS) or left NULL. Required value defaulted: the CDM convention for a NULL required value (a concept becomes 0; a visit, visit detail or drug end date the start date). Row dropped: a row whose start date, birth year, death date or other required value is NULL is not loaded (a row with several such values is counted under each); retention counts it as lost. Offset: a time zone offset written after a time, converted to <code>etl.timezone</code> or, without it, ignored (the time is kept as written). (filter): values in the mapping's WHERE that could not be read; such a row is left out.{% if notice.shareable %} Counts below {{ project.min_cell_count }} are shown as &lt;{{ project.min_cell_count }}.{% endif %}</p>
+  {% endif %}
   {% else %}{{ empty('Not run: no etl_run.json in the workspace.') }}{% endif %}
 </section>
 
@@ -347,7 +387,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
   <div class="stats">
     <div class="stat"><div class="v">{{ badge('passed', 'ok') if dq.passed else badge('failed', 'fail') }}</div><div class="k">gate</div></div>
     <div class="stat"><div class="v">{{ dq.n_checks|num }}</div><div class="k">checks</div></div>
-    <div class="stat"><div class="v">{{ dq.failed|length }}</div><div class="k">failed</div></div>
+    <div class="stat"><div class="v">{{ dq.n_failed }}</div><div class="k">failed</div></div>
     <div class="stat"><div class="v">{{ dq.n_blocking }}</div><div class="k">blocking</div></div>
     <div class="stat"><div class="v">{{ dq.errors|length }}</div><div class="k">errored</div></div>
   </div>
@@ -367,7 +407,8 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     </tbody>
   </table></div>
   {% endfor %}
-  <h3>Failed checks</h3>
+  {% if dq.failed or not dq.derived_failed %}
+  <h3>Failed checks{% if dq.derived_failed %} of the loaded tables{% endif %}</h3>
   {% if dq.failed %}
   <div class="tw"><table>
     <thead><tr><th>Check</th><th>Severity</th><th>Category</th><th class="n">Violated rows</th><th class="n">% violated</th><th class="n">Threshold</th><th>Description</th></tr></thead>
@@ -383,6 +424,27 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     </tbody>
   </table></div>
   {% else %}{{ empty('None.') }}{% endif %}
+  {% endif %}
+  {% for g in dq.derived_failed %}
+  <h3>Failed checks of {{ g.table }} <span class="muted">({% if g.not_built %}not built: {{ g.not_built }}{% else %}derived by the build from {{ g.source }}{% endif %})</span></h3>
+  <div class="tw"><table>
+    <thead><tr><th>Check</th><th>Severity</th><th>Category</th><th class="n">Violated rows</th><th class="n">% violated</th><th class="n">Threshold</th><th>Description</th></tr></thead>
+    <tbody>
+    {% for f in g.failed %}
+      <tr{% if f.blocking %} class="blocking"{% endif %}>
+        <td class="wrap">{% if f.blocking %}{{ badge('blocking', 'fail') }}<br>{% endif %}<code>{{ f.key }}</code></td>
+        <td>{{ f.severity }}</td><td>{{ f.category }}</td>
+        <td class="n">{{ f.violated|num }} / {{ f.denominator|num }}</td><td class="n">{{ f.pct|pct(2) }}</td><td class="n">{{ f.threshold }}</td>
+        <td class="wrap">{{ f.description }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% if g.not_built %}<p class="muted">{{ g.table }} was not built ({{ g.not_built }}; see the ETL run), so its checks fail for that reason.</p>{% endif %}
+  {% endfor %}
+  {% set built_eras = dq.derived_failed|rejectattr('not_built')|list %}
+  {% if built_eras %}<p class="muted">The eras follow the {{ built_eras|map(attribute='source')|join(' and ') }} records: a failure here comes from those records{% if 'drug_era' in built_eras|map(attribute='table') %}, or is expected (drugs without a standard ingredient, such as vaccines, get no drug era){% endif %}. These checks are never sent to the repair agent.</p>
+  {% elif dq.derived_failed %}<p class="muted">These checks are never sent to the repair agent.</p>{% endif %}
   {% if dq.errors %}
   <h3>Checks that errored</h3>
   <div class="tw"><table>
@@ -459,6 +521,9 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 3
     <div class="stat"><div class="v">{{ op.p90_days|num }} d</div><div class="k">90th percentile</div></div>
     {% endif %}
   </div>
+  {% if op.multi_period_persons %}
+  <p class="muted">Persons with more than one period: {{ op.multi_period_persons }} · source release date {{ op.release_date or 'none' }}{% if op.release_basis %} ({{ op.release_basis }}){% endif %} · periods ending on it: {{ op.ending_at_release }}</p>
+  {% endif %}
   {% endif %}
   {% for t in cdm.top_concepts %}
   <h3>Top concepts: {{ t.table }} <span class="muted">({{ t.field }})</span></h3>

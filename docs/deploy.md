@@ -135,7 +135,15 @@ internal network or VPN.
    `${OMOP_AGENT_DB_URL}`, so no password is stored in it. Its schemas are named after the
    project (`<name>_cdm`, `<name>_src`, ...), so projects in the same database don't overwrite
    each other; the app refuses to run a project whose schemas another project uses. Review the
-   privacy settings and `cdm_source` in that file.
+   privacy settings in that file, and set two values the build cannot know:
+   * `cdm_source.source_release_date`: the date of the data extract. Residency episodes that are
+     still open (no exit date) end on it. Unset, the build derives a date from the exit dates and
+     writes it to `cdm_source`; the `etlSourceReleaseDate` check fails while open episodes end on
+     it (and is fatal when that date is after the day of the build).
+   * `etl.timezone`: the site's time zone, e.g. `Africa/Nairobi`, when times in the source carry an
+     offset or `Z` (ODK submission times do). The build converts them to it. Unset, each time is
+     kept as written, and a design that reads times with `Z` or with several different offsets
+     fails validation.
 4. In the browser, open the project and press **Continue the pipeline**. The first run
    profiles the source and then stops for the **privacy review**, before anything is sent to
    Claude. A reviewer opens the **Privacy** tab, checks the withheld columns and the profile
@@ -222,6 +230,29 @@ docker compose up -d --build
 ```
 
 Accounts, projects, approvals and the database are kept.
+
+An update can change the CDM that an unchanged design builds. The update that added one row per
+key, the observation-period merge, routing by domain and the eras does: the first build of each
+project after it says so in its log and in the **Audit trail** (an `upgrade_notice` event), and
+the README's "Upgrading" section lists the changes. Approved designs and mappings stay
+approved. Things to check after an update:
+
+* The first build installs a new version of the helper functions in the project's ETL schema. The
+  app's `omop` role owns that schema, so this needs nothing from you. If a project sets
+  `target.etl_role`, the build grants the ETL tables it creates to that role; the role needs the
+  privileges listed under "Privacy and safety" in the README, now including DELETE on the CDM
+  tables (the observation-period merge and the route steps move rows by deleting them).
+* Every build now empties all the tables records can be moved to by domain, also those the
+  design does not load: rows put into the CDM schema by anything other than the design are lost.
+* CSV sources: staging now stores `NA`, `NULL`, `\N` and `.` as empty values. This takes effect
+  when the source is staged again:
+  `docker compose run --rm app profile -c /srv/projects/<name>/omop_agent.yaml`, then **Continue
+  the pipeline**. A project that sends data to Claude then needs a new privacy review. Don't use
+  **Start over** for this: it also redrafts the ETL design and maps every code again. Set
+  `source.na_values: []` in the project's config to keep these values as data.
+* Set `cdm_source.source_release_date` and, where needed, `etl.timezone` (see "A first real
+  project", step 3), and read the new failed checks in the report: the build now reports what it
+  could not read, what it merged and what it moved.
 
 ## Troubleshooting
 

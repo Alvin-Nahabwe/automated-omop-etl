@@ -20,15 +20,16 @@ import hashlib
 import io
 import re
 from pathlib import Path
-from typing import get_args
+from typing import Mapping, get_args
 
 import psycopg
 
 from ..db import Schemas
+from ..etl.routing import VocabularyDomains
 from ..fsutil import atomic_write_text, file_lock
 from ..models import Equivalence, MappingDecision, MappingStatus
 from ..workspace import Workspace
-from .mapper import check_concept
+from .mapper import MIXED_DOMAINS_NOTE, accepted_domains, check_concept
 
 REVIEW_COLUMNS = [
     "status",
@@ -37,6 +38,7 @@ REVIEW_COLUMNS = [
     "source_name",
     "frequency",
     "target_domain",
+    "accepted_domains",
     "target_concept_id",
     "target_concept_name",
     "target_domain_id",
@@ -68,7 +70,19 @@ def _csv_name(source_vocabulary_id: str) -> str:
 
 
 def _alternatives(d: MappingDecision) -> str:
-    return "; ".join(f"{c.concept_id}:{c.concept_name}" for c in d.candidates if c.concept_id != d.target_concept_id)
+    """The other candidates as ``id:name [Domain]``: a concept of another accepted domain than the
+    target domain moves the record to that domain's table, so the reviewer sees the domain here."""
+    return "; ".join(f"{c.concept_id}:{c.concept_name}" + (f" [{c.domain_id}]" if c.domain_id else "")
+                     for c in d.candidates if c.concept_id != d.target_concept_id)
+
+
+def _accepted(d: MappingDecision) -> str:
+    """The domains a concept for the term may belong to, for the review file: beyond the target
+    domain, a concept of another one moves the record to that domain's table."""
+    others = [x for x in d.accepted_domains if x.lower() != (d.target_domain or "").lower()]
+    if not others:
+        return d.target_domain or ""
+    return f"{d.target_domain}; also {', '.join(others)} (the record moves to that domain's table)"
 
 
 def _row(d: MappingDecision) -> dict[str, object]:
@@ -79,6 +93,7 @@ def _row(d: MappingDecision) -> dict[str, object]:
         "source_name": d.source_name,
         "frequency": d.frequency,
         "target_domain": d.target_domain or "",
+        "accepted_domains": _accepted(d),
         "target_concept_id": d.target_concept_id,
         "target_concept_name": d.target_concept_name or "",
         "target_domain_id": d.target_domain_id or "",
@@ -220,6 +235,16 @@ def _apply_cells(
     if new_id == d.target_concept_id:
         return d
 
+    known = next((c for c in d.candidates if c.concept_id == new_id), None)
+    if new_id != 0 and conn is not None and schemas is not None:
+        known, why = check_concept(conn, schemas, new_id, accepted_domains(d))
+        if known is None:  # the decision keeps the concept it had (FLAGGED: not loaded), never the
+            # rejected id under the labels of the concept it replaced
+            d.status = "FLAGGED"
+            d.rationale = (f"Reviewer's target_concept_id {new_id} rejected: {why}. The concept shown is the one "
+                           "before that edit; choose another, or 0 for no mapping.")
+            return d
+
     d.method = "manual"
     d.confidence = 1.0
     d.target_concept_id = new_id
@@ -229,18 +254,16 @@ def _apply_cells(
         d.target_concept_name = d.target_domain_id = d.target_vocabulary_id = None
         d.equivalence = "UNMATCHED"
         return d
-    known = next((c for c in d.candidates if c.concept_id == new_id), None)
-    if conn is not None and schemas is not None:
-        known, why = check_concept(conn, schemas, new_id, d.target_domain)
-        if known is None:
-            d.status = "FLAGGED"
-            d.rationale = f"Reviewer's target_concept_id rejected: {why}."
     if known is not None:
         d.target_concept_name, d.target_domain_id, d.target_vocabulary_id = (
             known.concept_name,
             known.domain_id,
             known.vocabulary_id,
         )
+        target = (d.target_domain or "").strip()
+        if target and known.domain_id.lower() != target.lower():  # the reviewer's pick moves the record
+            d.rationale = (f"{d.rationale} (Reviewer's {known.domain_id} concept, not {target}: the record moves to "
+                           f"the table of the {known.domain_id} domain.)").strip()
     else:
         d.target_concept_name = row.get("target_concept_name") or None
         d.target_domain_id = row.get("target_domain_id") or None
@@ -251,15 +274,24 @@ def _apply_cells(
 
 
 def import_review(
-    ws: Workspace, conn: psycopg.Connection | None = None, schemas: Schemas | None = None
+    ws: Workspace,
+    conn: psycopg.Connection | None = None,
+    schemas: Schemas | None = None,
+    *,
+    domains: Mapping[str, VocabularyDomains] | None = None,
 ) -> list[MappingDecision]:
     """``decisions.json`` with the reviewer's CSV edits applied (matched on vocabulary + code).
+
+    ``domains`` (``vocab.mapper.source_vocabulary_domains`` of the current spec) first refreshes
+    each decision's ``target_domain`` and ``accepted_domains``, so the edits are checked against
+    the domains the spec accepts now (the spec may have changed since the terms were mapped).
 
     * a changed ``status`` is taken as is;
     * a changed ``target_concept_id`` sets method ``manual``, confidence 1.0 and, unless the
       status was changed too, status APPROVED. With a connection, the concept is looked up to
       refresh its name, domain and vocabulary. An id that does not exist, is not standard and
-      valid, or is outside the term's target domain is FLAGGED.
+      valid, or is outside the term's accepted domains (its target domain, plus the other
+      domains of a table routed by domain) is FLAGGED.
 
     Only ``mappings/<source_vocabulary_id>.csv`` files are read; rows whose code is not in
     ``decisions.json`` are ignored, and an unknown status value FLAGs the term. Nothing is
@@ -269,6 +301,12 @@ def import_review(
     if not path.exists():
         raise FileNotFoundError(f"{path} not found: run the mapping step first")
     decisions = ws.load_json_list(path, MappingDecision)
+    if domains:
+        decisions = [
+            d.model_copy(update={"target_domain": vd.target_domain, "accepted_domains": list(vd.accepted)})
+            if (vd := domains.get(d.source_vocabulary_id)) is not None else d
+            for d in decisions
+        ]
     edits: dict[tuple[str, str], dict[str, str]] = {}
     for svid in sorted({d.source_vocabulary_id for d in decisions}):
         csv_path = ws.mappings_dir / _csv_name(svid)  # only the files export_review wrote
@@ -276,7 +314,7 @@ def import_review(
             for row in _read_csv(csv_path):
                 if row.get("source_vocabulary_id", "") == svid:
                     edits[(svid, row.get("source_code", ""))] = row
-    return [
+    out = [
         (
             _apply_edit(d, edits[(d.source_vocabulary_id, d.source_code)], conn, schemas)
             if (d.source_vocabulary_id, d.source_code) in edits
@@ -284,3 +322,33 @@ def import_review(
         )
         for d in decisions
     ]
+    if domains:  # every decision, edited or kept, against the domains the spec accepts now
+        out = [recheck(d, vd.auto_approve) if (vd := domains.get(d.source_vocabulary_id)) is not None else d
+               for d in out]
+    return out
+
+
+# methods whose APPROVED status was given automatically (a reviewer's choice is 'manual')
+_AUTOMATIC = ("exact", "lexical", "llm")
+
+
+def recheck(d: MappingDecision, auto_approve: bool = True) -> MappingDecision:
+    """A decision against the domains its term accepts now (``accepted_domains``, refreshed from the
+    current spec, e.g. after ``route_by_domain: false`` or a redesign): a concept of a domain the
+    field no longer accepts is FLAGGED, so it is not loaded (the concept is kept and named in the
+    rationale); an automatic approval of a source vocabulary whose fields expect different domains
+    (``auto_approve`` False) becomes UNCHECKED, as such a term is when it is mapped. A person's
+    choice stays approved unless its domain is no longer accepted. Idempotent."""
+    if not d.target_concept_id or d.status not in ("APPROVED", "UNCHECKED"):
+        return d
+    accepted = accepted_domains(d)
+    domain = (d.target_domain_id or "").strip()
+    if accepted and domain and domain.lower() not in {a.lower() for a in accepted}:
+        expected = accepted[0] if len(accepted) == 1 else ", ".join(accepted[:-1]) + " or " + accepted[-1]
+        return d.model_copy(update={"status": "FLAGGED", "rationale": (
+            f"concept {d.target_concept_id} ({d.target_concept_name or 'unnamed'}) is in domain {domain}, which the "
+            f"field no longer accepts ({expected}) since the ETL design changed: choose another concept, or 0 for "
+            "no mapping. " + (d.rationale or "")).strip()})
+    if not auto_approve and d.status == "APPROVED" and d.method in _AUTOMATIC:
+        return d.model_copy(update={"status": "UNCHECKED", "rationale": (d.rationale or "") + MIXED_DOMAINS_NOTE})
+    return d

@@ -81,11 +81,14 @@ def _run(job: Job, cfg, ws: Workspace, store: JobStore) -> None:
             else f"{len(report.blocking_failures)} blocking data-quality check(s) failed; see the report."
         )
         if report.passed:
-            from ..report.inspection import review_caveats
+            from ..report.inspection import nonblocking_notes, review_caveats
 
             caveats = review_caveats(cfg, ws)
             if caveats:
                 job.message += " Not fully reviewed: " + "; ".join(caveats) + "."
+            notes = nonblocking_notes(ws)  # a route or era step that failed without failing the build
+            if notes:
+                job.message += " " + "; ".join(notes) + "."
     except PipelineStopped as e:
         job.status, job.stage = "waiting_review", e.stage
         what = GATE_PHRASES.get(e.stage or "", "artifacts")

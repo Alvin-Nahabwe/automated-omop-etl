@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,7 +26,14 @@ from omop_agent.models import (
     TableProfile,
 )
 from omop_agent.quality import dqd_r
-from omop_agent.quality.checks import etl_checks, gate, run_builtin_checks, translate_sqlrender
+from omop_agent.quality.checks import (
+    etl_checks,
+    gate,
+    is_listed_check,
+    repairable,
+    run_builtin_checks,
+    translate_sqlrender,
+)
 from omop_agent.quality.repair import (
     RepairState,
     build_repair_prompt,
@@ -33,6 +41,7 @@ from omop_agent.quality.repair import (
     redact_error,
     repair_spec,
     repair_triggers,
+    validate_mapping,
 )
 from omop_agent.workspace import Workspace
 
@@ -137,6 +146,315 @@ def test_etl_checks_and_gate(tmp_path):
     assert gate(results[:4], cfg) == (True, [])
 
 
+def test_etl_check_keys_carry_the_step_label(tmp_path):
+    etl = ETLRunResult(started_at=NOW, steps=[
+        TableLoadResult(target_table="measurement", step="09_measurement", kind="insert", rows_inserted=90,
+                        source_rows=100, retained_rows=90),
+        TableLoadResult(target_table="measurement", step="10_measurement_2", kind="insert", rows_inserted=50,
+                        source_rows=50, retained_rows=50),
+        TableLoadResult(target_table="drug_exposure", step="11_custom_fix_dates", kind="custom", error="boom"),
+    ])
+    results = etl_checks(etl)
+    assert [r.key for r in results] == [
+        "etlRecordRetention.measurement",  # one mapping into a table: the key is unchanged
+        "etlRecordRetention.measurement.measurement_2",
+        "etlStepError.drug_exposure.custom_fix_dates",
+    ]
+    assert [r.step for r in results] == ["measurement", "measurement_2", "custom_fix_dates"]
+    assert len({r.key for r in results}) == len(results)
+    # a check name or a key prefix still selects every step of the table
+    assert all(is_listed_check(r, ["etlRecordRetention.measurement"]) for r in results[:2])
+    # the step label only extends ETL-level keys
+    field = CheckResult(check_name="isRequired", check_level="FIELD", table="person", field="year_of_birth",
+                        description="d", step="person_2")
+    assert field.key == "isRequired.person.year_of_birth"
+
+
+def test_non_blocking_and_generated_step_errors(tmp_path):
+    cfg = plain_config(tmp_path)
+    era = TableLoadResult(target_table="drug_era", step="19_drug_era", kind="derived", blocking=False,
+                          error="relation concept_ancestor does not exist")
+    person = TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=10, source_rows=10)
+    etl = ETLRunResult(started_at=NOW, steps=[person, era])
+    assert etl.ok and etl.errors() == [era] and etl.blocking_errors() == []
+    results = etl_checks(etl)
+    err = next(r for r in results if r.check_name == "etlStepError")
+    assert err.severity == "convention" and err.repairable is False and err.step == "drug_era"
+    assert gate(results, cfg, etl) == (True, [])  # reported, not blocking
+    dq = DQReport(run_at=NOW, passed=True, results=results)
+    assert repair_triggers(dq, etl, cfg) == ([], [])  # never sent to the repair agent
+
+    # a generated step that fails blocks the build, but the agent cannot fix it
+    prune = TableLoadResult(target_table="person_map_prune", step="04_person_map_prune", kind="prune", error="x")
+    etl = ETLRunResult(started_at=NOW, steps=[person, prune])
+    assert not etl.ok and etl.blocking_errors() == [prune]
+    passed, blocking = gate(etl_checks(etl), cfg, etl)
+    assert not passed and blocking[0].startswith("etlStepError.person_map_prune (fatal)")
+    assert next(r for r in etl_checks(etl) if r.check_name == "etlStepError").repairable is False
+    assert repair_triggers(None, etl, cfg) == ([], [])
+    # spec steps are sent; results of older runs (no kind) count as spec steps
+    bad = TableLoadResult(target_table="visit_occurrence", step="05_visit_occurrence", kind="insert", error="y")
+    old = TableLoadResult(target_table="death", step="10_death", error="z")
+    etl = ETLRunResult(started_at=NOW, steps=[person, prune, bad, old])
+    assert repair_triggers(None, etl, cfg) == ([bad, old], [])
+    assert all(r.repairable for r in etl_checks(etl) if r.check_name == "etlStepError" and r.table != "person_map_prune")
+
+
+def test_a_failed_person_load_hides_the_retention_it_causes():
+    etl = ETLRunResult(started_at=NOW, steps=[
+        TableLoadResult(target_table="person", step="03_person", kind="insert", error="division by zero",
+                        source_rows=400),
+        TableLoadResult(target_table="condition_occurrence", step="07_condition_occurrence", kind="insert",
+                        source_rows=1000, retained_rows=0),
+    ])
+    assert [r.key for r in etl_checks(etl)] == ["etlStepError.person"]
+    etl.steps[0] = etl.steps[0].model_copy(update={"error": None, "rows_inserted": 400})
+    assert [r.key for r in etl_checks(etl)] == ["etlRecordRetention.person", "etlRecordRetention.condition_occurrence",
+                                               "etlRecordLoss.condition_occurrence"]
+    # person custom SQL that fails: the pruning retires everyone it did not load, so likewise
+    custom = TableLoadResult(target_table="person", step="04_custom_persons", kind="custom", error="division by zero")
+    etl.steps[1:1] = [custom]
+    assert [r.key for r in etl_checks(etl)] == ["etlStepError.person.custom_persons"]
+    # a failed step of another table does not hide them
+    etl.steps[1] = custom.model_copy(update={"target_table": "death", "step": "10_custom_deaths"})
+    assert "etlRecordLoss.condition_occurrence" in [r.key for r in etl_checks(etl)]
+
+
+def test_required_value_checks():
+    steps = [
+        TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=399, source_rows=400,
+                        id_retained_rows=400, retained_rows=399, value_counts={
+                            "required_null": {"year_of_birth": 1}, "defaulted": {"gender_concept_id": 4},
+                            "row": {"dropped": 1}}),
+        TableLoadResult(target_table="visit_occurrence", step="05_visit_occurrence", kind="insert", rows_inserted=100,
+                        source_rows=100, id_retained_rows=100, retained_rows=100,
+                        value_counts={"defaulted": {"visit_end_date": 70}}),
+        TableLoadResult(target_table="measurement", step="09_measurement_2", kind="insert", rows_inserted=97,
+                        source_rows=110, id_retained_rows=100, retained_rows=95,
+                        value_counts={"required_null": {"measurement_date": 5}, "row": {"dropped": 5}}),
+        # older results: no id_retained_rows, the source rows are the denominator
+        TableLoadResult(target_table="death", step="10_death", rows_inserted=9, source_rows=10, retained_rows=9,
+                        value_counts={"required_null": {"death_date": 1}}),
+    ]
+    results = [r for r in etl_checks(ETLRunResult(started_at=NOW, steps=steps))
+               if r.check_name in ("etlRequiredFieldNull", "etlDefaultedValue")]
+    assert [(r.key, r.num_violated_rows, r.num_denominator_rows, r.threshold_pct, r.failed) for r in results] == [
+        # a person dropped for a missing birth year fails at once: their records go with them
+        ("etlRequiredFieldNull.person.year_of_birth", 1, 400, 0.0, True),
+        ("etlDefaultedValue.person.gender_concept_id", 4, 400, 5.0, False),
+        ("etlDefaultedValue.visit_occurrence.visit_end_date", 70, 100, 5.0, True),
+        ("etlRequiredFieldNull.measurement.measurement_date.measurement_2", 5, 100, 5.0, False),  # exactly 5%
+        ("etlRequiredFieldNull.death.death_date", 1, 10, 5.0, True),
+    ]
+    assert all(r.severity == "convention" and r.check_level == "ETL" and r.repairable is None for r in results)
+    assert "became 0 (no matching concept)" in results[1].description
+    assert "took the start date (visit_start_date)" in results[2].description
+    assert "required field person.year_of_birth was NULL" in results[0].description
+    # a failed step reports its error, not its counts
+    failed = steps[1].model_copy(update={"error": "boom"})
+    assert [r.check_name for r in etl_checks(ETLRunResult(started_at=NOW, steps=[failed]))] == ["etlStepError"]
+    sev = {"fatal", "convention"}
+    assert [repairable(r, sev) for r in results] == [True, False, True, False, True]
+
+
+def test_conversion_checks():
+    steps = [
+        TableLoadResult(target_table="visit_occurrence", step="05_visit_occurrence", kind="insert", rows_inserted=95,
+                        source_rows=100, id_retained_rows=100, retained_rows=95, value_counts={
+                            "invalid": {"visit_start_date": 5, "visit_source_value": 50, "where": 3},
+                            "required_null": {"visit_start_date": 5}, "row": {"dropped": 5},
+                            "imputed": {"visit_start_date": 2}, "partial_null": {"visit_start_date": 1},
+                            "offset_ignored": {"visit_start_datetime": 7}}),
+        TableLoadResult(target_table="measurement", step="09_measurement", kind="insert", rows_inserted=100,
+                        source_rows=100, id_retained_rows=100, retained_rows=100,
+                        value_counts={"invalid": {"value_as_number": 40, "measurement_date": 4},
+                                      "required_null": {"measurement_date": 4}, "row": {"dropped": 4},
+                                      "partial_null": {"measurement_date": 30}}),
+        TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=10, source_rows=10,
+                        id_retained_rows=10, retained_rows=10, value_counts={
+                            "invalid": {"year_of_birth": 1}, "required_null": {"year_of_birth": 1},
+                            "imputed": {"birth_datetime": 3}, "partial_null": {"birth_datetime": 2}}),
+        # a required end date none of whose rows was NULL: the expression fell back (start + COALESCE(days, 1) - 1)
+        TableLoadResult(target_table="drug_exposure", step="08_drug_exposure", kind="insert", rows_inserted=10,
+                        source_rows=10, id_retained_rows=10, retained_rows=10,
+                        value_counts={"invalid": {"drug_exposure_end_date": 2}}),
+    ]
+    results = [r for r in etl_checks(ETLRunResult(started_at=NOW, steps=steps))
+               if r.check_name in ("etlInvalidValue", "etlPartialDate")]
+    assert [(r.key, r.severity, r.num_violated_rows, r.num_denominator_rows, r.threshold_pct, r.failed)
+            for r in results] == [
+        # dates and required fields: convention at 5%; other fields and the WHERE: characterization
+        ("etlInvalidValue.visit_occurrence.visit_source_value", "characterization", 50, 100, 5.0, True),
+        ("etlInvalidValue.visit_occurrence.visit_start_date", "convention", 5, 100, 5.0, False),
+        ("etlInvalidValue.visit_occurrence.where", "characterization", 3, 103, 5.0, False),
+        ("etlPartialDate.visit_occurrence.visit_start_date", "characterization", 3, 100, 100.0, False),
+        ("etlInvalidValue.measurement.measurement_date", "convention", 4, 100, 5.0, False),
+        ("etlInvalidValue.measurement.value_as_number", "characterization", 40, 100, 5.0, True),
+        # partial dates are reported, never failed
+        ("etlPartialDate.measurement.measurement_date", "characterization", 30, 100, 100.0, False),
+        ("etlInvalidValue.person.year_of_birth", "convention", 1, 10, 5.0, True),
+        ("etlPartialDate.person.birth_datetime", "characterization", 5, 10, 100.0, False),
+        ("etlInvalidValue.drug_exposure.drug_exposure_end_date", "characterization", 2, 10, 5.0, True),
+    ]
+    by = {r.key: r for r in results}
+    assert "took the first day" in by["etlPartialDate.visit_occurrence.visit_start_date"].description
+    assert "could not complete were left NULL" in by["etlPartialDate.visit_occurrence.visit_start_date"].description
+    assert "15th" in by["etlPartialDate.measurement.measurement_date"].description
+    assert "THEMIS" in by["etlPartialDate.person.birth_datetime"].description
+    assert "etlRequiredFieldNull" in by["etlInvalidValue.person.year_of_birth"].description
+    assert "out of visit_occurrence" in by["etlInvalidValue.visit_occurrence.where"].description
+    end = by["etlInvalidValue.drug_exposure.drug_exposure_end_date"].description
+    assert "no row was left with this required field NULL" in end and "etlRequiredFieldNull" not in end
+    # only convention failures go to the repair agent; offsets are not checks
+    sev = {"fatal", "convention"}
+    assert [r.key for r in results if repairable(r, sev)] == ["etlInvalidValue.person.year_of_birth"]
+    assert not any("offset" in r.key or r.field == "visit_start_datetime" for r in results)
+    # a share above 1 (several conversions in one value) is capped
+    many = steps[2].model_copy(update={"value_counts": {"invalid": {"year_of_birth": 25}}})
+    (r,) = [x for x in etl_checks(ETLRunResult(started_at=NOW, steps=[many])) if x.check_name == "etlInvalidValue"]
+    assert (r.num_violated_rows, r.pct_violated_rows) == (25, 1.0)
+
+
+def test_conversion_checks_escalate_and_follow_the_config():
+    from omop_agent.config import EtlConfig
+    from omop_agent.quality.repair import _check_summary
+
+    drugs = TableLoadResult(target_table="drug_exposure", step="08_drug_exposure", kind="insert", rows_inserted=100,
+                            source_rows=100, id_retained_rows=100, retained_rows=100,
+                            value_counts={"invalid": {"quantity": 60, "sig": 3}})
+    by = {r.key: r for r in etl_checks(ETLRunResult(started_at=NOW, steps=[drugs]))}
+    # most values of an optional number unreadable: the expression is wrong, so the repair agent gets it
+    q = by["etlInvalidValue.drug_exposure.quantity"]
+    assert (q.severity, q.threshold_pct, q.failed) == ("convention", 50.0, True) and "probably wrong" in q.description
+    assert repairable(q, {"fatal", "convention"})
+    assert by["etlInvalidValue.drug_exposure.sig"].severity == "characterization"
+    # the rule the build applied: etl.partial_dates, THEMIS, or a field that is not a date
+    step = TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=10, source_rows=10,
+                           id_retained_rows=10, retained_rows=10, value_counts={
+                               "partial_null": {"day_of_birth": 2, "year_of_birth": 1}})
+    visit = TableLoadResult(target_table="visit_occurrence", step="05_visit_occurrence", kind="insert",
+                            rows_inserted=10, source_rows=10, id_retained_rows=10, retained_rows=10,
+                            value_counts={"partial_null": {"visit_start_date": 4}})
+    texts = {r.key: r.description for r in etl_checks(ETLRunResult(started_at=NOW, steps=[step, visit]),
+                                                      etl=EtlConfig(partial_dates="reject"))}
+    assert "THEMIS" in texts["etlPartialDate.person.day_of_birth"]
+    assert "etl.partial_dates: reject" in texts["etlPartialDate.visit_occurrence.visit_start_date"]
+    assert "first day" not in texts["etlPartialDate.visit_occurrence.visit_start_date"]
+    texts = {r.key: r.description for r in etl_checks(ETLRunResult(started_at=NOW, steps=[step, visit]))}
+    assert "etl.partial_dates" not in texts["etlPartialDate.person.day_of_birth"]
+    assert "first day" in texts["etlPartialDate.visit_occurrence.visit_start_date"]
+    # the descriptions give counts only as "<n> of <rows> rows", which the repair prompt can suppress
+    small = TableLoadResult(target_table="measurement", step="09_measurement", kind="insert", rows_inserted=4,
+                            source_rows=4, id_retained_rows=4, retained_rows=4,
+                            value_counts={"invalid": {"measurement_date": 2, "where": 1}, "imputed": {"measurement_date": 1},
+                                          "partial_null": {"measurement_date": 1}})
+    for r in etl_checks(ETLRunResult(started_at=NOW, steps=[small])):
+        if r.check_name in ("etlInvalidValue", "etlPartialDate"):
+            _, text = _check_summary(r, 5)
+            assert f"{r.num_violated_rows} of {r.num_denominator_rows}" not in text and "<5 of" in text, text
+            assert not re.search(r"\b\d+ (values|were|rows)\b", re.sub(r"<5 of (<5|\d+) rows", "", text)), text
+
+
+def test_rows_the_where_could_not_decide_are_lost_records():
+    """A WHERE that reads an unreadable value as NULL leaves the row out; the count queries use the
+    same filter, so those rows are added back as dropped: etlRecordRetention and the fatal
+    etlRecordLoss see them."""
+    cfg = ProjectConfig.model_validate({"name": "t", "source": {"type": "csv", "path": "."},
+                                        "target": {"url": "postgresql://unused"}})
+    empty = TableLoadResult(target_table="condition_occurrence", step="07_condition_occurrence", kind="insert",
+                            rows_inserted=0, source_rows=0, id_retained_rows=0, retained_rows=0,
+                            value_counts={"invalid": {"where": 641}})
+    results = {r.key: r for r in etl_checks(ETLRunResult(started_at=NOW, steps=[empty]))}
+    kept = results["etlRecordRetention.condition_occurrence"]
+    assert (kept.num_violated_rows, kept.num_denominator_rows, kept.failed) == (641, 641, True)
+    assert "could not decide" in kept.description
+    assert results["etlRecordLoss.condition_occurrence"].severity == "fatal"
+    passed, blocking = gate(list(results.values()), cfg)
+    assert not passed and any("etlRecordLoss" in b for b in blocking)
+    part = empty.model_copy(update={"source_rows": 449, "id_retained_rows": 449, "retained_rows": 449,
+                                    "rows_inserted": 449, "value_counts": {"invalid": {"where": 192}}})
+    kept = next(r for r in etl_checks(ETLRunResult(started_at=NOW, steps=[part])) if r.check_name == "etlRecordRetention")
+    assert (kept.num_violated_rows, kept.num_denominator_rows, kept.failed) == (192, 641, True)
+    assert repairable(kept, {"fatal", "convention"})
+
+
+def test_rows_loaded_leaves_out_the_id_maps():
+    etl = ETLRunResult(started_at=NOW, steps=[
+        TableLoadResult(target_table="person_map", step="01_person_map", kind="id_map", rows_inserted=400),
+        TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=390),
+        TableLoadResult(target_table="person_map_prune", step="04_person_map_prune", kind="prune", rows_inserted=10),
+        TableLoadResult(target_table="death", step="10_death", kind="insert", error="boom"),
+        TableLoadResult(target_table="cdm_source", step="20_cdm_source", kind="metadata", rows_inserted=1),
+    ])
+    assert etl.rows_loaded() == 391  # the keys the maps added or retired are not CDM rows
+
+
+def test_repairable():
+    sev = {"fatal", "convention"}
+
+    def res(**kw):
+        base = dict(check_name="isRequired", check_level="FIELD", table="person", description="d",
+                    severity="fatal", failed=True)
+        return CheckResult(**{**base, **kw})
+
+    assert repairable(res(), sev)
+    assert repairable(res(failed=False, error="column does not exist"), sev)
+    assert not repairable(res(failed=False), sev)
+    assert not repairable(res(not_applicable=True), sev)
+    assert not repairable(res(severity="characterization"), sev)
+    assert not repairable(res(repairable=False), sev)
+    assert repairable(res(repairable=True), sev)
+    # an era table the spec loads is repaired like any other; one the build derived is not
+    assert repairable(res(table="drug_era"), sev) and repairable(res(table="condition_era"), sev)
+    assert not repairable(res(table="drug_era"), sev, derived={"drug_era"})
+    assert repairable(res(table="condition_era"), sev, derived={"drug_era"})
+    completeness = res(check_name="measurePersonCompleteness", check_level="TABLE", table="observation")
+    assert repairable(completeness, sev)
+    assert not repairable(completeness, sev, route_only={"observation"})
+    assert repairable(res(table="observation"), sev, route_only={"observation"})
+
+
+def test_score_and_repairable_ignore_non_blocking_and_generated_failures(tmp_path):
+    from omop_agent.pipeline import Pipeline
+
+    cfg = plain_config(tmp_path)
+    cfg = cfg.model_copy(update={"llm": cfg.llm.model_copy(update={"provider": "none"})})
+    p = Pipeline(cfg, log=lambda m: None)
+
+    def report(etl: ETLRunResult) -> DQReport:
+        results = etl_checks(etl)
+        passed, blocking = gate(results, cfg, etl)
+        return DQReport(run_at=NOW, passed=passed, results=results, blocking_failures=blocking)
+
+    person = TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=10, source_rows=10)
+    clean = ETLRunResult(started_at=NOW, steps=[person])
+    # a non-blocking step's error is reported (convention, not repairable): it neither lowers the
+    # score of a build nor keeps the repair loop going
+    era = TableLoadResult(target_table="drug_era", step="19_drug_era", kind="derived", blocking=False,
+                          error="relation concept_ancestor does not exist")
+    with_era = ETLRunResult(started_at=NOW, steps=[person, era])
+    assert any(r.check_name == "etlStepError" and r.severity == "convention" for r in report(with_era).results)
+    assert p._score(with_era, report(with_era)) == p._score(clean, report(clean))
+    assert p._score(with_era, None) == p._score(clean, None)
+    assert not p._repairable(report(with_era)) and not p._repairable(report(clean))
+    # a blocking spec step that failed lowers the score and is given to the agent
+    death = TableLoadResult(target_table="death", step="10_death", kind="insert", error="boom")
+    broken = ETLRunResult(started_at=NOW, steps=[person, death])
+    assert p._score(broken, report(broken)) < p._score(clean, report(clean))
+    assert p._score(broken, None) < p._score(clean, None)
+    assert p._repairable(report(broken))
+
+
+def test_old_etl_results_still_load():
+    old = ETLRunResult.model_validate({"started_at": "2026-01-01T00:00:00Z", "steps": [
+        {"target_table": "person", "step": "03_person", "rows_inserted": 3, "source_rows": 3, "retained_rows": 3},
+        {"target_table": "death", "step": "10_death", "error": "boom"},
+    ]})
+    assert [(s.kind, s.blocking, s.id_retained_rows, s.value_counts, s.stats, s.moved, s.skipped) for s in old.steps] == [
+        (None, True, None, {}, {}, [], None)] * 2
+    assert not old.ok and old.blocking_errors() == old.errors()
+
+
 def test_redact_error():
     msg = redact_error(NOT_NULL_ERROR + " DETAIL: Failing row contains (1, 2, 9202, 2019-04-22, null).", "INSERT ...")
     assert msg == NOT_NULL_ERROR + " DETAIL: (withheld: may contain record values)"
@@ -160,6 +478,9 @@ def test_redact_error():
     assert redact_error('relation "cdm_x.person" does not exist', known={"cdm_x"}) == 'relation "cdm_x.person" does not exist'
     assert redact_error('relation "KH01.person" does not exist') == 'relation "<value withheld>" does not exist'
     assert redact_error('relation "visit_occurrence" does not exist') == 'relation "visit_occurrence" does not exist'
+    # ETL tables are known by name; the generic column names of the build's bookkeeping tables are not
+    assert redact_error('relation "person_map_retired" does not exist') == 'relation "person_map_retired" does not exist'
+    assert redact_error('relation "value" does not exist') == 'relation "<value withheld>" does not exist'
     assert redact_error('column "sex" does not exist', known={"sex"}) == 'column "sex" does not exist'
     assert redact_error('column "Sex" does not exist', known={"sex"}) == 'column "<value withheld>" does not exist'
     # HINT text is redacted the same way
@@ -541,6 +862,8 @@ def test_count_records_refusals(repair_env):
     # the id maps are never counted; the source_to_concept_map is
     refused({"table": "etl.person_map"}, "etl.person_map")
     refused({"table": "etl.visit_map", "group_by": ["person_source_value"]})
+    refused({"table": "etl.person_map_retired"}, "etl.person_map_retired")
+    refused({"table": "etl.visit_map_retired"})
     assert count({"table": "etl.source_to_concept_map"}).startswith("etl.source_to_concept_map: n")
     # only known tables, as <schema>.<table>
     assert count({"table": "individuals"}).startswith("ERROR: table must be '<schema>.<table>'")
@@ -616,6 +939,27 @@ def test_count_records_binds_values(repair_env):
         "ERROR: filter on sex: op '=' needs a `value`")
     assert count({"table": "src.individuals", "filters": [{"column": "sex", "op": "in"}]}).startswith("ERROR")
     assert scalar(state.conn, f"SELECT COUNT(*) FROM {qi(state.schemas.src)}.individuals") == 400
+
+
+@pytest.mark.postgres
+def test_repair_counts_and_explains_read_dates_as_the_build_does(repair_env):
+    """The agent's counts and its edits' EXPLAIN run under the build's session settings: a
+    month-first date the server's own DateStyle would accept is an error, as in the build."""
+    state, tools = repair_env
+    count = tools["count_records"].invoke
+    assert scalar(state.conn, "SELECT '03/04/2020'::date IS NOT NULL") is True  # the server's DateStyle reads it
+    on = {"table": "cdm.visit_occurrence", "filters": [{"column": "visit_start_date", "op": "=", "value": "03/04/2020"}]}
+    assert count(on).startswith("ERROR: date/time field value out of range")
+    iso = {"table": "cdm.visit_occurrence", "filters": [{"column": "visit_start_date", "op": "=", "value": "2020-03-04"}]}
+    assert count(iso).startswith("cdm.visit_occurrence WHERE visit_start_date = '2020-03-04': n")
+
+    tm = state.spec.mapping_for("death").model_copy(deep=True)
+    fm = next(f for f in tm.fields if f.target_field == "death_date")
+    fm.kind, fm.expression = "expression", "'03/04/2020'::date"
+    error = validate_mapping(tm, state.spec, state.conn, state.schemas, state.cfg)
+    assert error is not None and error.startswith("EXPLAIN failed: date/time field value out of range")
+    fm.expression = "'2020/03/04'::date"  # year first reads the same under every DateStyle
+    assert validate_mapping(tm, state.spec, state.conn, state.schemas, state.cfg) is None
 
 
 @pytest.mark.postgres
@@ -708,6 +1052,67 @@ def test_update_field_mapping_rejects_unsafe_sql(repair_env):
 
 
 @pytest.mark.postgres
+def test_repair_refuses_a_dedup_order_that_draws(repair_env):
+    """random() in a dedup_order would silence etlKeyConflict while the row loaded is a draw."""
+    state, tools = repair_env
+    tm = state.spec.mapping_for("person").model_dump(mode="json")
+    for order in ("random()", "i.sex DESC, random()"):
+        out = tools["replace_table_mapping"].invoke({"target_table": "person", "rationale": "x",
+                                                     "mapping_yaml": yaml.safe_dump({**tm, "dedup_order": order})})
+        assert out.startswith("REJECTED:") and "changes from call to call" in out, out
+    assert state.actions == []
+
+
+@pytest.mark.postgres
+def test_repair_refuses_a_second_mapping_of_the_same_codes(repair_env):
+    """A copy of a mapping for a subset of its rows loads those rows twice, and no check counts
+    records loaded twice (the larger denominators even make rate checks pass): refused. A mapping
+    of another code column of the same table (a secondary diagnosis) adds records: applied."""
+    state, tools = repair_env
+    replace = tools["replace_table_mapping"].invoke
+    tm = state.spec.mapping_for("condition_occurrence").model_dump(mode="json")
+    copy_ = {**copy.deepcopy(tm), "where": "d.dx_date >= '2021-01-01'"}
+    out = replace({"target_table": "condition_occurrence", "mapping_index": 1, "rationale": "x",
+                   "mapping_yaml": yaml.safe_dump(copy_)})
+    assert out.startswith("REJECTED: condition_occurrence mapping #0 already reads the same codes"), out
+    assert "loaded twice" in out and state.actions == []
+    other = copy.deepcopy(tm)
+    for fm in other["fields"]:
+        if fm["expression"] == "d.icd10":
+            fm["expression"] = "upper(d.icd10)"  # stands for another column of codes
+    assert replace({"target_table": "condition_occurrence", "mapping_index": 1, "rationale": "x",
+                    "mapping_yaml": yaml.safe_dump(other)}).startswith("OK:")
+
+
+@pytest.mark.postgres
+def test_identifier_keyed_mappings_stay_editable(repair_env):
+    """A mapping whose person key reads an identifier column (a clinic's patient number, here the
+    phone) loads only the integer person_id: its other fields may still be repaired, as the
+    validator allows. A value field that loads the identifier is still refused, and a column that
+    privacy.not_pii_columns clears is not an identifier, whatever its name."""
+    state, tools = repair_env
+    tm = state.spec.mapping_for("person")
+    key = next(f for f in tm.fields if f.target_field == "person_id")
+    key.expression = "COALESCE(i.individual_id, 'TEL:' || i.phone)"  # as a person designed it
+    update = tools["update_field_mapping"].invoke
+    out = update({"target_table": "person", "target_field": "gender_source_value", "kind": "expression",
+                  "expression": "upper(i.sex)", "rationale": "x"})
+    assert out.startswith("OK:"), out
+    out = update({"target_table": "person", "target_field": "person_source_value", "kind": "expression",
+                  "expression": "i.phone", "rationale": "x"})
+    assert out.startswith("REJECTED:") and "individuals.phone" in out and "never be loaded" in out, out
+    # a name that looks like an identifier, cleared by a person: a value field may load it
+    from omop_agent.quality.repair import _pii_tokens
+
+    loading = tm.model_copy(update={"fields": [f.model_copy(update={"expression": "i.phone"})
+                                               if f.target_field == "person_source_value" else f for f in tm.fields]})
+    assert "individuals.phone" in _pii_tokens(state, loading)
+    state.cfg = state.cfg.model_copy(update={"privacy": state.cfg.privacy.model_copy(
+        update={"not_pii_columns": ["individuals.phone"]})})
+    assert "individuals.phone" not in _pii_tokens(state, loading)
+
+
+@pytest.mark.postgres
 def test_replace_table_mapping(repair_env):
     state, tools = repair_env
     replace = tools["replace_table_mapping"].invoke
@@ -777,6 +1182,94 @@ def test_replace_table_mapping(repair_env):
     assert state.spec.mapping_for("condition_occurrence").where is None
 
 
+@pytest.mark.postgres
+def test_dry_run_guard_rejects_nulling_edit(repair_env):
+    from omop_agent.etl.runner import run_etl
+
+    state, tools = repair_env
+    conn, schemas = state.conn, state.schemas
+    run_etl(conn, schemas, state.spec, state.cfg)  # the id maps, as after the build the repair follows
+    update = tools["update_field_mapping"].invoke
+    before = state.spec
+    opd = int(scalar(conn, f"SELECT COUNT(*) FROM {schemas.src}.clinic_visits WHERE visit_type <> 'IPD'"))
+    # making a required start date NULL would drop records: refused, with the count
+    out = update({"target_table": "visit_occurrence", "target_field": "visit_start_date", "kind": "expression",
+                  "expression": "CASE WHEN v.visit_type = 'IPD' THEN v.visit_date::date END",
+                  "rationale": "only inpatient stays have a reliable date"})
+    assert out.startswith(f"REJECTED: it would drop {opd} rows of visit_occurrence"), out
+    assert "visit_occurrence.visit_start_date becomes NULL" in out
+    assert state.spec is before and state.actions == []
+    # also inside a replaced mapping
+    tm = before.mapping_for("visit_occurrence").model_dump()
+    for fm in tm["fields"]:
+        if fm["target_field"] == "visit_start_date":
+            fm["expression"] = "to_date(v.facility, 'DD/MM/YYYY')"  # the wrong column: no value is a date
+    out = tools["replace_table_mapping"].invoke({"target_table": "visit_occurrence", "mapping_yaml": yaml.safe_dump(tm),
+                                                 "rationale": "x"})
+    assert out.startswith("REJECTED: it would drop") and state.actions == []
+    # an edit that keeps every value is applied; so is one to a field that does not drop rows
+    out = update({"target_table": "visit_occurrence", "target_field": "visit_start_date", "kind": "expression",
+                  "expression": "to_date(v.visit_date, 'YYYY-MM-DD')", "rationale": "explicit template"})
+    assert out.startswith("OK:"), out
+    out = update({"target_table": "visit_occurrence", "target_field": "visit_start_datetime", "kind": "expression",
+                  "expression": "CASE WHEN v.visit_type = 'IPD' THEN v.visit_date::timestamp END", "rationale": "x"})
+    assert out.startswith("OK:"), out
+    # a constant NULL drops every row too
+    out = update({"target_table": "visit_occurrence", "target_field": "visit_start_date", "kind": "constant",
+                  "expression": "NULL", "rationale": "x"})
+    assert out.startswith("REJECTED: it would drop"), out
+    # with the source alias renamed, the old value does not fit the new mapping: the NULLs of each
+    # mapping over its own rows are compared
+    import omop_agent.quality.repair as repair
+
+    current = state.spec.mapping_for("visit_occurrence")
+    renamed = yaml.safe_load(yaml.safe_dump(current.model_dump()).replace("v.", "q."))
+    renamed["source"]["alias"] = "q"
+    for fm in renamed["fields"]:
+        if fm["target_field"] == "visit_start_date":
+            fm["expression"] = "CASE WHEN q.visit_type <> 'IPD' THEN q.visit_date::date END"
+    new_tm = type(current).model_validate(renamed)
+    assert repair.drop_guard(current, new_tm, state.spec, conn, schemas, state.cfg).startswith(
+        "it would drop"), "alias rename"
+    # a count that cannot run (or times out) lets the edit through: the build history still guards
+    broken = current.model_copy(update={"fields": [
+        f.model_copy(update={"expression": "v.no_such_column::date"}) if f.target_field == "visit_start_date" else f
+        for f in current.fields]})
+    assert repair.drop_guard(broken, new_tm, state.spec, conn, schemas, state.cfg) is None
+
+
+@pytest.mark.postgres
+def test_dry_run_guard_rejects_invented_values(repair_env):
+    """A required field whose NULL drops the row must not get a value the source does not hold: a
+    fallback onto a literal birth year, a constant or the build date brings back people (deaths)
+    the CDM convention leaves out. A fallback onto another source column is a fix."""
+    from omop_agent.etl.runner import run_etl
+
+    state, tools = repair_env
+    run_etl(state.conn, state.schemas, state.spec, state.cfg)
+    update = tools["update_field_mapping"].invoke
+    before = state.spec
+    for table, field, kind, expression in [
+        ("person", "year_of_birth", "expression", "COALESCE(EXTRACT(YEAR FROM to_date(i.dob, 'DD/MM/YYYY'))::int, 1900)"),
+        ("person", "year_of_birth", "constant", "1900"),
+        ("death", "death_date", "expression", "COALESCE(x.dod::date, CURRENT_DATE)"),
+        ("death", "death_date", "expression", "CASE WHEN x.dod IS NULL THEN DATE '2000-01-01' ELSE x.dod::date END"),
+        ("visit_occurrence", "visit_start_date", "expression", "COALESCE(v.visit_date::date, now()::date)"),
+    ]:
+        out = update({"target_table": table, "target_field": field, "kind": kind, "expression": expression,
+                      "rationale": "fill the missing values"})
+        assert out.startswith(f"REJECTED: it would give {table}.{field} a value of its own"), (expression, out)
+        assert state.spec is before and state.actions == []
+    # another source column, or another layout of the same column, is read from the source: applied
+    out = update({"target_table": "visit_occurrence", "target_field": "visit_start_date", "kind": "expression",
+                  "expression": "COALESCE(v.visit_date::date, v.discharge_date::date)", "rationale": "x"})
+    assert out.startswith("OK:"), out
+    out = update({"target_table": "person", "target_field": "year_of_birth", "kind": "expression",
+                  "expression": "EXTRACT(YEAR FROM COALESCE(to_date(i.dob, 'DD/MM/YYYY'), to_date(i.dob, 'YYYY-MM-DD')))::int",
+                  "rationale": "x"})
+    assert out.startswith("OK:"), out
+
+
 def test_repair_prompt_suppresses_small_counts(tmp_path):
     cfg = plain_config(tmp_path)
     spec = load_ref()
@@ -800,6 +1293,27 @@ def test_repair_prompt_suppresses_small_counts(tmp_path):
                            error='invalid input syntax for type date: "31/02/1990"')
     prompt = build_repair_prompt(spec, 1, [step], [], cfg)
     assert "source rows: <5" in prompt and "31/02/1990" not in prompt and '"<value withheld>"' in prompt
+
+
+def test_repair_prompt_shows_a_long_insert_from_its_source_rows(tmp_path):
+    from omop_agent.db import Schemas
+    from omop_agent.etl.compiler import compile_table
+
+    cfg = plain_config(tmp_path)
+    spec = load_ref()
+    sql = compile_table(spec.mapping_for("visit_occurrence"), spec,
+                        Schemas(cdm="cdm", vocab="vocab", src="src", etl="etl", results="results"))
+    assert len(sql) > 1500 and sql.index("discharge_date") > 1500  # the expressions are in the last layer
+    defaulted = CheckResult(check_name="etlDefaultedValue", check_level="ETL", table="visit_occurrence",
+                            field="visit_end_date", description="d", severity="convention", num_violated_rows=70,
+                            num_denominator_rows=100, pct_violated_rows=0.7, threshold_pct=5, failed=True, sql=sql)
+    prompt = build_repair_prompt(spec, 1, [], [defaulted], cfg)
+    shown = prompt.split("check SQL:\n```sql\n", 1)[1].split("```", 1)[0]
+    assert shown.startswith("-- (the INSERT column list and the outer SELECTs are left out)\n-- 1) the source rows")
+    assert "v.discharge_date" in shown and "FROM src.clinic_visits v" in shown
+    # a short statement is shown as it is
+    short = defaulted.model_copy(update={"sql": "SELECT 1"})
+    assert "check SQL:\n```sql\nSELECT 1\n```" in build_repair_prompt(spec, 1, [], [short], cfg)
 
 
 @pytest.mark.postgres

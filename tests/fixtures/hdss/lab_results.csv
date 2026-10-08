@@ -1,0 +1,8 @@
+lab_id,individual_id,patient_no,visit_ref,test_date,test,result,unit
+L01,H01,,1001,2021-03-01,MRDT,POS,
+L02,H01,,1001,2021-03-01,HB,11.5,g/dL
+L03,H02,,1004,2019-07-10,MRDT,NEG,
+L04,H03,,1005,2018-02-02,PREG,POS,
+L05,,P002,1015,2020-06-06,HB,9.8,g/dL
+L06,H06,,1006,2015-05-05,HB,12.0,g/dL
+L07,H09,,1013,2020-01-02,HB,13.1,g/dL
