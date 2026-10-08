@@ -30,7 +30,7 @@ RUN --mount=type=secret,id=extra_ca,required=false \
     sh /tmp/install_r_dqd.sh \
     && apt-get purge -y --auto-remove r-base-dev \
     && rm -rf /var/lib/apt/lists/* /tmp/install_r_dqd.sh /tmp/Rtmp* \
-    && Rscript -e 'stopifnot(all(vapply(c("DatabaseConnector","Achilles","DataQualityDashboard"), requireNamespace, logical(1), quietly=TRUE)))'
+    && Rscript -e 'for (p in c("DatabaseConnector", "Achilles", "DataQualityDashboard")) tryCatch(loadNamespace(p), error = function(e) stop(p, " does not load after removing the compilers: ", conditionMessage(e)))'
 
 WORKDIR /src
 COPY pyproject.toml README.md ./
