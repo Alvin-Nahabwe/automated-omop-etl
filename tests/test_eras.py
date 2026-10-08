@@ -65,10 +65,10 @@ from omop_agent.report.inspection import (
     render_markdown,
 )
 from omop_agent.workspace import Workspace
-from tests.conftest import FIXTURES
-from tests.test_etl import S, check_step_invariants, count, fixed_ref, load_ref, step
-from tests.test_quality import plain_config
-from tests.test_report import full_ws  # noqa: F401 (fixture)
+from conftest import FIXTURES
+from test_etl import S, check_step_invariants, count, fixed_ref, load_ref, step
+from test_quality import plain_config
+from test_report import full_ws  # noqa: F401 (fixture)
 
 NOW = datetime(2024, 1, 1, tzinfo=timezone.utc)
 D = date.fromisoformat

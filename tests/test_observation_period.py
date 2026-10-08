@@ -31,8 +31,8 @@ from omop_agent.quality.repair import (
     validate_mapping,
 )
 from omop_agent.report.inspection import _etl_section, _release_basis, characterize_cdm
-from tests.test_etl import S, count, fixed_ref, load_ref, set_field, step
-from tests.test_quality import NOW, _profile, plain_config
+from test_etl import S, count, fixed_ref, load_ref, set_field, step
+from test_quality import NOW, _profile, plain_config
 
 OPEN_FROM = date(2099, 1, 1)
 DQD_OVERLAP = """SELECT COUNT(DISTINCT a.person_id) FROM {cdm}.observation_period a

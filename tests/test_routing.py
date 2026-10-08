@@ -50,8 +50,8 @@ from omop_agent.vocab.mapper import (
     _validate_row,
 )
 from omop_agent.workspace import Workspace
-from tests.test_etl import S, check_step_invariants, count, fixed_ref, load_ref, set_field, step
-from tests.test_quality import plain_config
+from test_etl import S, check_step_invariants, count, fixed_ref, load_ref, set_field, step
+from test_quality import plain_config
 
 NOW = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
@@ -520,7 +520,7 @@ def test_reapplied_review_edits_use_the_current_spec(tmp_path, monkeypatch):
 
     from omop_agent.pipeline import Pipeline
     from omop_agent.vocab import mapper
-    from tests.test_etl import FIXTURES
+    from test_etl import FIXTURES
 
     cfg = plain_config(tmp_path)
     p = Pipeline(cfg, log=lambda _: None)
@@ -1278,7 +1278,7 @@ def test_one_retrieval_for_all_accepted_domains(staged, monkeypatch, pool):
 def test_off_domain_choice_is_unchecked_not_flagged(staged):
     from omop_agent.models import SourceTerm
     from omop_agent.vocab.mapper import map_terms
-    from tests.test_vocab import CapturingLLM
+    from test_vocab import CapturingLLM
 
     conn, schemas, cfg = staged
     routed = SourceTerm(source_vocabulary_id="SRC_X", source_code="RTA", source_name="Road traffic accident",

@@ -28,9 +28,9 @@ from omop_agent.quality.repair import repair_triggers
 from omop_agent.report.inspection import build_report
 from omop_agent.vocab.loader import load_athena
 from omop_agent.workspace import Workspace
-from tests import hdss_cases as hc
-from tests.hdss_cases import D
-from tests.conftest import DB_URL, FIXTURE_VOCAB, FIXTURES, _drop, _new_schemas
+import hdss_cases as hc
+from hdss_cases import D
+from conftest import DB_URL, FIXTURE_VOCAB, FIXTURES, _drop, _new_schemas
 
 pytestmark = pytest.mark.postgres
 

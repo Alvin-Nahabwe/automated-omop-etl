@@ -15,8 +15,8 @@ from omop_agent.etl.runner import _refuse_unsafe, run_etl
 from omop_agent.models import CustomSQL, ETLRunResult, FieldMapping, TableLoadResult, TableMapping
 from omop_agent.quality.checks import etl_checks, gate, run_builtin_checks
 from omop_agent.quality.repair import _mapping_diff, _same_mapping_logic, data_loss_issues, identity_issues
-from tests.test_etl import S, count, fixed_ref, id_map, set_field
-from tests.test_quality import repair_env as repair_env  # a fixture
+from test_etl import S, count, fixed_ref, id_map, set_field
+from test_quality import repair_env as repair_env  # a fixture
 
 EMR_KEY = "COALESCE({a}.hdss_id, 'EMR:' || {a}.patient_no)"
 
