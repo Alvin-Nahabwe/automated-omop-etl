@@ -10,6 +10,10 @@
 
 > **Not fully reviewed:** {{ verdict_caveats|map('md')|join('; ') }}. The data-quality checks passed, but a person still needs to review this before the CDM is used.
 {% endif %}
+{% if verdict_notes %}
+
+> **Steps that failed without failing the build:** {{ verdict_notes|map('md')|join('; ') }}.
+{% endif %}
 
 | | |
 |---|---|
@@ -72,17 +76,19 @@ _Not run: no state.json in the workspace._
 _None detected._
 {% endif %}
 
-**Date formats detected**
-{% if source.date_formats %}
+**Reading the values** (date formats, and the profile's scan of each whole column)
+{% if source.reading %}
 
-| Column | Format | Type |
-|---|---|---|
-{% for d in source.date_formats %}
-| {{ d.table|md }}.{{ d.column|md }} | {{ d.format|md }} | {{ d.type }} |
+| Column | Type | Format | Shapes | Do not fit | Their shapes | Partial dates | Offsets | NA markers | Notes |
+|---|---|---|---|--:|---|--:|---|--:|---|
+{% for d in source.reading %}
+| {{ d.table|md }}.{{ d.column|md }} | {{ d.type }} | {{ d.format|md }} | {{ d.shapes|md }} | {{ d.nonconforming|md }} | {{ d.nonconforming_shapes|md }} | {{ d.partial|md }} | {{ d.offsets|md }} | {{ d.na_markers|md }} | {{ d.notes|md }} |
 {% endfor %}
+
+A shape writes a value with 9 for each digit and a / A for each letter. Do not fit: values that do not fit the column's type or format (the build reads them as NULL and counts them). Partial dates have an unknown day or month, or no day; the build completes or rejects them as `etl.partial_dates` says. Offsets: the time zone offsets written after the times (`etl.timezone` decides how the build reads them). NA markers: values staged as NULL (`source.na_values`). Counts below {{ source.min_cell_count }} are shown as "&lt;{{ source.min_cell_count }}"; direct identifiers are left out.
 {% else %}
 
-_None detected._
+_Nothing to report: no dates, and every value fits its column's type._
 {% endif %}
 {% else %}
 _Not run: no profile.json in the workspace._
@@ -105,7 +111,13 @@ _None._
 ## 4. ETL design
 
 {% if design %}
-{{ design.n_mappings }} table mappings, {{ design.n_fields }} field mappings, CDM {{ design.cdm_version|md }}. Person key: {{ design.person_key|md }}{% if design.person_key_also %} (also from: {{ design.person_key_also|md }}){% endif %}. Visit key: {{ design.visit_key|md if design.visit_key else 'none' }}{% if design.visit_key_also %} (also from: {{ design.visit_key_also|md }}){% endif %}. Observation period: {{ design.observation_period }}. Records moved to the table of their concept's domain: {{ 'yes' if design.route_by_domain else 'no (route_by_domain: false)' }}. Eras: {{ design.eras|md }}.
+{{ design.n_mappings }} table mappings, {{ design.n_fields }} field mappings, CDM {{ design.cdm_version|md }}. Person key: {{ design.person_key|md }}{% if design.person_key_also %} (also from: {{ design.person_key_also|md }}){% endif %}. Visit key: {{ design.visit_key|md if design.visit_key else 'none' }}{% if design.visit_key_also %} (also from: {{ design.visit_key_also|md }}){% endif %}. Observation period: {{ design.observation_period }}.
+
+What the build does beyond the mappings:
+
+{% for r in design.rules %}
+- {{ r.label }}: {{ r.text|md }}.
+{% endfor %}
 
 Fields by kind: {% for k in design.kinds_total %}{{ k.kind }} {{ k.n }}{{ ', ' if not loop.last else '' }}{% endfor %}.
 
@@ -219,15 +231,15 @@ _Not run: no mappings/decisions.json in the workspace._
 ## 7. ETL run
 
 {% if etl %}
-Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }} ({{ etl.duration|secs }}){% endif %}. {{ etl.steps|length }} steps, {{ etl.total_rows|num }} rows loaded{% if etl.derived_rows %}, {{ etl.derived_rows|num }} rows derived by the build (observation periods, eras){% endif %}{% if etl.moved_rows %}, {{ etl.moved_rows }} records moved to the table of their concept's domain{% endif %}, {{ etl.n_errors }} error(s).
+Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_at }} ({{ etl.duration|secs }}){% endif %}. {{ etl.steps|length }} steps, {{ etl.total_rows|num }} rows loaded{% if etl.derived_rows %}, {{ etl.derived_rows|num }} rows derived by the build (observation periods, eras){% endif %}{% if etl.moved_rows %}, {{ etl.moved_rows|md }} records moved to the table of their concept's domain{% endif %}, {{ etl.n_errors }} error(s){% if etl.n_errors > etl.n_blocking_errors %} ({{ etl.n_errors - etl.n_blocking_errors }} in steps that do not block the build){% endif %}.
 
 | Step | Table | Rows inserted | Source rows | Retention | Statistics | Visit links | Time | Error |
 |---|---|--:|--:|--:|---|---|--:|---|
 {% for s in etl.steps %}
-| {{ s.step|md }} | {{ s.table|md }} | {{ s.rows|num }} | {{ s.source_rows|num }} | {{ s.retention|pct }} | {{ (s.one_row_per_key or s.periods or s.moved)|md }} | {{ s.visit_links|md }} | {{ s.seconds|secs }} | {{ ('**ERROR** ' ~ s.error)|md if s.error else '' }} |
+| {{ s.step|md }} | {{ s.table|md }} | {{ s.rows|num }} | {{ s.source_rows|num }} | {{ s.retention|pct }} | {{ (s.one_row_per_key or s.periods or s.moved or s.derived or s.id_keys)|md }} | {{ s.visit_links|md }} | {{ s.seconds|secs }} | {{ (('**ERROR** ' if s.blocking else '**ERROR (not blocking)** ') ~ s.error)|md if s.error else ('skipped: ' ~ s.skipped)|md if s.skipped else '' }} |
 {% endfor %}
 
-Retention: rows inserted per source row; for steps that keep one row per key, source rows kept (rows that lost to another row of their key are not lost). Statistics: for steps that keep one row per key, source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays; for the observation-period merge, the episodes loaded and the periods they became (episodes that end before they start are dropped; open episodes end at the source release date, configured or derived from the exit dates, or at death; overlapping and back-to-back episodes merge; the persons with overlapping episodes, or with an open episode followed by a later one, are counted for review), and the persons without a period that the fill gave one from their events; for the route steps, the records they moved to the table of their concept's domain (they load none, so they have no retention). Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.
+Retention: rows inserted per source row; for steps that keep one row per key, source rows kept (rows that lost to another row of their key are not lost). Statistics: for steps that keep one row per key, source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays; for the observation-period merge, the episodes loaded and the periods they became (episodes that end before they start are dropped; open episodes end at the source release date, configured or derived from the exit dates, or at death; overlapping and back-to-back episodes merge; the persons with overlapping episodes, or with an open episode followed by a later one, are counted for review), and the persons without a period that the fill gave one from their events; for the route steps, the records they moved to the table of their concept's domain (they load none, so they have no retention); for the eras, the table they are derived from; for the id-map steps, the new keys they numbered, and for the pruning steps the keys they retired (people and visits not loaded; they keep their ids for when they return). Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.
 {% if etl.moved %}
 
 **Records moved to the table of their concept's domain**
@@ -235,10 +247,23 @@ Retention: rows inserted per source row; for steps that keep one row per key, so
 | From | To | Concept domain | Records | With a value dropped |
 |---|---|---|--:|--:|
 {% for m in etl.moved %}
-| {{ m.from_table|md }} | {{ m.to_table|md }} | {{ m.domain_id|md }} | {{ m.rows }} | {{ m.dropped }} |
+| {{ m.from_table|md }} | {{ m.to_table|md }} | {{ m.domain_id|md }} | {{ m.rows|md }} | {{ m.dropped|md }} |
 {% endfor %}
 
 A record whose standard concept belongs to another domain is moved after loading; a measurement with a result whose concept is not a measurement or an observation goes to observation. With a value dropped: moved records that had a value the destination table has no place for (a measurement's range or operator, a drug's days_supply or route, ...).
+{% endif %}
+{% if etl.value_rows %}
+
+**Values not loaded as written**
+
+| Field | Step | Unreadable | Partial date completed | Partial date left NULL | Required value defaulted | Row dropped (required value NULL) | Offset ignored | Offset converted |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+{% for v in etl.value_rows %}
+| {{ v.table|md }}.{{ v.field|md }} | {{ v.step|md }} | {{ v.invalid|md }} | {{ v.imputed|md }} | {{ v.partial_null|md }} | {{ v.defaulted|md }} | {{ v.required_null|md }} | {{ v.offset_ignored|md }} | {{ v.offset_converted|md }} |
+{% endfor %}
+
+Counted per source row. Unreadable: a value the field's conversion could not read (a date such as 31/02/2019, text in a number); the conversion gives NULL, so the field is NULL unless its expression falls back to another value (COALESCE). Partial date: a date with an unknown day or month, completed by the field's rule (`etl.partial_dates`; birth and death dates follow THEMIS) or left NULL. Required value defaulted: the CDM convention for a NULL required value (a concept becomes 0; a visit, visit detail or drug end date the start date). Row dropped: a row whose start date, birth year, death date or other required value is NULL is not loaded (a row with several such values is counted under each); retention counts it as lost. Offset: a time zone offset written after a time, converted to `etl.timezone` or, without it, ignored (the time is kept as written). (filter): values in the mapping's WHERE that could not be read; such a row is left out.{% if notice.shareable %} Counts below {{ project.min_cell_count }} are shown as "&lt;{{ project.min_cell_count }}".{% endif %}
+
 {% endif %}
 {% else %}
 _Not run: no etl_run.json in the workspace._
@@ -285,17 +310,25 @@ _None._
 {% endif %}
 {% for g in dq.derived_failed %}
 
-**Failed checks of {{ g.table }} (derived by the build from {{ g.source }})**
+**Failed checks of {{ g.table }} ({% if g.not_built %}not built: {{ g.not_built }}{% else %}derived by the build from {{ g.source }}{% endif %})**
 
 | Blocking | Check | Severity | Category | Violated rows | % violated | Threshold | Description |
 |---|---|---|---|--:|--:|--:|---|
 {% for f in g.failed %}
 | {{ '**BLOCKING**' if f.blocking else '' }} | {{ f.key|md }} | {{ f.severity }} | {{ f.category|md }} | {{ f.violated|num }} / {{ f.denominator|num }} | {{ f.pct|pct(2) }} | {{ f.threshold }} | {{ f.description|md }} |
 {% endfor %}
-{% endfor %}
-{% if dq.derived_failed %}
+{% if g.not_built %}
 
-The eras follow the {{ dq.derived_failed|map(attribute='source')|join(' and ') }} records: a failure here comes from those records{% if 'drug_era' in dq.derived_failed|map(attribute='table') %}, or is expected (drugs without a standard ingredient, such as vaccines, get no drug era){% endif %}. These checks are never sent to the repair agent.
+{{ g.table }} was not built ({{ g.not_built }}; see the ETL run), so its checks fail for that reason.
+{% endif %}
+{% endfor %}
+{% set built_eras = dq.derived_failed|rejectattr('not_built')|list %}
+{% if built_eras %}
+
+The eras follow the {{ built_eras|map(attribute='source')|join(' and ') }} records: a failure here comes from those records{% if 'drug_era' in built_eras|map(attribute='table') %}, or is expected (drugs without a standard ingredient, such as vaccines, get no drug era){% endif %}. These checks are never sent to the repair agent.
+{% elif dq.derived_failed %}
+
+These checks are never sent to the repair agent.
 {% endif %}
 {% if dq.errors %}
 

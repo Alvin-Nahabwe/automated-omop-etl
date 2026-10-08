@@ -317,6 +317,37 @@ def test_era_step_errors_and_checks_are_not_repaired(tmp_path):
     assert p._score(etl, only_eras)[-1] == 0 and p._score(spec_loaded, only_eras)[-1] == -2
 
 
+def test_checks_of_spec_loaded_eras_are_left_to_a_person(tmp_path):
+    """While the build derives eras, an era table the spec's own SQL loads in its place is a
+    person's decision (the validator warns): its checks are not given to the repair agent."""
+    from omop_agent.pipeline import Pipeline
+
+    cfg = plain_config(tmp_path)
+    spec = load_ref().model_copy(deep=True)
+    spec.custom_sql = [CustomSQL(name="eras", target_table="drug_era", sql="INSERT INTO {cdm}.drug_era SELECT 1")]
+    run = ETLRunResult(started_at=NOW, steps=[TableLoadResult(
+        target_table="drug_era", step="19_eras", kind="custom", rows_inserted=3)])
+    assert derived_tables(run) == set() and derived_tables(run, spec) == {"drug_era"}
+    off = spec.model_copy(update={"derive_eras": False})
+    assert derived_tables(run, off) == set()
+    failure = CheckResult(check_name="measurePersonCompleteness", check_level="TABLE", table="drug_era",
+                          description="d", severity="convention", failed=True, num_violated_rows=1,
+                          num_denominator_rows=2)
+    dq = DQReport(run_at=NOW, passed=True, results=[failure])
+    assert repair_triggers(dq, run, cfg, spec) == ([], [])
+    # without the spec, or when the spec turned the build's eras off, it is repaired like any other
+    assert repair_triggers(dq, run, cfg) == ([], [failure]) == repair_triggers(dq, run, cfg, off)
+    p = Pipeline(cfg.model_copy(update={"llm": cfg.llm.model_copy(update={"provider": "none"})}), log=lambda m: None)
+    assert not p._repairable(dq, run, spec) and p._repairable(dq, run, off)
+    assert p._score(run, dq, None, spec)[-1] == 0 and p._score(run, dq, None, off)[-1] == -1
+    # the agent is told why
+    line = next(x for x in build_repair_prompt(spec, 1, [], [], cfg).splitlines() if x.startswith("Eras:"))
+    assert ("drug_era is loaded by the spec's own SQL in place of the build's era step: its checks are not yours to "
+            "fix (a person decides") in line
+    line = next(x for x in build_repair_prompt(off, 1, [], [], cfg).splitlines() if x.startswith("Eras:"))
+    assert "drug_era is loaded by the spec's own SQL;" in line and "in place of" not in line
+
+
 def test_rows_and_history_count_eras_apart():
     person = TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=80)
     cond = TableLoadResult(target_table="condition_occurrence", step="07_condition_occurrence", kind="insert",
@@ -384,7 +415,7 @@ def test_report_shows_eras(full_ws):  # noqa: F811 (the fixture imported above)
             "the repair agent.") in md
     assert "**Failed checks of the loaded tables**" in md
     assert "Failed checks of drug_era <span class=\"muted\">(derived by the build from drug_exposure)</span>" in html
-    assert "eras: condition_era derived by the build" in html and "<h3>Failed checks of the loaded tables</h3>" in html
+    assert "<dt>Eras</dt><dd>condition_era derived by the build" in html and "<h3>Failed checks of the loaded tables</h3>" in html
     # only era failures: no empty "Failed checks" table next to a non-zero failed count
     data["dq"] = {**data["dq"], **_dq_section(DQReport(run_at=NOW, passed=True, results=dq.results[-1:]), cfg,
                                               {"drug_era"})}
@@ -835,7 +866,8 @@ def test_era_failure_is_not_blocking(staged):
         conn.rollback()
         era = [i for i in issues if i.target_table == "drug_era"]
         assert [(i.severity, i.message.split(":")[0]) for i in era] == [
-            ("warning", "step drug_era cannot run (the step is skipped and reported)")], issues
+            ("warning", "step drug_era cannot run (the step would fail and be reported, without failing the "
+                        "build)")], issues
         assert "concept_ancestor" in era[0].message and not [i for i in issues if i.severity == "error"]
     finally:
         execute(conn, f"ALTER TABLE {schemas.vocab}.concept_ancestor_gone RENAME TO concept_ancestor")

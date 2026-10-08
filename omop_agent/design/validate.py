@@ -1206,7 +1206,7 @@ def _explain_generated(
     sources, ``compiler.key_sources``) and of the steps the build generates (pruning, and the
     later routing, merge and derived steps), inside the caller's rolled-back transaction. A step
     that would fail is an error when it is blocking (the build would fail) and a warning when it
-    is not (it is reported and skipped). Steps that run the SQL of a mapping with errors, or of a
+    is not (its error is reported, and the build goes on). Steps that run the SQL of a mapping with errors, or of a
     key whose probe failed, are left out: those errors are reported already."""
     steps = compile_spec(spec, schemas, cfg.cdm_source if cfg is not None else None,
                          etl=cfg.etl if cfg is not None else None,
@@ -1222,7 +1222,7 @@ def _explain_generated(
         for stmt in s.statements:
             error = _explain(conn, stmt)
             if error:
-                how = "the build would fail" if s.blocking else "the step is skipped and reported"
+                how = "the build would fail" if s.blocking else "the step would fail and be reported, without failing the build"
                 out.append(SpecIssue(severity="error" if s.blocking else "warning", target_table=s.target_table,
                                      message=f"step {s.label} cannot run ({how}): {error}"))
                 break

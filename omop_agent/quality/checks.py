@@ -61,10 +61,11 @@ corresponding DQD SQL file, so results line up with the official R package:
   distinct drug concept).
 
 The era checks are never sent to the repair agent, and neither are the checks of the era tables
-the build derived itself (``derived_tables``): the eras follow the condition and drug records,
-whose own checks are. The other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``,
-``plausibleTemporalAfter`` and the concept-level checks) are reported once per populated table as
-not applicable, pointing to the R package (``quality.use_r_dqd``).
+the build derived itself, or that spec SQL loads in the build's place while ``derive_eras`` is on
+(``derived_tables``): the eras follow the condition and drug records, whose own checks are. The
+other DQD checks (``cdmTable``, ``cdmField``, ``cdmDatatype``, ``plausibleTemporalAfter`` and the
+concept-level checks) are reported once per populated table as not applicable, pointing to the R
+package (``quality.use_r_dqd``).
 
 A check fails when ``pct_violated_rows * 100 > threshold``. measurePersonCompleteness of a table
 that only receives records moved there by domain (no mapping loads it), and fkDomain of the main
@@ -1624,12 +1625,17 @@ def is_listed_check(r: CheckResult, entries: list[str]) -> bool:
     return any(e == r.check_name or e == r.key or r.key.startswith(e + ".") for e in entries)
 
 
-def derived_tables(etl_result: ETLRunResult | None) -> set[str]:
-    """The era tables the build derived in ``etl_result`` (its condition_era / drug_era steps, also
-    when they failed or were skipped): the ``derived`` tables of ``repairable``."""
-    if etl_result is None:
-        return set()
-    return {s.target_table for s in etl_result.steps if s.kind == "derived" and s.target_table in DERIVED_ERAS}
+def derived_tables(etl_result: ETLRunResult | None, spec: ETLSpec | None = None) -> set[str]:
+    """The era tables whose checks are not the repair agent's (the ``derived`` tables of
+    ``repairable``): those the build derived in ``etl_result`` (its condition_era / drug_era steps,
+    also when they failed or were skipped), and, while ``spec.derive_eras`` is on, those the spec's
+    own SQL loads in place of the build's step (the validator warns about such SQL: a person decides
+    whether to keep it or let the build derive the eras, the agent does not tune it to pass)."""
+    out = set() if etl_result is None else {
+        s.target_table for s in etl_result.steps if s.kind == "derived" and s.target_table in DERIVED_ERAS}
+    if spec is not None and spec.derive_eras:
+        out |= spec_era_tables(spec)
+    return out
 
 
 def repairable(
@@ -1643,8 +1649,9 @@ def repairable(
     with a severity in ``severities``, and caused by something the spec tools can change. Never:
     results marked ``repairable=False`` (e.g. errors of generated steps), checks on the tables this
     build derived from other tables rather than from the spec (``derived``: the eras built by the
-    build's own steps, ``derived_tables``; an era table the spec loads stays repairable), and person
-    completeness of tables that only receive records moved there by domain (``route_only``)."""
+    build's own steps, and while ``derive_eras`` is on those the spec's own SQL loads in their place,
+    ``derived_tables``; with ``derive_eras: false`` an era table the spec loads stays repairable), and
+    person completeness of tables that only receive records moved there by domain (``route_only``)."""
     if r.repairable is False or r.not_applicable or not (r.failed or r.error) or r.severity not in severities:
         return False
     if r.table in derived:

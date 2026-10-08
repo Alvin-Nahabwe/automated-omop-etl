@@ -1390,13 +1390,14 @@ def build_repair_tools(state: RepairState) -> list[AgentTool]:
 
 
 def repair_triggers(
-    dq: DQReport | None, etl_result: ETLRunResult | None, cfg: ProjectConfig
+    dq: DQReport | None, etl_result: ETLRunResult | None, cfg: ProjectConfig, spec: ETLSpec | None = None
 ) -> tuple[list[TableLoadResult], list[CheckResult]]:
     """The errors of blocking steps that run spec SQL, if there are any; otherwise the repairable DQ
     failures in ``repair_severities`` (``checks.repairable``). Errors of steps the build generates
     (id-map pruning, routing, eras, ...) and errors a spec change cannot fix (a missing privilege,
     ``TableLoadResult.repairable``) are never given to the agent: its tools cannot change them; nor
-    are the checks of the era tables the build derived (``checks.derived_tables``)."""
+    are the checks of the era tables the build derived, or that ``spec`` loads itself while the
+    build derives eras (``checks.derived_tables``)."""
     if etl_result is not None:
         fixable = [
             s for s in etl_result.blocking_errors() if (s.kind is None or s.kind in SPEC_KINDS) and s.repairable
@@ -1407,7 +1408,7 @@ def repair_triggers(
         return [], []
     severities = set(cfg.quality.repair_severities)
     order = {"fatal": 0, "convention": 1, "characterization": 2}
-    derived = derived_tables(etl_result)
+    derived = derived_tables(etl_result, spec)
     failures = [r for r in dq.results if repairable(r, severities, derived=derived)]
     return [], sorted(failures, key=lambda r: (order.get(r.severity, 3), -r.pct_violated_rows))
 
@@ -1556,7 +1557,11 @@ def _eras_line(spec: ETLSpec) -> str:
                      f"mapping into {'it' if one else 'them'}; {'its' if one else 'their'} checks are not yours to fix, "
                      f"fix the {records} records instead")
     if own:
-        parts.append(f"{' and '.join(own)} {'is' if len(own) == 1 else 'are'} loaded by the spec's own SQL")
+        one = len(own) == 1
+        parts.append(f"{' and '.join(own)} {'is' if one else 'are'} loaded by the spec's own SQL"
+                     + (f" in place of the build's era step: {'its' if one else 'their'} checks are not yours to fix (a "
+                        "person decides whether the build should derive the eras instead), and you may change that SQL "
+                        "only to fix an error that stops it from running" if spec.derive_eras else ""))
     if not spec.derive_eras:
         parts.append("the build derives no eras (derive_eras: false)")
     return "Eras: " + ("; ".join(parts) if parts else "none (no condition or drug records are loaded)") + "."
@@ -1594,7 +1599,7 @@ def repair_spec(
     profile: SourceProfile | None,
 ) -> tuple[ETLSpec, list[RepairAction]]:
     """Let the repair agent fix ``spec`` for the current failures. Returns (new spec, actions)."""
-    etl_errors, checks = repair_triggers(dq, etl_result, cfg)
+    etl_errors, checks = repair_triggers(dq, etl_result, cfg, spec)
     if not etl_errors and not checks:
         return spec, []
 

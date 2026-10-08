@@ -186,6 +186,16 @@ def test_cli_init(tmp_path, monkeypatch):
     assert cfg.name == "APHRC: Nairobi HDSS" and cfg.source.type == "csv"
     assert cfg.target.url == "postgresql://postgres:@localhost:5432/omop"
     assert cfg.llm.model == "claude-opus-5-5" and cfg.privacy.min_cell_count == 5
+    assert (cfg.etl.timezone, cfg.etl.partial_dates, cfg.source.na_values) == (None, "widest", None)
+    # the commented settings work once uncommented
+    text = (tmp_path / "omop_agent.yaml").read_text()
+    assert "# timezone: Africa/Nairobi" in text and "# source_release_date: 2024-06-30" in text
+    on = (text.replace("# timezone:", "timezone:").replace("# na_values:", "na_values:")
+          .replace("# source_release_date:", "source_release_date:"))
+    (tmp_path / "on.yaml").write_text(on)
+    cfg = load_config(tmp_path / "on.yaml")
+    assert cfg.etl.timezone == "Africa/Nairobi" and cfg.source.na_values == ["NA", "NULL", "\\N", "."]
+    assert str(cfg.cdm_source.source_release_date) == "2024-06-30"
     bad = CliRunner().invoke(app, ["init", str(tmp_path / "x"), "--source-type", "excel"])
     assert bad.exit_code != 0
 
@@ -279,3 +289,52 @@ def test_official_dqd_runs_once_after_repairs_and_failures_are_visible(demo_proj
     report = Pipeline(cfg, log=logs.append).check()
     assert not report.passed and any(b.startswith("cdmField.person.gender_concept_id") for b in report.blocking_failures)
     p.close()
+
+
+def test_upgrade_notice_is_given_once(tmp_path, monkeypatch):
+    """The first build of a project last built by an older version (its steps carry no kind) says
+    once, in the log and the audit trail, what builds now do differently."""
+    import yaml
+
+    from omop_agent.config import ProjectConfig
+    from omop_agent.etl import runner
+    from omop_agent.models import ETLRunResult, TableLoadResult
+    from omop_agent.workspace import Workspace
+
+    cfg = ProjectConfig.model_validate({
+        "name": "t", "workdir": str(tmp_path / "work"), "source": {"type": "csv", "path": str(tmp_path)},
+        "target": {"url": "postgresql://unused"}, "llm": {"provider": "none"}})
+    ws = Workspace(cfg.workdir)
+    assert runner.upgrade_notice(ws) == []  # never built: nothing to announce
+    old = ETLRunResult(started_at="2025-01-01T00:00:00Z",
+                       steps=[TableLoadResult(target_table="person", step="person", rows_inserted=3)])
+    ws.save_json(ws.etl_run_json, old)
+    assert runner.upgrade_notice(ws) == list(runner.UPGRADE_BEHAVIOURS)
+
+    def fake_run_etl(conn, schemas, spec, cfg, ws):
+        new = ETLRunResult(started_at="2026-01-01T00:00:00Z", steps=[
+            TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=3),
+            TableLoadResult(target_table="drug_era", step="19_drug_era", kind="derived", blocking=False,
+                            error="permission denied for table concept_ancestor")])
+        ws.save_json(ws.etl_run_json, new)
+        return new
+
+    monkeypatch.setattr(runner, "run_etl", fake_run_etl)
+    monkeypatch.setattr(Pipeline, "conn", property(lambda self: None))
+    spec = ETLSpec.model_validate(yaml.safe_load((Path(__file__).parent / "fixtures" / "demo_etl_spec.yaml").read_text()))
+    logs: list[str] = []
+    p = Pipeline(cfg, log=logs.append)
+    p.build(spec)
+    notices = [e for e in ws.read_audit() if e["event"] == "upgrade_notice"]
+    assert len(notices) == 1 and notices[0]["behaviours"] == list(runner.UPGRADE_BEHAVIOURS)
+    assert notices[0]["notice"] == runner.UPGRADE_NOTICE
+    assert sum("the first build of this project with the new version" in m for m in logs) == 1
+    assert any(m.endswith("1 errors (1 in steps that do not block the build)") for m in logs)
+    assert "  ✗ 19_drug_era (not blocking): permission denied for table concept_ancestor" in logs
+    # a build by the new version is not an upgrade, and the notice is given once even when the old
+    # result comes back (a build that failed before writing its own)
+    assert runner.upgrade_notice(ws) == []
+    ws.save_json(ws.etl_run_json, old)
+    assert runner.upgrade_notice(ws) == []
+    p.build(spec)
+    assert len([e for e in ws.read_audit() if e["event"] == "upgrade_notice"]) == 1

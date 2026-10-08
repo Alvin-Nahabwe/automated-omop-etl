@@ -210,7 +210,8 @@ class CdmSourceConfig(_Base):
 class EtlConfig(_Base):
     """How the build reads source values that need interpretation. Spec SQL always runs with
     DateStyle 'ISO, YMD' (``etl.session``): a day-first or month-first text date needs to_date
-    with its template, since ``'31/12/2020'::date`` is an error whatever the server's DateStyle."""
+    with its template, since ``'31/12/2020'::date`` is an error whatever the server's DateStyle,
+    and ``'31/12/20'::date`` (a two-digit year) is read year-first, as 2031-12-20."""
 
     timezone: str | None = Field(
         None,

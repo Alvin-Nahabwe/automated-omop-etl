@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ..cdm.spec import DERIVED_ERAS, LOAD_ORDER
 from ..etl.compiler import ERA_PAD_DAYS, era_status, key_sources
+from ..etl.routing import route_sources
 from ..models import ETLSpec, FieldMapping, TableMapping
 
 # How each era table is built (``etl.compiler.era_status``), for the review views.
@@ -27,6 +28,50 @@ def eras_text(spec: ETLSpec) -> str:
     rule = (f". An era joins the records of one person and concept (for drug eras: ingredient of RxNorm or RxNorm "
             f"Extension) that start at most {ERA_PAD_DAYS} days after the earlier ones ended" if derived else "")
     return "; ".join(parts) + rule
+
+
+# What the build does with the rows of person, death and visit_occurrence (``etl.compiler.ONE_ROW_PER``).
+ONE_ROW_PER_KEY_TEXT = (
+    "person and death keep one row per person, visit_occurrence one per visit and person (from the earliest start "
+    "to the latest end of its rows); a mapping's dedup_order picks the row, then, for death, a date known to the "
+    "day and the latest date, then the most complete row; duplicate and conflicting rows are counted and reported"
+)
+
+
+def observation_period_text(spec: ETLSpec) -> str:
+    """How the observation periods of ``spec`` are built, for the review views."""
+    if spec.observation_period == "from_events":
+        return (f"derived from the records: one period per person from the first to the last record (type concept "
+                f"{spec.observation_period_type_concept_id})")
+    return ("loaded by a table mapping, one row per episode; the build merges each person's overlapping and "
+            "back-to-back episodes, ends open ones (no end date) at the source release date "
+            "(cdm_source.source_release_date, configured or derived from the exit dates) or at death, drops episodes "
+            "that end before they start, and gives persons without a valid episode a period from their first to "
+            "their last record")
+
+
+def routing_text(spec: ETLSpec) -> str:
+    """Whether and how the build moves the records of ``spec`` to the table of their concept's domain."""
+    if not spec.route_by_domain:
+        return "off (route_by_domain: false): records stay in the table that loads them"
+    if not route_sources(spec):
+        return ("on, but the spec loads none of the tables records are moved from (condition_occurrence, "
+                "procedure_occurrence, drug_exposure, device_exposure, measurement)")
+    return ("after loading, every condition_occurrence, procedure_occurrence, drug_exposure, device_exposure and "
+            "measurement record whose standard concept belongs to another event domain moves to that domain's table "
+            "(a measurement with a result goes to observation); records with concept 0 stay")
+
+
+def build_rules(spec: ETLSpec) -> list[tuple[str, str]]:
+    """(label, text) of what the build does with every spec beyond its mappings: one row per key,
+    the observation periods, routing by domain and the eras. The spec page, the spec document and
+    the report show the same lines."""
+    return [
+        ("One row per key", ONE_ROW_PER_KEY_TEXT),
+        ("Observation periods", observation_period_text(spec)),
+        ("Routing by domain", routing_text(spec)),
+        ("Eras", eras_text(spec)),
+    ]
 
 
 def _cell(text: str | None) -> str:
@@ -117,28 +162,7 @@ def render_spec_md(spec: ETLSpec) -> str:
                    + _also(spec, "visit_occurrence"))
     else:
         out.append("- **Visit key:** none (records are not linked to visits)")
-    if spec.observation_period == "from_events":
-        out.append(
-            f"- **Observation period:** derived from events (first to last event date per person), "
-            f"type concept {spec.observation_period_type_concept_id}"
-        )
-    else:
-        out.append(
-            "- **Observation period:** loaded by a table mapping, one row per episode. The build merges each "
-            "person's overlapping and back-to-back episodes, ends open ones (no end date) at "
-            "`cdm_source.source_release_date` (configured, or derived from the exit dates) or at death, drops "
-            "episodes that end before they start, and gives persons without a valid episode a period from their "
-            "first to their last event"
-        )
-    if spec.route_by_domain:
-        out.append(
-            "- **Routing by domain:** after loading, every condition_occurrence, procedure_occurrence, drug_exposure, "
-            "device_exposure and measurement record whose standard concept belongs to another event domain moves to "
-            "that domain's table (a measurement with a result goes to observation); records with concept 0 stay"
-        )
-    else:
-        out.append("- **Routing by domain:** off (`route_by_domain: false`): records stay in the table that loads them")
-    out.append(f"- **Eras:** {eras_text(spec)}")
+    out += [f"- **{label}:** {text}" for label, text in build_rules(spec)]
     out += ["", "| # | source table | → | CDM table | fields |", "|---|---|---|---|---|"]
     for k, (_, tm) in enumerate(mappings, start=1):
         src = tm.source.table + "".join(f" + {j.table}" for j in tm.joins)

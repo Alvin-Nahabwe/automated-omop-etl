@@ -58,7 +58,7 @@ def _freqs(values: list[ValueFreq], k: int) -> str:
     return ", ".join(f"{_value(v.value)}×{v.count}" for v in kept)
 
 
-def _rare_offsets(c: ColumnProfile, k: int) -> str:
+def rare_offsets(c: ColumnProfile, k: int) -> str:
     """The values whose offset is too rare to name (counted with the listed offsets a stricter
     threshold hides)."""
     hidden = sum(v.count for v in c.tz_offsets) - sum(v.count for v in suppress_small_cells(list(c.tz_offsets), k)[0])
@@ -75,7 +75,7 @@ def _reading(c: ColumnProfile, k: int) -> list[str] | None:
         small_count(c.n_nonconforming, k) if c.n_nonconforming else "",
         _freqs(c.nonconforming_shapes, k),
         small_count(c.n_partial_dates, k) if c.n_partial_dates else "",
-        ", ".join(x for x in [_freqs(c.tz_offsets, k), _rare_offsets(c, k)] if x),
+        ", ".join(x for x in [_freqs(c.tz_offsets, k), rare_offsets(c, k)] if x),
         small_count(c.n_na_markers, k) if c.n_na_markers else "",
         _cell("; ".join(c.format_notes)),
     ]

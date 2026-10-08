@@ -828,7 +828,8 @@ def test_prompts_and_texts(tmp_path):
     assert "never write merging, filters or a fallback into the observation_period end date" in prompt
     assert "Observation periods: from_events" in build_repair_prompt(from_events(), 1, [], [], cfg)
     md = render_spec_md(load_ref())
-    assert "ends open ones (no end date) at `cdm_source.source_release_date`" in md
+    assert ("ends open ones (no end date) at the source release date (cdm_source.source_release_date, "
+            "configured or derived from the exit dates) or at death") in md
 
 
 def test_normalise_plan_follows_the_planned_tables():

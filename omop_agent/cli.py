@@ -132,8 +132,12 @@ def init(
 
     src = (
         f"  type: csv\n  path: {q(source)}\n"
+        "  # Missing-value markers staged as NULL (default for CSV files: NA, NULL, \\N and .); [] keeps them.\n"
+        "  # na_values: [\"NA\", \"NULL\", '\\N', \".\"]\n"
         if source_type == "csv"
         else f"  type: database\n  url: {q(source)}\n  schema: public\n"
+        "  # Values to store as NULL when staging (none by default for a database source).\n"
+        "  # na_values: [\"NA\"]\n"
     )
     path.write_text(
         f"""# omop-agent project configuration. ${{VAR}} and ${{VAR:-default}} are read from the environment.
@@ -185,6 +189,14 @@ cdm_source:
   # The date of the data extract: observation periods still open (no exit date) end on it.
   # Unset, the build derives it from the exit dates and reports it (etlSourceReleaseDate).
   # source_release_date: 2024-06-30
+
+etl:
+  # The site's time zone. Set it when times carry an offset or 'Z' (e.g. ODK submission times):
+  # they are then converted to it. Unset, an offset is ignored and the time is kept as written.
+  # timezone: Africa/Nairobi
+  # Dates with an unknown day or month (00, 97-99), other than birth and death dates:
+  # widest = start dates take the first day, end dates the last, other dates the 15th; reject = NULL.
+  partial_dates: widest
 """
     )
     load_config(path)  # fail now, not on the first command, if the file is not valid

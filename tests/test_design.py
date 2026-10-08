@@ -851,7 +851,7 @@ def test_render_spec_md():
     md = render_spec_md(spec)
     assert md.startswith("# ETL specification")
     assert "**Person key:** `individuals`.`individual_id`" in md
-    assert "**Observation period:** loaded by a table mapping" in md
+    assert "**Observation periods:** loaded by a table mapping" in md
     assert "| 1 | individuals | → | person | 11 |" in md
     assert "### condition_occurrence ← `diagnoses` (d)" in md
     assert "| CDM field | kind | source / expression | vocabulary | rationale |" in md

@@ -389,17 +389,25 @@ class Pipeline:
         return spec
 
     def build(self, spec: ETLSpec | None = None) -> ETLRunResult:
-        from .etl.runner import run_etl
+        from .etl.runner import UPGRADE_NOTICE, run_etl, upgrade_notice
 
         def run() -> ETLRunResult:
+            behaviours = upgrade_notice(self.ws)
+            if behaviours:  # the first build since the update: say once what builds now do
+                self.log("  note: the first build of this project with the new version, which changes the CDM it "
+                         f"builds: {'; '.join(behaviours)} (README.md, \"Upgrading\")")
+                self.ws.audit("upgrade_notice", notice=UPGRADE_NOTICE, behaviours=behaviours)
             result = run_etl(self.conn, self.schemas, spec or self.validated_spec(), self.cfg, self.ws)
             derived, moved = result.rows_derived(), result.rows_moved()
+            n_errors, n_blocking = len(result.errors()), len(result.blocking_errors())
             self.log(f"  {len(result.steps)} steps, {result.rows_loaded()} rows loaded"
                      + (f", {derived} derived by the build (observation periods, eras)" if derived else "")
                      + (f", {moved} records moved to the table of their concept's domain" if moved else "")
-                     + f", {len(result.errors())} errors")
+                     + f", {n_errors} errors"
+                     + (f" ({n_errors - n_blocking} in steps that do not block the build)" if n_errors > n_blocking
+                        else ""))
             for s in result.errors():
-                self.log(f"  ✗ {s.step}: {s.error}")
+                self.log(f"  ✗ {s.step}{'' if s.blocking else ' (not blocking)'}: {s.error}")
             return result
 
         return self._run_stage("build", run)  # type: ignore[return-value]
@@ -491,7 +499,7 @@ class Pipeline:
             etl = self.build(spec)
             report = self.check(spec, etl, include_r=False) if etl.ok else None
             losses = seen.losses(etl, report) if iteration > 0 else []
-            score = self._score(etl, report, losses)
+            score = self._score(etl, report, losses, spec)
             if best is not None and score < best[0]:
                 why = f" ({'; '.join(losses[:3])})" if losses else ""
                 self.log(f"  repair iteration {iteration} made the result worse{why}; restoring the previous spec")
@@ -507,7 +515,7 @@ class Pipeline:
             if best is None or score >= best[0]:
                 best = (score, spec, iteration)
             seen.add(etl, report)
-            if report is not None and report.passed and not self._repairable(report, etl):
+            if report is not None and report.passed and not self._repairable(report, etl, spec):
                 break
             if iteration >= max_iter:
                 self.log(f"  stopping after {max_iter} repair iterations")
@@ -546,7 +554,9 @@ class Pipeline:
         self.ws.save_json(self.ws.vocab_eval_json, ev)
         (self.ws.root / "vocab_evaluation.md").write_text(render_vocab_evaluation_md(ev))
 
-    def _score(self, etl: ETLRunResult, report: DQReport | None, losses: list[str] | None = None) -> tuple:
+    def _score(
+        self, etl: ETLRunResult, report: DQReport | None, losses: list[str] | None = None, spec: ETLSpec | None = None
+    ) -> tuple:
         """Higher is better: no records or data lost compared with earlier builds, then gate passed,
         fewer blocking ETL errors, fewer blocking and repairable failures. Losing data ranks below
         any failing check, so a repair that drops records or blanks fields to pass is rolled back."""
@@ -556,17 +566,18 @@ class Pipeline:
         if report is None:
             return (no_loss, False, -len(etl.blocking_errors()), -10**9, -10**9)
         sev = set(self.cfg.quality.repair_severities)
-        derived = derived_tables(etl)
+        derived = derived_tables(etl, spec)
         n_repairable = sum(repairable(r, sev, derived=derived) for r in report.results)
         return (no_loss, report.passed, -len(etl.blocking_errors()), -len(report.blocking_failures), -n_repairable)
 
-    def _repairable(self, report: DQReport, etl: ETLRunResult | None = None) -> bool:
+    def _repairable(self, report: DQReport, etl: ETLRunResult | None = None, spec: ETLSpec | None = None) -> bool:
         """True when ``report`` has a failure the repair agent should be given (``checks.repairable``;
-        not the checks of the era tables the build of ``etl`` derived)."""
+        not the checks of the era tables the build of ``etl`` derived, or that ``spec`` loads itself
+        while the build derives eras)."""
         from .quality.checks import derived_tables, repairable
 
         sev = set(self.cfg.quality.repair_severities)
-        derived = derived_tables(etl)
+        derived = derived_tables(etl, spec)
         return any(repairable(r, sev, derived=derived) for r in report.results)
 
     def report(self, shareable: bool = True) -> None:

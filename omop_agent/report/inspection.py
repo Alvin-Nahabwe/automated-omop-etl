@@ -34,12 +34,15 @@ from pydantic import BaseModel
 from ..cdm.spec import DERIVED_ERAS, LOAD_ORDER, load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, fetch_all, qi, short_error
-from ..design.render import eras_text
+from ..design.render import build_rules, eras_text
 from ..etl.compiler import derived_era_tables, era_status, key_sources, step_label
+from ..etl.policies import ROW_SITE, WHERE_SITE
 from ..etl.routing import ROUTE_PREPARE
-from ..privacy import apply_overrides
+from ..privacy import apply_overrides, small_count, suppress_small_cells
+from ..profiling.render import rare_offsets
 from ..models import (
     CheckResult,
+    ColumnProfile,
     DQReport,
     ETLRunResult,
     ETLSpec,
@@ -48,6 +51,7 @@ from ..models import (
     SourceAnnotations,
     SourceProfile,
     TableLoadResult,
+    ValueFreq,
 )
 from ..workspace import STAGES, Workspace, utcnow
 
@@ -75,6 +79,10 @@ CHECK_STATUSES = ["passed", "failed", "error", "not_applicable"]
 FIELD_KINDS = [
     "person_id", "visit_id", "auto_id", "column", "expression", "constant", "vocab_code", "concept_map", "null"
 ]
+# Values not loaded as written (TableLoadResult.value_counts), in the order the report shows them.
+VALUE_CATEGORIES = [
+    "invalid", "imputed", "partial_null", "defaulted", "required_null", "offset_ignored", "offset_converted",
+]
 MAX_REVIEW_ROWS = 100
 MAX_UNMATCHED_SHOWN = 5
 WITHHELD = "<withheld>"
@@ -84,7 +92,9 @@ CONFIDENTIAL_NOTICE = (
 )
 SHAREABLE_NOTICE = (
     "Source codes and terms seen fewer than {n} times are replaced by \"<withheld>\". Frequent source codes "
-    "and terms are still listed; check the report against your data-sharing rules before sharing it."
+    "and terms are still listed. Some tables show counts below {n} as \"<{n}\", but totals, differences and the "
+    "data-quality counts are exact, so a small count can often be worked out from them. Check the report against "
+    "your data-sharing rules before sharing it."
 )
 
 
@@ -288,10 +298,13 @@ def _strs(v: Any) -> list[str]:
 
 def _verdict(
     dq: DQReport | None, etl_run: ETLRunResult | None, stages: dict[str, dict[str, Any]]
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], list[str]]:
+    """The verdict, its reasons, and the steps that failed without failing the build (route and era
+    steps are not blocking, see ``_nonblocking_notes``), which are listed apart whatever the verdict."""
     failures: list[str] = []
-    if etl_run is not None and etl_run.errors():
-        errs = etl_run.errors()
+    notes = _nonblocking_notes(etl_run)
+    if etl_run is not None and etl_run.blocking_errors():
+        errs = etl_run.blocking_errors()
         failures.append(f"{len(errs)} ETL step(s) errored: " + ", ".join(s.step for s in errs[:5]))
     if dq is not None and not dq.passed:
         n = len(dq.blocking_failures)
@@ -300,7 +313,7 @@ def _verdict(
         if name != "report" and str(info.get("status", "")).lower() in FAILED_STATUSES:
             failures.append(f"stage '{name}' failed" + (f": {_short(info['error'], 160)}" if info.get("error") else ""))
     if failures:
-        return FAILED, failures
+        return FAILED, failures, notes
     unfinished = [
         f"stage '{n}' is {i.get('status')}"
         for n, i in stages.items()
@@ -308,16 +321,51 @@ def _verdict(
     ]
     if dq is None:
         reasons = (["the ETL has not run"] if etl_run is None else []) + ["data-quality checks have not run"]
-        return INCOMPLETE, reasons + unfinished
+        return INCOMPLETE, reasons + unfinished, notes
     if unfinished:
-        return INCOMPLETE, unfinished
+        return INCOMPLETE, unfinished, notes
     dq_at, etl_at = _as_utc(dq.run_at), _as_utc(etl_run.started_at) if etl_run else None
     if dq_at and etl_at and dq_at < etl_at:
-        return INCOMPLETE, ["the data-quality results predate the latest ETL run; re-run the checks"]
+        return INCOMPLETE, ["the data-quality results predate the latest ETL run; re-run the checks"], notes
     reasons = ["no blocking data-quality check failed"]
     if etl_run is not None:
-        reasons.append(f"all {len(etl_run.steps)} ETL steps completed without error")
-    return PASSED, reasons
+        reasons.append(_steps_completed(etl_run))
+    return PASSED, reasons, notes
+
+
+def _steps_completed(etl_run: ETLRunResult) -> str:
+    """How many ETL steps of a run without blocking errors completed, failed and were skipped (a
+    step that requires a failed one is skipped: a route step after route_prepare)."""
+    n, k = len(etl_run.steps), len(etl_run.errors())
+    m = sum(1 for s in etl_run.steps if s.skipped and not s.error)
+    if not k and not m:
+        return f"all {n} ETL steps completed without error"
+    done = f"{n - k - m} of {n} ETL steps completed without error"
+    if not m:
+        return done + ("; the one that failed does not block the build" if k == 1 else
+                       f"; the {k} that failed do not block the build")
+    return (done + f"; {k} failed and {m} {'was' if m == 1 else 'were'} skipped because of "
+            + ("it" if k == 1 else "them") + ", and none of these steps blocks the build")
+
+
+def _nonblocking_notes(etl_run: ETLRunResult | None) -> list[str]:
+    """One line per step that failed without failing the build (``blocking=False``: the route and
+    era steps), saying what the CDM lacks because of it. The error itself is in the ETL run table."""
+    notes = []
+    for s in etl_run.errors() if etl_run is not None else []:
+        if s.blocking:
+            continue
+        label = step_label(s.step)
+        if label == ROUTE_PREPARE:
+            effect = "no records were moved to the table of their concept's domain"
+        elif s.kind == "route":
+            effect = f"the {s.target_table} records whose concept belongs to another domain stay where they were loaded"
+        elif s.target_table in DERIVED_ERAS:
+            effect = f"{s.target_table} was not built"
+        else:
+            effect = f"{s.target_table} may be incomplete"
+        notes.append(f"{s.step} failed without failing the build: {effect} (see the ETL run)")
+    return notes
 
 
 def _relative(v: Any, root: Path) -> Any:
@@ -416,9 +464,38 @@ def _reviews(
     return rows, caveats
 
 
+def _freq_text(values: list[ValueFreq], k: int) -> str:
+    kept, _ = suppress_small_cells(list(values), k)  # defensive: the profile lists none seen fewer than k times
+    return ", ".join(f"{v.value} ×{fmt_int(v.count)}" for v in kept)
+
+
+def _reading(table: str, c: ColumnProfile, k: int) -> dict[str, Any] | None:
+    """How a column's values read, from the profile's scan of the whole column (as in profile.md):
+    its date format, value shapes, the values that do not fit its type or format and their shapes,
+    partial dates, time zone offsets and missing-value markers staged as NULL. Counts below ``k``
+    are shown as ``<k``. None for a direct identifier, and for a column without a date format whose
+    values all fit its type (its shapes alone are in profile.md)."""
+    if c.is_pii:
+        return None
+    row = {
+        "format": c.date_format or "",
+        "shapes": _freq_text(c.value_shapes, k),
+        "nonconforming": small_count(c.n_nonconforming, k) if c.n_nonconforming else "",
+        "nonconforming_shapes": _freq_text(c.nonconforming_shapes, k),
+        "partial": small_count(c.n_partial_dates, k) if c.n_partial_dates else "",
+        "offsets": ", ".join(x for x in (_freq_text(c.tz_offsets, k), rare_offsets(c, k)) if x),
+        "na_markers": small_count(c.n_na_markers, k) if c.n_na_markers else "",
+        "notes": "; ".join(c.format_notes),
+    }
+    if not any(v for key, v in row.items() if key not in ("shapes", "nonconforming_shapes")):
+        return None
+    return {"table": table, "column": c.name, "type": c.inferred_type, **row}
+
+
 def _source_section(profile: SourceProfile, annotations: SourceAnnotations | None) -> dict[str, Any]:
     ann = {t.table: t for t in annotations.tables} if annotations else {}
-    tables, pii, dates = [], [], []
+    k = profile.min_cell_count
+    tables, pii, reading = [], [], []
     for t in profile.tables:
         a = ann.get(t.name)
         tables.append(
@@ -434,18 +511,19 @@ def _source_section(profile: SourceProfile, annotations: SourceAnnotations | Non
         for c in t.columns:
             if c.is_pii:
                 pii.append({"table": t.name, "column": c.name, "reason": c.pii_reason or ""})
-            if c.date_format:
-                dates.append({"table": t.name, "column": c.name, "format": c.date_format, "type": c.inferred_type})
+            if (row := _reading(t.name, c, k)) is not None:
+                reading.append(row)
     return {
         "source_type": profile.source_type,
         "generated_at": fmt_dt(profile.generated_at),
-        "min_cell_count": profile.min_cell_count,
+        "min_cell_count": k,
         "n_tables": len(profile.tables),
         "n_rows": sum(t.n_rows for t in profile.tables),
         "n_columns": sum(len(t.columns) for t in profile.tables),
         "tables": tables,
         "pii": pii,
-        "date_formats": dates,
+        # date formats, shapes, values that do not fit, partial dates, offsets, NA markers
+        "reading": reading,
     }
 
 
@@ -483,6 +561,8 @@ def _design_section(spec: ETLSpec) -> dict[str, Any]:
         # how each era table is built: derived by the build, loaded by the spec's SQL, or not built
         "eras": eras_text(spec),
         "era_status": era_status(spec),
+        # what the build does beyond the mappings (one row per key, periods, routing, eras), as on the spec page
+        "rules": [{"label": label, "text": text} for label, text in build_rules(spec)],
         "n_mappings": len(spec.table_mappings),
         "n_fields": sum(total.values()),
         "kinds_total": [{"kind": k, "n": total[k]} for k in order if total[k]],
@@ -673,10 +753,64 @@ def _moved_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
     return f"moved {count(sum(m.moved_rows for m in s.moved))}"
 
 
+def _map_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
+    """An id-map step: the new keys it numbered; a pruning step: the keys it retired (they keep
+    their ids for when they return). These steps write the ETL schema only."""
+    if s.error or s.skipped:
+        return ""
+    if s.kind == "id_map":
+        return f"{count(s.rows_inserted)} new keys"
+    return f"{count(s.rows_inserted)} keys retired" if s.kind == "prune" else ""
+
+
+def _step_table(s: TableLoadResult) -> str:
+    """The table a step writes: the CDM table, or for the id-map and pruning steps the ETL id map
+    (person_map, visit_map), for route_prepare the ETL table of the largest ids before routing."""
+    if s.kind in ("id_map", "prune"):
+        return "visit_map" if step_label(s.step).startswith("visit_map") else "person_map"
+    return "id_high_water" if s.kind == "route" and step_label(s.step) == ROUTE_PREPARE else s.target_table
+
+
+def _derived_stats(s: TableLoadResult) -> str:
+    """A step that derives its rows from other CDM tables: the eras, and the observation periods
+    from the records (the fill is described by ``_period_stats``)."""
+    if s.kind != "derived" or s.error or s.skipped or "persons_without_period" in s.stats:
+        return ""
+    if s.target_table in DERIVED_ERAS:
+        return f"derived from {DERIVED_ERAS[s.target_table]}"
+    return "derived from each person's first and last record" if s.target_table == "observation_period" else ""
+
+
+def _value_rows(run: ETLRunResult, count: Callable[[int], str]) -> list[dict[str, Any]]:
+    """Values not loaded as written, one row per mapping and field (``TableLoadResult.value_counts``):
+    unreadable values (NULL), partial dates completed or left NULL, NULL required values given the
+    CDM default, rows dropped for a NULL required value, and time zone offsets ignored or converted.
+    The WHERE is the field 'where'. A second mapping into a table is named by its step."""
+    cdm = load_cdm_spec()
+    rows = []
+    for s in run.steps:
+        if s.error or not s.value_counts:
+            continue
+        fields = {f for cat, by_field in s.value_counts.items() if cat != ROW_SITE for f in by_field}
+        order = ([f.name for f in cdm.table(s.target_table).fields] if cdm.has_table(s.target_table) else [])
+        label = step_label(s.step)
+        for f in sorted(fields, key=lambda f: (f != WHERE_SITE, order.index(f) if f in order else len(order), f)):
+            counts = {c: int(s.value_counts.get(c, {}).get(f) or 0) for c in VALUE_CATEGORIES}
+            if not any(counts.values()):
+                continue
+            rows.append({
+                "table": s.target_table,
+                "field": "(filter)" if f == WHERE_SITE else f,
+                "step": label if label != s.target_table else "",
+                **{c: count(n) if n else "" for c, n in counts.items()},
+            })
+    return rows
+
+
 def _retention(s: TableLoadResult) -> float | None:
     """Rows inserted per source row; for a step that keeps one row per key, the source rows kept
     (``retained_rows``, the etlRecordRetention basis): rows that lost to another row of their key,
-    or rolled up into one visit, are not lost (the 'One row per key' column counts them)."""
+    or rolled up into one visit, are not lost (the Statistics column counts them)."""
     if "keys" in s.stats and s.retained_rows is not None:
         return _ratio(s.retained_rows, s.source_rows)
     return _ratio(s.rows_inserted, s.source_rows)
@@ -688,17 +822,24 @@ def _etl_section(run: ETLRunResult, min_cell_count: int = 5, shareable: bool = F
 
     steps = [
         {
-            "table": s.target_table,
+            "table": _step_table(s),
             "step": s.step,
-            "rows": None if s.kind == "route" else s.rows_inserted,  # a route step loads nothing: see "moved"
+            # route steps load nothing (see "moved"), id-map and pruning steps write the id maps only
+            "rows": None if s.kind in ("route", "id_map", "prune") or s.skipped else s.rows_inserted,
             "source_rows": s.source_rows,
-            "retention": _retention(s) if s.error is None else None,
+            "retention": _retention(s) if s.error is None and not s.skipped else None,
+            # the Statistics column: one row per key, the merge or fill, the records moved, what a derived
+            # step reads, or the keys an id-map step numbered or retired
             "one_row_per_key": _key_stats(s, count),
             "periods": _period_stats(s, count),
-            "visit_links": _link_stats(s, count),
             "moved": _moved_stats(s, count),
+            "derived": _derived_stats(s),
+            "id_keys": _map_stats(s, count),
+            "visit_links": _link_stats(s, count),
             "seconds": s.seconds,
             "error": _short(s.error, 600) if s.error else "",
+            "blocking": s.blocking,  # an error of a step that does not block the build (route, eras) is a warning
+            "skipped": _short(s.skipped, 300) if s.skipped else "",
         }
         for s in run.steps
     ]
@@ -718,7 +859,9 @@ def _etl_section(run: ETLRunResult, min_cell_count: int = 5, shareable: bool = F
         "derived_rows": run.rows_derived(),  # apart: observation periods and eras the build derived
         "moved": moved,
         "moved_rows": count(run.rows_moved()) if run.rows_moved() else "",
+        "value_rows": _value_rows(run, count),  # values not loaded as written, per table and field
         "n_errors": len(run.errors()),
+        "n_blocking_errors": len(run.blocking_errors()),
         "ok": run.ok,
     }
 
@@ -748,10 +891,15 @@ def _tally(results: list[CheckResult], key: Callable[[CheckResult], str], order:
     return rows
 
 
-def _dq_section(dq: DQReport, cfg: ProjectConfig, derived: set[str] | frozenset[str] = frozenset()) -> dict[str, Any]:
+def _dq_section(
+    dq: DQReport, cfg: ProjectConfig, derived: set[str] | frozenset[str] = frozenset(),
+    not_built: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """The data-quality results. The failures on the era tables the build derived (``derived``) are
     listed apart, under the event table each derives from: they follow the condition and drug
-    records, whose own checks come first, and are never sent to the repair agent."""
+    records, whose own checks come first, and are never sent to the repair agent. An era table
+    whose step failed or was skipped (``not_built``: table -> why) fails its checks for that reason,
+    which its group says instead."""
     blocking_sev = set(cfg.quality.blocking_severities)
 
     def is_blocking(r: CheckResult) -> bool:
@@ -776,7 +924,8 @@ def _dq_section(dq: DQReport, cfg: ProjectConfig, derived: set[str] | frozenset[
 
     failed = [r for r in dq.results if r.failed and not r.error and not r.not_applicable]
     failed.sort(key=lambda r: (not is_blocking(r), SEVERITIES.index(r.severity), -_violated_pct(r), r.key))
-    eras = [{"table": t, "source": DERIVED_ERAS[t], "failed": [row(r) for r in failed if r.table == t]}
+    eras = [{"table": t, "source": DERIVED_ERAS[t], "failed": [row(r) for r in failed if r.table == t],
+             "not_built": (not_built or {}).get(t)}
             for t in DERIVED_ERAS if t in derived]
     return {
         "run_at": fmt_dt(dq.run_at),
@@ -904,6 +1053,7 @@ def _next_steps(
     dq: dict[str, Any] | None,
     schemas: Schemas,
     r_dqd_ran: bool,
+    verdict_notes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
     if mapping is None:
@@ -925,13 +1075,22 @@ def _next_steps(
             "done": spec is not None and n_q == 0 and not notes,
         }
     )
-    n_err = etl["n_errors"] if etl else 0
+    n_err = etl["n_blocking_errors"] if etl else 0
     n_block = dq["n_blocking"] if dq else 0
     if verdict == FAILED:
         steps.append(
             {
                 "text": f"Fix the {n_err} ETL step error(s) and {n_block} blocking data-quality failure(s) "
                 "listed above (edit etl_spec.yaml or the mappings), then rebuild.",
+                "done": False,
+            }
+        )
+    if verdict_notes:
+        k = len(verdict_notes)
+        steps.append(
+            {
+                "text": f"Fix the cause of the {k} ETL step(s) that failed without failing the build (see the summary "
+                "and the ETL run), then rebuild: until then the CDM lacks what they would have done.",
                 "done": False,
             }
         )
@@ -978,6 +1137,15 @@ def _release_basis(run: ETLRunResult | None) -> str | None:
     if merge is None or not merge.stats.get("release_date"):
         return None
     return "configured" if merge.stats.get("configured") else "derived"
+
+
+def _eras_not_built(run: ETLRunResult | None) -> dict[str, str]:
+    """The era tables whose build step failed or was skipped in ``run``, with why."""
+    out: dict[str, str] = {}
+    for s in run.steps if run is not None else []:
+        if s.kind == "derived" and s.target_table in DERIVED_ERAS and (s.error or s.skipped):
+            out[s.target_table] = f"step {s.step} failed" if s.error else f"step {s.step} was skipped because {s.skipped}"
+    return out
 
 
 def _derived_eras(run: ETLRunResult | None, spec: ETLSpec | None) -> set[str]:
@@ -1194,13 +1362,13 @@ def collect_report_data(
         except psycopg.Error as e:
             cdm_note = f"CDM characterisation failed: {short_error(e)}"
 
-    verdict, reasons = _verdict(dq, etl_run, stages)
+    verdict, reasons, verdict_notes = _verdict(dq, etl_run, stages)
     review_rows, caveats = _reviews(cfg, ws, audit, repairs, decisions)
     design = _design_section(spec) if spec else None
     vocab = _vocab_section(vocab_eval, mcc, shareable) if vocab_eval is not None else None
     mapping = _mapping_section(decisions, cfg, shareable) if decisions is not None else None
     etl = _etl_section(etl_run, mcc, shareable) if etl_run else None
-    dq_data = _dq_section(dq, cfg, _derived_eras(etl_run, spec)) if dq else None
+    dq_data = _dq_section(dq, cfg, _derived_eras(etl_run, spec), _eras_not_built(etl_run)) if dq else None
     notes = list(annotations.notes) if annotations else []
     llm = _llm_section(cfg, ws, audit)
     # Done only when the current dq_results.json holds DQD results; an older successful run in the
@@ -1229,6 +1397,7 @@ def collect_report_data(
         "verdict": verdict,
         "verdict_reasons": reasons,
         "verdict_caveats": caveats if verdict == PASSED else [],
+        "verdict_notes": verdict_notes,  # steps that failed without failing the build
         "reviews": review_rows,
         "timeline": _timeline(stages, audit, ws.root),
         "source": _source_section(apply_overrides(profile, cfg.privacy, annotations), annotations) if profile else None,
@@ -1242,7 +1411,7 @@ def collect_report_data(
         "cdm": cdm,
         "cdm_note": cdm_note,
         "llm": llm,
-        "next_steps": _next_steps(verdict, design, notes, mapping, etl, dq_data, schemas, r_dqd_ran),
+        "next_steps": _next_steps(verdict, design, notes, mapping, etl, dq_data, schemas, r_dqd_ran, verdict_notes),
         "problems": problems,
     }
     return _redact_errors(data) if shareable else data

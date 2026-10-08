@@ -817,7 +817,7 @@ def test_validator_explains_the_generated_steps(staged, monkeypatch):
     # a step that runs the SQL of a mapping with errors is left out (its errors are reported already)
     issues = explained([tm for tm in spec.table_mappings if tm.source.table != "ipd_admissions"])
     assert not any("visit_map_2" in i for i in issues) and any("visit_map_prune" in i for i in issues)
-    # a non-blocking step that cannot run is a warning (it would be reported and skipped)
+    # a non-blocking step that cannot run is a warning (its error would be reported, and the build goes on)
     real = validate.compile_spec
 
     def prune_not_blocking(*args, **kwargs):
@@ -827,8 +827,8 @@ def test_validator_explains_the_generated_steps(staged, monkeypatch):
         return steps
 
     monkeypatch.setattr(validate, "compile_spec", prune_not_blocking)
-    assert any(i.startswith("WARNING step visit_map_prune cannot run (the step is skipped and reported)")
-               for i in explained(spec.table_mappings))
+    assert any(i.startswith("WARNING step visit_map_prune cannot run (the step would fail and be reported, "
+                            "without failing the build)") for i in explained(spec.table_mappings))
 
 
 @pytest.mark.postgres

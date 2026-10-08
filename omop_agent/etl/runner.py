@@ -34,6 +34,10 @@ before the steps run (with every table the route steps can write, and every tabl
 build moved records to), and ANALYZEd, as the connecting user; the facts an earlier build derived
 (``{etl}.build_facts``: the release date the observation-period merge stores for cdm_source) are
 deleted in the same transaction.
+
+``upgrade_notice`` tells the first build of a project last built by an older version what builds
+now do differently (``UPGRADE_BEHAVIOURS``); the pipeline logs it once and records an
+``upgrade_notice`` audit event.
 """
 
 from __future__ import annotations
@@ -83,6 +87,41 @@ def _previous_tables(ws: Workspace | None) -> set[str]:
         return set()
     names = {s.target_table for s in prev.steps} | {m.to_table for s in prev.steps for m in s.moved}
     return {n for n in names if _is_cdm_table(n)}
+
+
+# The behaviours a build of an older version did not have, announced once per project by its first
+# build after the update (an ``upgrade_notice`` audit event and one log line; README.md, "Upgrading").
+UPGRADE_NOTICE = "hdss-correct-output"
+UPGRADE_BEHAVIOURS = (
+    "person, death and visit_occurrence keep one row per key, and every person and visit mapping adds its keys "
+    "to the id maps",
+    "id-map keys that are not loaded are retired with their ids instead of deleted",
+    "values that cannot be read become NULL and are counted, and NULL required values follow the CDM conventions "
+    "(concept 0, end date = start date, or the row is dropped)",
+    "each person's observation periods are merged, and open episodes end at the source release date or at death",
+    "records move to the table of their standard concept's domain (route_by_domain)",
+    "condition_era and drug_era are derived with the OHDSI era logic (derive_eras)",
+    "custom SQL of a table without a mapping runs at that table's place in the load order",
+)
+
+
+def upgrade_notice(ws: Workspace) -> list[str]:
+    """The new build behaviours (``UPGRADE_BEHAVIOURS``) when the project's last build was made by a
+    version without them (its steps carry no ``kind``) and no ``upgrade_notice`` event announced them
+    yet; else []. A project that was never built has nothing to be told."""
+    if not ws.etl_run_json.exists():
+        return []
+    try:
+        prev = ws.load_json(ws.etl_run_json, ETLRunResult)
+    except Exception:  # an unreadable old result: no notice rather than a failed build
+        return []
+    if not prev.steps or any(s.kind is not None for s in prev.steps):
+        return []
+    if ws.audit_log.exists():
+        for line in ws.audit_log.read_text(encoding="utf-8").splitlines():
+            if UPGRADE_NOTICE in line and '"upgrade_notice"' in line:
+                return []
+    return list(UPGRADE_BEHAVIOURS)
 
 
 def _write_sql(ws: Workspace, steps: list[CompiledStep], cfg: ProjectConfig | None = None) -> None:

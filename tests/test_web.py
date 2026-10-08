@@ -346,7 +346,11 @@ def test_spec_page_shows_key_sources_and_dedup_order(site):
     assert "also <code>emr_patients</code> keyed by <code>&#39;EMR:&#39; || e.patient_no</code>" in page
     assert "one row per key, the best row first by <code>x.dod::date DESC</code>" in page
     # the build's merge of observation periods
-    assert "ends open ones at the source release date (configured, or derived from the exit dates) or at death" in page
+    assert ("ends open ones (no end date) at the source release date (cdm_source.source_release_date, configured or "
+            "derived from the exit dates) or at death") in page
+    # what the build does with every spec: one row per key, periods, routing, eras
+    assert "<dt>One row per key</dt><dd>person and death keep one row per person" in page
+    assert "<dt>Routing by domain</dt><dd>after loading" in page
 
 
 def test_report_is_served_with_a_strict_policy(site):

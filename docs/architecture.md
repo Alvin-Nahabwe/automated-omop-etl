@@ -66,7 +66,7 @@ flowchart LR
 | Design | `design/designer.py`, `design/validate.py`, `design/render.py` | `etl_spec.yaml`, `etl_spec.md` |
 | Evaluate vocabulary | `vocab/evaluate.py` | `vocab_evaluation.json` |
 | Map codes | `vocab/mapper.py`, `vocab/review.py` | `mappings/*.csv`, `etl.source_to_concept_map` |
-| Build | `etl/compiler.py`, `etl/runner.py` | `sql/*.sql`, CDM tables, `etl_run.json` |
+| Build | `etl/compiler.py`, `etl/runner.py`, `etl/tolerant.py`, `etl/policies.py`, `etl/routing.py`, `etl/session.py`, `etl/functions.sql` | `sql/*.sql`, CDM tables, `etl_run.json` |
 | Quality | `quality/checks.py`, `quality/dqd_r.py` | `dq_results.json` |
 | Repair | `quality/repair.py` | updated `etl_spec.yaml`, `repairs.json` |
 | Report | `report/inspection.py` | `report.md`, `report.html` |
@@ -104,7 +104,8 @@ value shapes (`99/99/9999 99:99`: 9 for a digit, a / A for a letter) and the tim
 written after the times. Shapes, offsets and listed values follow the small-cell rule: rarer
 offsets are only counted, and a key column's shape needs that many different keys. Direct
 identifiers get no shapes. A note flags a date column in which one date after the profile date is
-common: in an exit-date column that is usually a "still resident" placeholder.
+common: in an exit-date column that is usually a "still resident" placeholder. `profile.md` and
+the source section of the inspection report list these per column ("Reading the values").
 
 ## The ETL spec
 
@@ -123,6 +124,104 @@ a Rabbit-in-a-Hat document, and it compiles directly to SQL. Each `TableMapping`
 | `vocab_code` | `LEFT JOIN vocab.concept` on code+vocabulary, then `Maps to` for `concept_role: standard` |
 | `concept_map` | `LEFT JOIN etl.source_to_concept_map` on code+`source_vocabulary_id` |
 | `null` | `NULL` |
+
+Concept lookups yield `0` when the source value exists but has no mapping. When the source
+value is NULL they yield NULL, or 0 if the CDM field is required. `varchar(n)` targets are
+truncated to `n` characters. The `cdm_source` row is generated from `cdm_source` in the config;
+`cdm_version_concept_id` is looked up in the vocabulary (CDM vocabulary, code `CDM v5.4.0` or
+`CDM v5.4`), or 0 if that vocabulary isn't loaded. Placeholders `{cdm}`, `{vocab}`, `{src}`,
+`{etl}`, `{results}` in expressions and custom SQL resolve to the configured schemas.
+
+### The order of the build steps
+
+`compile_spec` gives every step a sort key (the load-order index of its table, a band, a
+sequence) and sorts on it: band 0 holds a table's writers (its mappings in spec order, then its
+custom SQL), band 1 the steps the build adds for that table, and band 2 the route block. Custom
+SQL for a table without a mapping runs at that table's place too. The full order:
+
+| # | Steps | Kind | Why here |
+|---|---|---|---|
+| 1 | `person_map`, `person_map_2`, ... | id_map | Every insert finds person ids through the map. Retired keys get their ids back first, then new keys are numbered after the largest id ever given. One step per extra person source, so a failing source loses only its own keys. |
+| 2 | `visit_map`, `visit_map_2`, ... | id_map | The same for visits, before any insert. The runner then ANALYZEs the id maps, so the joins are planned with fresh statistics. |
+| 3 | `location`, `care_site`, `provider` | insert, custom | Tables that others refer to come first. |
+| 4 | `person`, `person_2`, ..., person custom SQL | insert, custom | Values are converted and the required-field rules applied inside each insert, so a person dropped for a NULL birth year is gone before the next step. |
+| 5 | `person_map_prune` | prune | Retires the keys without a person, so the person join drops the records of people who were not loaded. It always runs: retiring is reversible. |
+| 6 | `visit_occurrence`, `visit_occurrence_2`, ..., custom SQL | insert, custom | After the person pruning, so visits of people who were not loaded are dropped. |
+| 7 | `visit_map_prune` | prune | Records each loaded visit's person in the map, then retires the keys without a visit. It comes before the records, which link only to a visit of their own person. |
+| 8 | `visit_detail` | insert, custom | Needs the visits. |
+| 9 | `condition_occurrence` ... `observation`, `death`, `note`, `specimen` | insert, custom | The records. |
+| 10 | `route_prepare`, `route_<table>` | route, not blocking | After every writer of the six event tables. Before `cost`, `fact_relationship` and `episode_event`, which refer to records; before the observation periods from records and the fill, which read them; before the eras, which read the condition and drug records where they end up. |
+| 11 | `payer_plan_period`, `cost` | insert, custom | After routing, so a cost refers to a record where it ends up. |
+| 12 | `observation_period` mappings or custom SQL, or the step that derives periods from the records (`from_events`) | insert, custom, derived | After routing and death: periods from the records read the routed tables. |
+| 13 | `observation_period_merge` | merge | After the last writer of `observation_period`. It reads `death`, whose writers all come earlier. |
+| 14 | `observation_period_fill` | derived | With `table_mapping` only. After the merge: it fills only persons left without a period, and cannot move the release date. |
+| 15 | `condition_era`, `drug_era` | derived, not blocking | From the condition and drug records as routed and de-duplicated. Spec SQL that loads an era table runs here instead of that table's step, as an ordinary insert or custom step: it blocks, and its errors fail the build like those of any spec SQL. |
+| 16 | `episode`, `episode_event`, `fact_relationship`, `metadata` | insert, custom | Tables of links come last, when ids are final. |
+| 17 | `cdm_source` | metadata | Reads the release date the merge stored in `etl.build_facts`. |
+
+The demo spec compiles to `01_person_map 02_visit_map 03_person 04_person_map_prune
+05_visit_occurrence 06_visit_map_prune 07_condition_occurrence 08_drug_exposure 09_measurement
+10_death 11_route_prepare 12_route_condition_occurrence 13_route_drug_exposure
+14_route_measurement 15_observation_period 16_observation_period_merge
+17_observation_period_fill 18_condition_era 19_drug_era 20_cdm_source`.
+
+A step runs in its own transaction, so a failing step is reported and the others still load. A
+step whose `requires` (a table or a step) failed or was skipped is skipped too (an era step after
+a failed load of its event table; a route step after `route_prepare`). The route and era steps
+are not blocking (`TableLoadResult.blocking`): their errors are reported, and the build is still
+checked. After every step that wrote rows the runner ANALYZEs the tables it wrote.
+
+### How a mapping compiles
+
+The `SELECT` of a mapping's `INSERT` has layers. Each one is fenced with `OFFSET 0`, so
+PostgreSQL neither merges them nor evaluates a value twice:
+
+1. **Source rows.** The mapping's `FROM`, joins and `WHERE`, the id-map joins, every
+   `column` / `expression` / `constant` / id value, and the code of every lookup (`_k1`, ...).
+   Each value is computed once per source row, and the tolerant conversions count, per field,
+   the values they could not read.
+2. **Required values.** A required field that comes out NULL follows the CDM convention
+   (`etl/policies.py`, derived from the CDM v5.4 field list) instead of failing the whole table
+   on its NOT NULL constraint:
+
+   | Required field | NULL becomes | Counted as |
+   |---|---|---|
+   | a concept (`*_concept_id`) | 0 | `defaulted` |
+   | `visit_end_date`, `visit_detail_end_date`, `drug_exposure_end_date` | the start date | `defaulted` |
+   | `observation_period_end_date` | `9999-12-31`: the episode is still open (the merge ends it) | - (the merge counts open episodes) |
+   | any other: start and event dates, `year_of_birth`, `death_date`, `note_text`, ... | the row is dropped | `required_null` per field, `row.dropped` |
+
+   This layer is left out when no required field is computed from the source.
+3. **Lookups.** The vocabulary and `source_to_concept_map` joins on the layer-1 codes,
+   `auto_id` and `null` fields. A code with several targets inserts several rows, but the counts
+   above are per source row.
+4. **One row per key** (`person`, `death`: one per person; `visit_occurrence`: one per visit and
+   person). The layer-3 rows become the candidates of one statement that keeps the best row of
+   each key and returns its statistics (see "One row per key").
+
+The counters are transaction-local settings (`omop_agent.<category>__<field>`) that the
+helper functions in the ETL schema (`etl/functions.sql`: `omop_count`, `omop_drop`,
+`omop_default_int`, `omop_derived_date`, `omop_derived_ts`) increase, only for the rows they count.
+The runner reads them at the end of the step into `TableLoadResult.value_counts`, and
+`retained_rows` is the rows that survived the id-map joins (`id_retained_rows`) minus the
+dropped rows. So `etlRecordRetention` and the fatal `etlRecordLoss` see the drops.
+`create_etl_tables` installs the functions with a version stamp: a version change must be
+installed once by their owner, and a build role needs EXECUTE on them (PUBLIC by default). Spec
+SQL may not call them (`sqlguard.py`).
+
+### Session settings
+
+Spec SQL runs in the build, in the vocabulary stage, in the repair agent's counts and in the
+validator's `EXPLAIN`s. Each of them pins the same settings first (`etl/session.py`), so a value
+reads the same everywhere, whatever the server's defaults: DateStyle `ISO, YMD` (a day-first text
+such as `'31/12/2020'::date` is an error, not a guess; with a two-digit year, `'31/12/20'::date`
+is read year-first, as 2031-12-20, so such a cast needs `to_date` with the template; field
+conversions are tolerant and give NULL instead), `standard_conforming_strings` on, the time
+zone `etl.timezone` when it is set, and the latest date a partial date may be completed to (the
+configured `cdm_source.source_release_date`, else the current date). The files in `sql/` start
+with these settings as comments.
+
+### Id maps
 
 The id maps are kept across re-runs, so a person keeps the same `person_id`, and no id is
 given to another key. After `person` and `visit_occurrence` load, map entries for people or
@@ -155,12 +254,43 @@ its filter, so a filtered-out or dropped visit counts here, while a `visit_key` 
 mapping writes and keys of an older spec do not). The rest name a key that no visit mapping
 reads.
 
-**Observation periods.** With `observation_period: table_mapping` the mappings (or custom
-SQL) load one row per source episode (residency, enrolment, follow-up), with a NULL end for an
-episode that is still open; with `from_events` the build derives one period per person from
-their first to their last record. After the last writer of `observation_period`, and so after
-`death`, the `observation_period_merge` step replaces those rows by each person's periods, in
-one statement that returns its statistics (`TableLoadResult.stats`):
+### One row per key
+
+`person` and `death` keep one row per person, and `visit_occurrence` one row per visit and
+person (`compiler.ONE_ROW_PER`), whichever mappings load them. The layer-3 rows become the
+candidates of one statement (`WITH cand AS MATERIALIZED ... picked ... ins AS (INSERT ...)
+SELECT <statistics>`). Among the rows of a key the mapping's `dedup_order` wins (an `ORDER BY`
+list over the aliases, ranked in layer 1 and read tolerantly; `NULLS LAST` is added to every
+item that does not say where NULLs go, so a missing or unreadable value never wins), then the
+table's default (for death a date known to the day before one completed from a year or month,
+then the latest date), then the most complete row (a concept 0 counts as missing, so an unknown
+sex never wins over a known one), then the source row's text (compared byte-wise, `COLLATE
+"C"`): the choice is deterministic and prefers no value. A visit takes the earliest start and
+the latest end of its rows (window `MIN` / `MAX`), where the patient came from as in its first
+row and where they went as in its last (`FIRST_VALUE`). Rows with a NULL drop-policy field are
+gone in layer 2, so they never win. A key an earlier mapping loaded is skipped (an anti-join
+outside `DISTINCT ON`); a visit key shared by two people gives two rows, so `isPrimaryKey` still
+fails. The statement returns `inserted`, `source_rows_kept`, `keys`, `duplicate_rows`,
+`already_loaded_keys`, `conflict_keys` (rows that disagree on sex or birth year, the date of
+death, or a visit's person, among themselves or with the row an earlier mapping loaded),
+`undecided_keys` (person and death: keys whose best-ranked rows still disagree), `fan_out_keys`
+(a code with several concepts) and, for visits, `gap_keys` (visits whose rows are separate
+stays) into `TableLoadResult.stats`. A NULL (`null`) field is a typed NULL, so it passes through
+the candidates.
+
+The checks report what the statement found (see "Quality gate and repair loop"): duplicates
+(`etlDuplicateRecords`), conflicting keys (`etlKeyConflict`), keys with a code of several concepts
+(`etlKeyFanOut`) and visit keys coarser than a visit (`etlVisitGrain`). Nothing is resolved
+silently.
+
+### Observation periods
+
+With `observation_period: table_mapping` the mappings (or custom SQL) load one row per source
+episode (residency, enrolment, follow-up), with a NULL end for an episode that is still open;
+with `from_events` the build derives one period per person from their first to their last
+record. After the last writer of `observation_period`, and so after `death`, the
+`observation_period_merge` step replaces those rows by each person's periods, in one statement
+that returns its statistics (`TableLoadResult.stats`):
 
 * an episode is open when its end is NULL (loaded as `9999-12-31`) or a placeholder on or after
   2099-01-01. It ends at the source release date, or at the person's death when that comes
@@ -204,12 +334,14 @@ the merged periods, which a fix of an episode's dates can join).
 `withinObservationPeriod` (characterization, 5%) counts the records of each event and era table
 whose start date lies in no period of their person.
 
-**Routing by domain.** The CDM puts a record in the table of its standard concept's domain, but a
-spec maps each source table to one table (an ICD-10 diagnosis list also holds observations such
-as Z34.9 and procedures). With `route_by_domain: true` (the default) the build moves the
-records after every writer of the event tables, in a block of generated steps after `specimen`
-and before `payer_plan_period`, `cost`, the observation periods and the eras, which read or refer
-to the records where they end up (`etl/routing.py`):
+### Routing by domain
+
+The CDM puts a record in the table of its standard concept's domain, but a spec maps each source
+table to one table (an ICD-10 diagnosis list also holds observations such as Z34.9 and
+procedures). With `route_by_domain: true` (the default) the build moves the records after every
+writer of the event tables, in a block of generated steps after `specimen` and before
+`payer_plan_period`, `cost`, the observation periods and the eras, which read or refer to the
+records where they end up (`etl/routing.py`):
 
 * `route_prepare` stores the largest id of each of the six event tables in `etl.id_high_water`;
   then one `route_<table>` step per table the spec loads among `condition_occurrence`,
@@ -262,94 +394,35 @@ tables, and the repair agent may not add either. Not
 routed (by design): records out of `observation`, concept-0 records by their source concept,
 and the value of a 'Maps to value' relationship.
 
-**Eras.** With `derive_eras: true` (the default) the build derives `condition_era` and
-`drug_era` with the OHDSI era logic (the CommonDataModel / ETL-Synthea scripts), in one generated
-step each at its table's place: after routing (the condition and drug records where they end up)
-and after the observation periods. The records of one person and concept (for drugs: each
-standard Ingredient of RxNorm or RxNorm Extension the drug rolls up to in `concept_ancestor`)
-that start at most 30 days after the earlier ones ended form one era, from the earliest start to
-the latest end; `drug_era.gap_days` counts the days of the era no exposure covers. Records with
-concept 0, and drug exposures with a negative `days_supply`, get no era. Where the published
-scripts are undefined the build deviates: a condition that ends before it starts ends the day
-after it starts; a drug exposure that ends before it starts ends after its `days_supply`
-(start + days_supply - 1) when that is 1 to 365 days, else on its start; ties are broken by the
-record id in both windows. On valid data the eras equal the published scripts (a test compares
-them, `tests/fixtures/era_reference.sql`). Spec SQL that loads an era table (a mapping or custom
-SQL with that target, or custom SQL with `INSERT INTO {cdm}.condition_era` / `drug_era`, also
-under the schema's own name or unqualified) replaces the built-in step for that table, runs at
-that table's place, and gets a validator warning. The era steps are not blocking (an error, such as a
+### Eras
+
+With `derive_eras: true` (the default) the build derives `condition_era` and `drug_era` with the
+OHDSI era logic (the CommonDataModel / ETL-Synthea scripts), in one generated step each at its
+table's place: after routing (the condition and drug records where they end up) and after the
+observation periods. The records of one person and concept (for drugs: each standard Ingredient
+of RxNorm or RxNorm Extension the drug rolls up to in `concept_ancestor`) that start at most 30
+days after the earlier ones ended form one era, from the earliest start to the latest end;
+`drug_era.gap_days` counts the days of the era no exposure covers. Records with concept 0, and
+drug exposures with a negative `days_supply`, get no era. Where the published scripts are
+undefined the build deviates: a condition that ends before it starts ends the day after it
+starts; a drug exposure that ends before it starts ends after its `days_supply` (start +
+days_supply - 1) when that is 1 to 365 days, else on its start; ties are broken by the record id
+in both windows. On valid data the eras equal the published scripts (a test compares them,
+`tests/fixtures/era_reference.sql`). Spec SQL that loads an era table (a mapping or custom SQL
+with that target, or custom SQL with `INSERT INTO {cdm}.condition_era` / `drug_era`, also under
+the schema's own name or unqualified) replaces the built-in step for that table, runs at that
+table's place as an ordinary blocking step, and gets a validator warning. The build's own era
+steps are not blocking (an error, such as a
 vocabulary without `concept_ancestor`, is reported as `etlStepError`, convention, and the build
 goes on without that table) and are skipped when a load of their event table failed. Their rows
 are counted apart from the loaded rows (derived rows). `measureConditionEraCompleteness` (DQD),
 `measureDrugEraCompleteness` (persons with an exposure that gets an era but no drug era) and
 `measureDrugEraCoverage` (exposures that get no era: no ingredient, or a negative `days_supply`;
-most are vaccines) check them; no check of an era table the build derived is sent to the repair
-agent, and the repair agent may not add a new mapping into an era table (fix the condition and
-drug records instead). `dose_era` is not built: OHDSI publishes no
-script for it.
-
-Concept lookups yield `0` when the source value exists but has no mapping. When the source
-value is NULL they yield NULL, or 0 if the CDM field is required. `varchar(n)` targets are
-truncated to `n` characters. The `cdm_source` row is generated from `cdm_source` in the config;
-`cdm_version_concept_id` is looked up in the vocabulary (CDM vocabulary, code `CDM v5.4`), or
-0 if that vocabulary isn't loaded. Placeholders `{cdm}`, `{vocab}`, `{src}`, `{etl}`, `{results}` in
-expressions and custom SQL resolve to the configured schemas.
-
-### How a mapping compiles
-
-The `SELECT` of a mapping's `INSERT` has layers. Each one is fenced with `OFFSET 0`, so
-PostgreSQL neither merges them nor evaluates a value twice:
-
-1. **Source rows.** The mapping's `FROM`, joins and `WHERE`, the id-map joins, every
-   `column` / `expression` / `constant` / id value, and the code of every lookup (`_k1`, ...).
-   Each value is computed once per source row, and the tolerant conversions count, per field,
-   the values they could not read.
-2. **Required values.** A required field that comes out NULL follows the CDM convention
-   (`etl/policies.py`, derived from the CDM v5.4 field list) instead of failing the whole table
-   on its NOT NULL constraint:
-
-   | Required field | NULL becomes | Counted as |
-   |---|---|---|
-   | a concept (`*_concept_id`) | 0 | `defaulted` |
-   | `visit_end_date`, `visit_detail_end_date`, `drug_exposure_end_date` | the start date | `defaulted` |
-   | `observation_period_end_date` | `9999-12-31`: the episode is still open (the merge ends it) | - (the merge counts open episodes) |
-   | any other: start and event dates, `year_of_birth`, `death_date`, `note_text`, ... | the row is dropped | `required_null` per field, `row.dropped` |
-
-   This layer is left out when no required field is computed from the source.
-3. **Lookups.** The vocabulary and `source_to_concept_map` joins on the layer-1 codes,
-   `auto_id` and `null` fields. A code with several targets inserts several rows, but the counts
-   above are per source row.
-4. **One row per key** (`person`, `death`: one per person; `visit_occurrence`: one per visit and
-   person). The layer-3 rows become the candidates of one statement (`WITH cand AS MATERIALIZED
-   ... picked ... ins AS (INSERT ...) SELECT <statistics>`). Among the rows of a key the
-   mapping's `dedup_order` wins (an `ORDER BY` list over the aliases, ranked in layer 1 and read
-   tolerantly; `NULLS LAST` is added to every item that does not say where NULLs go, so a missing
-   or unreadable value never wins), then the table's default (for death a date known to the day
-   before one completed from a year or month, then the latest date), then the most complete
-   row (a concept 0 counts as missing, so an unknown sex never wins over a known one), then the
-   source row's text (compared byte-wise, `COLLATE "C"`): the choice is deterministic and
-   prefers no value. A visit takes the earliest start and the latest end of its rows (window
-   `MIN` / `MAX`), where the patient came from as in its first row and where they went as in
-   its last (`FIRST_VALUE`). Rows with a NULL
-   drop-policy field are gone in layer 2, so they never win. A key an earlier mapping loaded is
-   skipped (an anti-join outside `DISTINCT ON`); a visit key shared by two people gives two rows,
-   so `isPrimaryKey` still fails. The statement returns `inserted`, `source_rows_kept`, `keys`,
-   `duplicate_rows`, `already_loaded_keys`, `conflict_keys` (rows that disagree on sex or birth
-   year, the date of death, or a visit's person, among themselves or with the row an earlier
-   mapping loaded), `undecided_keys` (person and death: keys whose best-ranked rows still
-   disagree), `fan_out_keys` (a code with several concepts) and, for visits, `gap_keys` (visits
-   whose rows are separate stays) into `TableLoadResult.stats`. A NULL (`null`) field is a typed
-   NULL, so it passes through the candidates.
-
-The counters are transaction-local settings (`omop_agent.<category>__<field>`) that the
-helper functions in the ETL schema (`etl/functions.sql`: `omop_count`, `omop_drop`,
-`omop_default_int`, `omop_derived_date`, `omop_derived_ts`) increase, only for the rows they count.
-The runner reads them at the end of the step into `TableLoadResult.value_counts`, and
-`retained_rows` is the rows that survived the id-map joins (`id_retained_rows`) minus the
-dropped rows. So `etlRecordRetention` and the fatal `etlRecordLoss` see the drops.
-`create_etl_tables` installs the functions with a version stamp: a version change must be
-installed once by their owner, and a build role needs EXECUTE on them (PUBLIC by default). Spec
-SQL may not call them (`sqlguard.py`).
+most are vaccines) check them. While `derive_eras` is on, no check of an era table is sent to
+the repair agent, whether the build derived it or spec SQL loaded it in the build's place (a
+person decides whether to keep such SQL), and the repair agent may not add a new mapping into an
+era table (fix the condition and drug records instead). `dose_era` is not built: OHDSI publishes
+no script for it.
 
 ### Tolerant conversion
 
@@ -403,7 +476,9 @@ s for another template.
 The checks `etlInvalidValue` (per field and `where`; convention at 5% for date and required
 fields; characterization for other fields, unless more than half of a field's values are
 unreadable, then convention) and `etlPartialDate` (characterization, never failed) report the
-counts. A row the `WHERE` could not decide because a value in it is unreadable is left out, and
+counts, and the report lists every count per table and field ("Values not loaded as written",
+with the defaulted values, the dropped rows and the offsets; counts below `min_cell_count` are
+shown as `<k` in the shareable copy). A row the `WHERE` could not decide because a value in it is unreadable is left out, and
 counted as a dropped record by `etlRecordRetention` and the fatal `etlRecordLoss`. The validator
 warns about a conversion the build has to leave as written, and about casts in joins and keys; an
 ISO cast (or `try_date` without a template) of a column profiled with a day-first or month-first
@@ -417,45 +492,43 @@ rare to list count towards "several" only next to a listed one.
 
 The built-in checks re-implement the Data Quality Dashboard field- and table-level checks in
 PostgreSQL. Names, thresholds and severities are read from DQD's own v5.4 metadata (bundled in
-`resources/ohdsi`), so results line up with DQD. An extra `etlRecordRetention` check compares
-source rows with rows kept after the person/visit joins and the required-field policies for
-each table mapping. `etlRequiredFieldNull` reports, per field, rows dropped for a NULL required
-value (convention; threshold 0 for `person`, because a dropped person takes their records along,
-5% elsewhere), and `etlDefaultedValue` the NULL required values the build completed (convention,
-5%), so the repair agent can write a better fallback where the source has one. For the tables
-that keep one row per key, `etlDuplicateRecords` reports the rows that lost to another row of
-their key (convention at 5% for `person`, where many mean a source of another grain; not
-repairable; characterization otherwise), `etlKeyConflict` the keys whose rows disagree
-(convention at 0 for the person keys whose best-ranked rows still disagree: all rows without a
-`dedup_order`; characterization otherwise), `etlKeyFanOut` the keys with a code of several
-concepts (convention, not repairable) and `etlVisitGrain` the visits rolled up from rows that are
-separate stays, a visit key coarser than one visit (fatal above 5%, not repairable).
-`etlVisitLinkage` reports records whose visit key gives no visit of their own person
-(convention, 5%; rows whose key is one of a visit mapping's source rows that the mapping left
-out are not counted: the retained count reads the visit mappings' keys before their filters),
-and `etlVisitLinkLoss` fails fatally when more than 100 - `min_record_retention_pct` percent
-name a key that no visit mapping reads. Two checks re-verify
-after the load what custom SQL could break (fatal, threshold 0, not repairable):
-`measureDuplicateDeaths` (one death per person) and `fkVisitPerson` (a record's visit belongs to
-its person). `etlDomainRouting` (characterization) reports the records each route step moved to
-the table of their concept's domain, and those that lost a value on the way. A route destination
-that no mapping loads (its records were all moved there) usually fails
-`measurePersonCompleteness`; that result is not sent to the repair agent, and a repair after which
-such a table receives no records is not treated as data loss. `measureConditionEraCompleteness`
-(DQD, convention, threshold 0), `measureDrugEraCompleteness` (ours, the same for drug eras:
-persons with an exposure that gets an era, i.e. a drug with a standard ingredient and a
-`days_supply` that is not negative, but no drug era; threshold 0; not applicable when `drug_era`
-is not built) and `measureDrugEraCoverage` (ours, convention, 5%: drug exposures that get no era)
-check the eras; none of them, and no check of an era table the build derived, is sent to the
-repair agent, and an era table that empties is not treated as data loss. DQD checks the
-built-in engine doesn't implement are listed as not applicable, and so is each empty table, as a
-single summary row. The run passes when no check with a
-blocking severity (default `fatal`) fails, no check listed in `quality.blocking_checks` fails
-(by default `measurePersonCompleteness` on `observation_period`, because analyses in ATLAS
-need every person to have one) and no ETL step errored. A table mapping that keeps fewer than
-`quality.min_record_retention_pct` (default 50%) of its source rows fails the fatal
-`etlRecordLoss` check, so a build that silently drops most records cannot pass. Otherwise the
-repair agent gets the failures and a set of tools:
+`resources/ohdsi`), so results line up with DQD. DQD checks the built-in engine doesn't
+implement are listed as not applicable, and so is each empty table, as a single summary row.
+
+The tool adds checks of its own for what the build does (`quality/checks.py`). The ETL-level ones
+carry the step's label, so a second mapping into a table gets its own key
+(`etlRecordRetention.measurement.measurement_2`):
+
+| Check | What it counts | Severity, threshold | Given to the repair agent |
+|---|---|---|---|
+| `etlStepError` | a step that failed | fatal; convention for a route or era step | only for a step that runs spec SQL (a mapping, custom SQL, or an id map of a mapping's keys) and did not fail for a missing privilege |
+| `etlRecordRetention` | source rows of a mapping not kept after the person and visit joins and the required-field rules | convention, 5% | yes |
+| `etlRecordLoss` | the same, when more than 100 - `quality.min_record_retention_pct` percent are lost (default: half) | fatal | yes |
+| `etlInvalidValue` | values a conversion could not read, per field and for the `WHERE` | convention, 5%, for date and required fields; characterization for other fields (convention when more than half are unreadable) and the `WHERE` | yes |
+| `etlPartialDate` | dates with an unknown day or month, completed or left NULL | characterization, never failed | no |
+| `etlRequiredFieldNull` | rows dropped for a NULL required value, per field | convention; 0 for `person` (a dropped person takes their records along), 5% elsewhere | yes |
+| `etlDefaultedValue` | NULL required values given the CDM default | convention, 5% | yes |
+| `etlDuplicateRecords` | rows that lost to another row of their key | convention, 5%, for `person` (many mean a source of another grain); characterization otherwise | no |
+| `etlKeyConflict` | keys whose rows disagree (sex or birth year, date of death, a visit's person) | convention, 0, for person keys whose best-ranked rows still disagree; characterization otherwise | person only (it can set a `dedup_order`) |
+| `etlKeyFanOut` | keys with a code mapped to several concepts | convention, 0 | no |
+| `etlVisitGrain` | visits rolled up from rows that are separate stays (a key coarser than a visit) | fatal, 5% | no |
+| `etlVisitLinkage` | records whose visit key gives no visit of their own person (a key the visit mappings filtered out is not counted) | convention, 5% | yes |
+| `etlVisitLinkLoss` | records whose visit key no visit mapping reads, when more than 100 - `min_record_retention_pct` percent | fatal | yes |
+| `measureDuplicateDeaths`, `fkVisitPerson` | persons with more than one death; records whose visit belongs to another person (re-checked after the load, since custom SQL bypasses the build's inserts) | fatal, 0 | no |
+| `etlObservationPeriodMerge` | episodes dropped because they end before they start, and those loaded as open because their exit date could not be read; a fatal `etlRecordLoss` copy as above | convention, 5% | yes |
+| `etlSourceReleaseDate` | open episodes ended on a derived release date, or episodes after a configured one | convention, 0; fatal when the derived date is after the day of the build | no |
+| `withinObservationPeriod` | records of an event or era table outside every period of their person (OMOP allows them) | characterization, 5% | no |
+| `etlDomainRouting` | records each route step moved, and those that lost a value on the way | characterization, never failed | no |
+| `etlHandRouting` | mappings that route records by hand while the build routes them (records loaded twice) | convention, 0 | no |
+| `measureConditionEraCompleteness` (DQD), `measureDrugEraCompleteness` | persons with a condition (a drug that gets an era) but no era | convention, 0 | no |
+| `measureDrugEraCoverage` | drug exposures that get no era (no standard ingredient, as vaccines, or a negative `days_supply`) | convention, 5% | no |
+
+The run passes when no blocking ETL step errored (the route and era steps are not blocking), no
+check with a blocking severity (default `fatal`) fails, and no check listed in
+`quality.blocking_checks` fails (by default `measurePersonCompleteness` on `observation_period`,
+because analyses in ATLAS need every person to have one). So a build that silently drops most
+records cannot pass (`etlRecordLoss`). Otherwise the repair agent gets the failures and a set of
+tools:
 
 * `get_table_mapping`, `get_cdm_table`, `get_source_profile`: read context;
 * `count_records`: counts only. The tool builds `SELECT g…, COUNT(*) AS n FROM <table>
@@ -475,18 +548,38 @@ repair agent gets the failures and a set of tools:
   makes a record's visit key NULL where it was not (a blank or NA-marker key aside) is refused
   too: it would hide records that lost their visit from `etlVisitLinkage`.
 
-Errors of steps the build generates (id-map pruning, routing, eras, ...) and errors a spec change cannot
-fix (a missing privilege of the ETL role: the error names the GRANT to run) are never sent to the
-repair agent. Neither is an edit that routes records by hand while the build routes them (a filter
-or join on the domain of `vocab.concept`, or a second mapping of the same codes into another
-event table): it is refused, because it would load those records twice. Nor is a new mapping into
-an era table while `derive_eras` is on (it would replace the OHDSI era step, or load the eras of
-one the spec's own SQL loads twice).
+Before an edit is applied it is dry-run: an edit that makes a required value whose NULL drops the
+row (a start date, `year_of_birth`, `death_date`) NULL for rows where it was not, that makes a
+record's visit key NULL, or that opens closed observation-period episodes (or closes open ones on
+their start date) is refused. A count that times out lets the edit through; the build history
+still rolls back a build that lost records. For open ends one placeholder exit date shared by all
+the episodes may become NULL, and an old fallback onto the start date may be removed; a correct
+fix of unreadable exits that gives episodes of one day is refused too, and left to a person.
+
+Some failures are never given to the repair agent, because its tools cannot fix their cause, or
+because a person has to decide:
+
+* errors of the steps the build generates (id-map pruning, routing, the observation-period merge
+  and fill, eras, `cdm_source`), and errors a spec change cannot fix (a missing privilege of the
+  ETL role: the error names the GRANT to run);
+* the checks of the era tables while `derive_eras` is on (derived by the build, or loaded by the
+  spec's own SQL in its place), and the three era checks;
+* `measurePersonCompleteness` of a table that only receives moved records, `fkDomain` of a table
+  whose route step failed, and `measurePersonCompleteness.observation_period` once the build
+  derived periods (it still blocks);
+* `isPrimaryKey` of `person` and `visit_occurrence`, and the checks marked "no" in the table
+  above.
+
+Nor may the agent route records by hand while the build routes them (a filter or join on the
+domain of `vocab.concept`, or a second mapping of the same codes into another event table), or
+add a mapping into an era table while `derive_eras` is on: such an edit is refused, because it
+would load records twice, or replace the OHDSI era step.
 
 The ETL is rebuilt and re-checked, up to `quality.max_repair_iterations` times. Each build is
 scored: losing data (a CDM table keeping under 95% of the rows an earlier build loaded, or of
 its records with a visit key or linked to their visit, or checks that applied before becoming
-not applicable) ranks below any number of failing checks,
+not applicable; not for an era table, or a table that only receives moved records, since both
+follow the loaded records) ranks below any number of failing checks,
 then ETL errors, then blocking and repairable failures. An iteration that makes the score worse
 is rolled back to the best spec, rebuilt, and its repairs are marked `reverted` in
 `repairs.json`. `etl_spec.before_repair.yaml` keeps the spec as it was before automatic
