@@ -18,10 +18,11 @@ corresponding DQD SQL file, so results line up with the official R package:
   year of birth was NULL, per field; threshold 0 for person, 5% elsewhere) and
   ``etlDefaultedValue`` (required values the build completed by the CDM convention: a concept 0,
   an end date equal to the start date; 5%), ``etlInvalidValue`` (values a conversion could not read,
-  such as '31/02/2019' or a number with text in it, loaded as NULL; convention at 5% for date and
+  such as '31/02/2019' or a number with text in it, read as NULL; convention at 5% for date and
   required fields, characterization for other fields unless more than half of the values are
-  unreadable, and for the mapping's WHERE, whose undecided rows etlRecordRetention counts as
-  dropped) and
+  unreadable, for a required field whose expression gave every such row another value (no row was
+  completed or dropped for it), and for the mapping's WHERE, whose undecided rows
+  etlRecordRetention counts as dropped) and
   ``etlPartialDate`` (dates with an unknown day or month, completed by the partial-date rule or
   left NULL; characterization, never failed); for person, death and visit_occurrence, which keep
   one row per key, ``etlDuplicateRecords`` (source rows that lost to another row of their key:
@@ -127,6 +128,7 @@ ETL_PERSON_DROP_THRESHOLD = 0.0
 # Values a conversion could not read (etlInvalidValue), as a share of the step's rows. In an
 # optional field that is not a date it is characterization (a column that mixes numbers and text),
 # unless more than ETL_INVALID_MOSTLY of its values are unreadable: then the expression is wrong.
+# So is a required field none of whose rows was NULL (the expression fell back to another value).
 ETL_INVALID_THRESHOLD = 5.0
 ETL_INVALID_MOSTLY = 50.0
 # One row per key (etlDuplicateRecords): the share of a person mapping's rows that lost to another
@@ -1064,6 +1066,15 @@ def _is_required_field(table: str, name: str) -> bool:
     return f is not None and f.required
 
 
+def _filled_required(s: TableLoadResult, name: str) -> bool:
+    """Whether ``name`` is a required field of the step's table none of whose rows was NULL: the
+    build counts every NULL required value it completed or dropped (an open observation-period end
+    is not counted), so its unreadable values all got another value from the field's expression."""
+    policy = required_null_policy(s.target_table, name)
+    return policy not in (None, "open") and not any(
+        (s.value_counts.get(c) or {}).get(name) for c in ("required_null", "defaulted"))
+
+
 def _partial_rule(table: str, name: str, etl: EtlConfig | None) -> str:
     """What the partial-date rule of ``table.name`` did with an unknown day or month."""
     policy = partial_policy(table, name, etl)
@@ -1098,15 +1109,18 @@ def _conversion_checks(s: TableLoadResult, label: str, etl: EtlConfig | None = N
                 severity="characterization", category="Conformance",
             ))
             continue
-        important = _is_date_field(t, f) or _is_required_field(t, f)
+        filled = _filled_required(s, f)
+        important = (_is_date_field(t, f) or _is_required_field(t, f)) and not filled
         mostly = not important and n * 100 > ETL_INVALID_MOSTLY * rows
         out.append(_value_check(
             s, label, "etlInvalidValue", f, n, rows, ETL_INVALID_MOSTLY if mostly else ETL_INVALID_THRESHOLD,
             f"Values of {t}.{f} in ETL step '{s.step}' that could not be read as written (an invalid date such as "
             f"31/02/2019, a date in another layout than the template, a number with text in it): {n} of {rows} rows, "
-            "loaded as NULL"
-            + (" (a required field then follows the CDM convention: see etlRequiredFieldNull and etlDefaultedValue)"
-               if _is_required_field(t, f) else "")
+            "read as NULL, so the field is NULL unless its expression falls back to another value (a COALESCE)"
+            + ("; no row was left with this required field NULL, so the expression gave these rows another value"
+               if filled else
+               " (a NULL required field then follows the CDM convention: see etlRequiredFieldNull and "
+               "etlDefaultedValue)" if _is_required_field(t, f) else "")
             + (f"; more than {ETL_INVALID_MOSTLY:g}% of the values, so the expression is probably wrong for this "
                "source" if mostly else "")
             + ". Fix the expression if the source has these values in another form (the to_date template the "

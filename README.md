@@ -317,6 +317,15 @@ Tests that need PostgreSQL are skipped when `OMOP_AGENT_TEST_DB_URL` is unset. C
 suite plus the offline demo against a `postgres:16` service, and builds the Docker bundle and
 runs the demo inside it.
 
+`tests/test_hdss.py` builds a small HDSS dataset (`tests/fixtures/hdss/`, about 35 people) in
+which every source row is one named case (`tests/hdss_cases.py`): duplicate and corrected
+registrations, partial and invalid dates, residency episodes that overlap, touch, stay open or end
+after the extract date, clinic patients who are not HDSS residents, ward stays, diagnoses whose
+codes belong to other domains, drug courses, and deaths from two sources. It checks the CDM row by
+row, and the check results and the gate. `tests/perf/scale.py` is not part of the suite: it
+measures the build on synthetic sources of a million people and a full Athena vocabulary (see
+"Measured performance" in `docs/architecture.md`).
+
 ## Upgrading
 
 Updating to the version with the conventions above ("What the build does beyond the mappings")
@@ -516,7 +525,9 @@ does with every spec. What changes:
   that converts the same unreadable value twice (`COALESCE(a::date, b::date)`) counts it twice,
   a template that is not a literal (written in hand-made SQL) is read at about 150 µs a value,
   and a cast of a `jsonb` value (`(j->'x')::int`) fails validation: cast the text instead
-  (`(j->>'x')::int`).
+  (`(j->>'x')::int`). An unreadable value that a `COALESCE` replaces is still counted: in an
+  optional date field it fails `etlInvalidValue` at convention severity although the field has a
+  value (for a required field the check sees that the build had no NULL to complete or drop).
 * An exit date that exists but cannot be read is loaded as an open episode (it runs to the release
   date or to death); `etlObservationPeriodMerge` counts such episodes.
 * Some steps and checks added for HDSS data were not yet timed on a full HDSS (about 1M people and

@@ -268,11 +268,16 @@ def test_conversion_checks():
         TableLoadResult(target_table="measurement", step="09_measurement", kind="insert", rows_inserted=100,
                         source_rows=100, id_retained_rows=100, retained_rows=100,
                         value_counts={"invalid": {"value_as_number": 40, "measurement_date": 4},
+                                      "required_null": {"measurement_date": 4}, "row": {"dropped": 4},
                                       "partial_null": {"measurement_date": 30}}),
         TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=10, source_rows=10,
                         id_retained_rows=10, retained_rows=10, value_counts={
-                            "invalid": {"year_of_birth": 1}, "imputed": {"birth_datetime": 3},
-                            "partial_null": {"birth_datetime": 2}}),
+                            "invalid": {"year_of_birth": 1}, "required_null": {"year_of_birth": 1},
+                            "imputed": {"birth_datetime": 3}, "partial_null": {"birth_datetime": 2}}),
+        # a required end date none of whose rows was NULL: the expression fell back (start + COALESCE(days, 1) - 1)
+        TableLoadResult(target_table="drug_exposure", step="08_drug_exposure", kind="insert", rows_inserted=10,
+                        source_rows=10, id_retained_rows=10, retained_rows=10,
+                        value_counts={"invalid": {"drug_exposure_end_date": 2}}),
     ]
     results = [r for r in etl_checks(ETLRunResult(started_at=NOW, steps=steps))
                if r.check_name in ("etlInvalidValue", "etlPartialDate")]
@@ -289,6 +294,7 @@ def test_conversion_checks():
         ("etlPartialDate.measurement.measurement_date", "characterization", 30, 100, 100.0, False),
         ("etlInvalidValue.person.year_of_birth", "convention", 1, 10, 5.0, True),
         ("etlPartialDate.person.birth_datetime", "characterization", 5, 10, 100.0, False),
+        ("etlInvalidValue.drug_exposure.drug_exposure_end_date", "characterization", 2, 10, 5.0, True),
     ]
     by = {r.key: r for r in results}
     assert "took the first day" in by["etlPartialDate.visit_occurrence.visit_start_date"].description
@@ -297,6 +303,8 @@ def test_conversion_checks():
     assert "THEMIS" in by["etlPartialDate.person.birth_datetime"].description
     assert "etlRequiredFieldNull" in by["etlInvalidValue.person.year_of_birth"].description
     assert "out of visit_occurrence" in by["etlInvalidValue.visit_occurrence.where"].description
+    end = by["etlInvalidValue.drug_exposure.drug_exposure_end_date"].description
+    assert "no row was left with this required field NULL" in end and "etlRequiredFieldNull" not in end
     # only convention failures go to the repair agent; offsets are not checks
     sev = {"fatal", "convention"}
     assert [r.key for r in results if repairable(r, sev)] == ["etlInvalidValue.person.year_of_birth"]

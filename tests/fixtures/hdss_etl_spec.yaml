@@ -1,0 +1,166 @@
+# ETL spec for the mini HDSS fixture (tests/fixtures/hdss/; the cases are listed in
+# tests/hdss_cases.py). People come from the HDSS register and from the clinic system (patients
+# not in the HDSS); visits from the outpatient register and the inpatient ward list; deaths from
+# the register and from verbal autopsies.
+version: 1
+cdm_version: '5.4'
+person_key:
+  table: individuals
+  expression: individual_id
+visit_key:
+  table: clinic_visits
+  expression: visit_id
+observation_period: table_mapping
+observation_period_type_concept_id: 32817
+table_mappings:
+- target_table: person
+  source: {table: individuals, alias: i}
+  dedup_order: i.reg_date::date DESC
+  rationale: One row per registration; a re-registration corrects the earlier one.
+  fields:
+  - {target_field: person_id, kind: person_id, expression: i.individual_id}
+  - target_field: gender_concept_id
+    kind: expression
+    expression: CASE i.sex WHEN '1' THEN 8507 WHEN '2' THEN 8532 END
+    rationale: 'HDSS sex codes: 1 male, 2 female, 9 unknown.'
+  - {target_field: year_of_birth, kind: expression, expression: "EXTRACT(YEAR FROM to_date(i.dob, 'DD/MM/YYYY'))::int"}
+  - {target_field: month_of_birth, kind: expression, expression: "EXTRACT(MONTH FROM to_date(i.dob, 'DD/MM/YYYY'))::int"}
+  - {target_field: day_of_birth, kind: expression, expression: "EXTRACT(DAY FROM to_date(i.dob, 'DD/MM/YYYY'))::int"}
+  - {target_field: birth_datetime, kind: expression, expression: "to_date(i.dob, 'DD/MM/YYYY')::timestamp"}
+  - {target_field: race_concept_id, kind: constant, expression: '0'}
+  - {target_field: ethnicity_concept_id, kind: constant, expression: '0'}
+  - {target_field: person_source_value, kind: column, expression: i.individual_id}
+  - {target_field: gender_source_value, kind: column, expression: i.sex}
+- target_table: person
+  source: {table: emr_patients, alias: e}
+  where: e.hdss_id IS NULL
+  rationale: Clinic patients who are not HDSS residents (those linked to the HDSS are already people).
+  fields:
+  - {target_field: person_id, kind: person_id, expression: "'EMR:' || e.patient_no"}
+  - target_field: gender_concept_id
+    kind: expression
+    expression: CASE e.sex WHEN 'M' THEN 8507 WHEN 'F' THEN 8532 END
+  - {target_field: year_of_birth, kind: expression, expression: EXTRACT(YEAR FROM e.dob::date)::int}
+  - {target_field: month_of_birth, kind: expression, expression: EXTRACT(MONTH FROM e.dob::date)::int}
+  - {target_field: day_of_birth, kind: expression, expression: EXTRACT(DAY FROM e.dob::date)::int}
+  - {target_field: race_concept_id, kind: constant, expression: '0'}
+  - {target_field: ethnicity_concept_id, kind: constant, expression: '0'}
+  - {target_field: gender_source_value, kind: column, expression: e.sex}
+- target_table: observation_period
+  source: {table: residency_episodes, alias: r}
+  rationale: One row per residency episode; an episode without an exit date is still open.
+  fields:
+  - {target_field: observation_period_id, kind: auto_id}
+  - {target_field: person_id, kind: person_id, expression: r.individual_id}
+  - {target_field: observation_period_start_date, kind: expression, expression: "to_date(r.start_date, 'DD/MM/YYYY')"}
+  - {target_field: observation_period_end_date, kind: expression, expression: "to_date(r.end_date, 'DD/MM/YYYY')"}
+  - {target_field: period_type_concept_id, kind: constant, expression: '32817'}
+- target_table: visit_occurrence
+  source: {table: clinic_visits, alias: v}
+  where: v.visit_type <> 'EMERG'
+  rationale: Outpatient visits; emergency visits are recorded elsewhere. The ODK form's submission time is the
+    visit time, and its date when the visit date is missing.
+  fields:
+  - {target_field: visit_occurrence_id, kind: visit_id, expression: v.visit_id}
+  - {target_field: person_id, kind: person_id, expression: "COALESCE(v.individual_id, 'EMR:' || v.patient_no)"}
+  - {target_field: visit_concept_id, kind: constant, expression: '9202'}
+  - {target_field: visit_start_date, kind: expression, expression: "COALESCE(v.visit_date::date, v.submitted_at::date)"}
+  - {target_field: visit_start_datetime, kind: expression, expression: v.submitted_at::timestamp}
+  - {target_field: visit_end_date, kind: expression, expression: v.discharge_date::date}
+  - {target_field: visit_type_concept_id, kind: constant, expression: '32817'}
+  - {target_field: visit_source_value, kind: column, expression: v.visit_type}
+- target_table: visit_occurrence
+  source: {table: ipd_wards, alias: w}
+  rationale: One row per ward stay; the stays of one admission are one inpatient visit. Admission numbers are
+    numbered apart from the outpatient visit ids, hence the prefix.
+  fields:
+  - {target_field: visit_occurrence_id, kind: visit_id, expression: "'IPD:' || w.admission_no"}
+  - {target_field: person_id, kind: person_id, expression: w.patient_ref}
+  - {target_field: visit_concept_id, kind: constant, expression: '9201'}
+  - {target_field: visit_start_date, kind: expression, expression: w.ward_in::date}
+  - {target_field: visit_end_date, kind: expression, expression: w.ward_out::date}
+  - {target_field: visit_type_concept_id, kind: constant, expression: '32817'}
+  - {target_field: visit_source_value, kind: constant, expression: "'IPD'"}
+- target_table: condition_occurrence
+  source: {table: diagnoses, alias: d}
+  rationale: One row per ICD-10 diagnosis.
+  fields:
+  - {target_field: condition_occurrence_id, kind: auto_id}
+  - {target_field: person_id, kind: person_id, expression: "COALESCE(d.individual_id, 'EMR:' || d.patient_no)"}
+  - {target_field: condition_concept_id, kind: vocab_code, expression: d.icd10, vocabulary: ICD10}
+  - {target_field: condition_start_date, kind: expression, expression: d.dx_date::date}
+  - {target_field: condition_type_concept_id, kind: constant, expression: '32817'}
+  - {target_field: visit_occurrence_id, kind: visit_id, expression: d.visit_ref}
+  - {target_field: condition_source_value, kind: column, expression: d.icd10}
+  - {target_field: condition_source_concept_id, kind: vocab_code, expression: d.icd10, vocabulary: ICD10, concept_role: source}
+- target_table: drug_exposure
+  source: {table: prescriptions, alias: p}
+  rationale: One row per prescription line.
+  fields:
+  - {target_field: drug_exposure_id, kind: auto_id}
+  - {target_field: person_id, kind: person_id, expression: "COALESCE(p.individual_id, 'EMR:' || p.patient_no)"}
+  - {target_field: drug_concept_id, kind: concept_map, expression: p.drug, vocabulary: SRC_DRUG, target_domain: Drug}
+  - {target_field: drug_exposure_start_date, kind: expression, expression: p.date_prescribed::date}
+  - target_field: drug_exposure_end_date
+    kind: expression
+    expression: p.date_prescribed::date + GREATEST(COALESCE(p.days::int, 1), 1) - 1
+  - {target_field: drug_type_concept_id, kind: constant, expression: '32817'}
+  - {target_field: quantity, kind: expression, expression: p.qty::numeric}
+  - {target_field: days_supply, kind: expression, expression: p.days::int}
+  - {target_field: visit_occurrence_id, kind: visit_id, expression: p.visit_ref}
+  - {target_field: drug_source_value, kind: column, expression: p.drug}
+  - {target_field: drug_source_concept_id, kind: constant, expression: '0'}
+- target_table: measurement
+  source: {table: lab_results, alias: l}
+  rationale: Lab results; a result is a number or POS / NEG.
+  fields:
+  - {target_field: measurement_id, kind: auto_id}
+  - {target_field: person_id, kind: person_id, expression: "COALESCE(l.individual_id, 'EMR:' || l.patient_no)"}
+  - {target_field: measurement_concept_id, kind: concept_map, expression: l.test, vocabulary: SRC_LAB, target_domain: Measurement}
+  - {target_field: measurement_date, kind: expression, expression: l.test_date::date}
+  - {target_field: measurement_type_concept_id, kind: constant, expression: '32817'}
+  - target_field: value_as_number
+    kind: expression
+    expression: CASE WHEN l.result ~ '^-?[0-9]+(\.[0-9]+)?$' THEN l.result::numeric END
+  - target_field: value_as_concept_id
+    kind: concept_map
+    expression: CASE WHEN l.result !~ '^-?[0-9]+(\.[0-9]+)?$' THEN l.result END
+    vocabulary: SRC_RESULT
+    target_domain: Meas Value
+  - {target_field: unit_concept_id, kind: concept_map, expression: l.unit, vocabulary: SRC_UNIT, target_domain: Unit}
+  - {target_field: visit_occurrence_id, kind: visit_id, expression: l.visit_ref}
+  - {target_field: measurement_source_value, kind: column, expression: l.test}
+  - {target_field: unit_source_value, kind: column, expression: l.unit}
+  - {target_field: value_source_value, kind: column, expression: l.result}
+- target_table: observation
+  source: {table: residency_episodes, alias: r}
+  where: r.entry_type = 'IMG'
+  rationale: In-migrations, on the day of entry.
+  fields:
+  - {target_field: observation_id, kind: auto_id}
+  - {target_field: person_id, kind: person_id, expression: r.individual_id}
+  - {target_field: observation_concept_id, kind: constant, expression: '2000100005'}
+  - {target_field: observation_date, kind: expression, expression: "to_date(r.start_date, 'DD/MM/YYYY')"}
+  - {target_field: observation_type_concept_id, kind: constant, expression: '32817'}
+  - {target_field: observation_source_value, kind: column, expression: r.entry_type}
+- target_table: death
+  source: {table: deaths, alias: x}
+  rationale: Deaths in the HDSS register.
+  fields:
+  - {target_field: person_id, kind: person_id, expression: x.individual_id}
+  - {target_field: death_date, kind: expression, expression: x.dod::date}
+  - {target_field: death_type_concept_id, kind: constant, expression: '32817'}
+- target_table: death
+  source: {table: va_deaths, alias: w}
+  dedup_order: CASE w.verified WHEN 'Y' THEN 0 ELSE 1 END
+  rationale: Verbal autopsies; a death the register has is kept from the register. A verified interview wins.
+  fields:
+  - {target_field: person_id, kind: person_id, expression: w.individual_id}
+  - {target_field: death_date, kind: expression, expression: "to_date(w.va_date, 'DD/MM/YYYY')"}
+  - {target_field: death_type_concept_id, kind: constant, expression: '32817'}
+  - {target_field: cause_concept_id, kind: concept_map, expression: w.cause, vocabulary: SRC_VA_CAUSE, target_domain: Condition}
+  - {target_field: cause_source_value, kind: column, expression: w.cause}
+custom_sql: []
+assumptions:
+- HDSS residency episodes define the observation periods; the release date is the extract date.
+open_questions: []

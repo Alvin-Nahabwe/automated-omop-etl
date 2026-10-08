@@ -75,6 +75,11 @@ LEXICAL_MIN_SCORE = 0.85  # lexical fallback threshold when no LLM is available
 DECISION_CANDIDATES = 5  # candidates kept on each decision for the reviewer
 EXHAUSTIVE_DOMAIN_SIZE = 3000  # domains up to this many standard concepts are scored in full
 TRGM_WORD_THRESHOLD = 0.3  # pg_trgm.word_similarity_threshold used to retrieve candidates
+# Candidates are first retrieved at this higher threshold, which the trigram index answers much faster on
+# a full vocabulary; a domain whose pool that does not fill is retrieved again at TRGM_WORD_THRESHOLD
+# (the pools are the same either way: see _Searcher._trigram). Drug names usually fill their pools at
+# this threshold; for most other terms some accepted domain does not, and both retrievals run.
+TRGM_FIRST_THRESHOLD = 0.5
 POOL_SIZE = 300  # rows retrieved by trigram/ILIKE search before Python re-scoring
 ALSO_ACCEPTED_CANDIDATES = 3  # candidates added from each other accepted domain of a term
 MAX_RETRY_PHRASES = 3
@@ -471,7 +476,30 @@ class _Searcher:
                 )
         return self._pools[domain]
 
-    def _trigram_rows(self, q: str, codes: list[str], domain: str | None) -> list[dict]:
+    def _trigram(self, q: str, codes: list[str], domains: list[str | None]) -> list[dict]:
+        """The trigram pools of ``domains`` (one None: any domain): per domain the ``POOL_SIZE``
+        concepts of highest word similarity (ties by concept_id). They are first retrieved at
+        ``TRGM_FIRST_THRESHOLD``, which on a full vocabulary matches far fewer names and synonyms
+        than ``TRGM_WORD_THRESHOLD``; the domains whose pool that leaves short are retrieved again at
+        ``TRGM_WORD_THRESHOLD``. The pools are those of a retrieval at ``TRGM_WORD_THRESHOLD``: a pool
+        that fills at the higher threshold holds the concepts of highest similarity, all at or above
+        it, ranked as in the lower one."""
+
+        def fetch(wanted: list[str | None], threshold: float) -> list[dict]:
+            if len(wanted) == 1:
+                return self._trigram_rows(q, codes, wanted[0], threshold)
+            return self._trigram_rows_each(q, codes, [d for d in wanted if d is not None], threshold)
+
+        rows = fetch(domains, TRGM_FIRST_THRESHOLD)
+        full = {d for d in domains if sum(d is None or r["domain_id"] == d for r in rows) >= POOL_SIZE}
+        short = [d for d in domains if d not in full]
+        if not short:
+            return rows
+        kept = [r for r in rows if r["domain_id"] in full]
+        return kept + fetch(short, TRGM_WORD_THRESHOLD)
+
+    def _trigram_rows(self, q: str, codes: list[str], domain: str | None,
+                      threshold: float = TRGM_WORD_THRESHOLD) -> list[dict]:
         dom = self._domain_sql(domain)
         sql = f"""
 SELECT {_CONCEPT_COLS},
@@ -492,18 +520,24 @@ WHERE c.standard_concept = 'S' AND c.invalid_reason IS NULL {dom}
 GROUP BY {_CONCEPT_COLS}
 ORDER BY max(h.ws) DESC, c.concept_id
 LIMIT %(pool)s"""
-        setup = f"SET LOCAL pg_trgm.word_similarity_threshold = {float(TRGM_WORD_THRESHOLD)}"
+        setup = f"SET LOCAL pg_trgm.word_similarity_threshold = {float(threshold)}"
         return self._rows(sql, {"q": q, "codes": codes, "domain": domain, "pool": POOL_SIZE}, setup)
 
-    def _trigram_rows_each(self, q: str, codes: list[str], domains: list[str]) -> list[dict]:
+    def _trigram_rows_each(self, q: str, codes: list[str], domains: list[str],
+                           threshold: float = TRGM_WORD_THRESHOLD) -> list[dict]:
         """``_trigram_rows`` for several domains in one query: per domain the same ``POOL_SIZE``
         rows as a query of that domain alone (ranked alike, ties by concept_id), but the trigram
-        scans of the names and synonyms, which do not depend on the domain, run once."""
+        scans of the names and synonyms, which do not depend on the domain, run once. The concept's
+        columns come from the one join of the candidates with the concept table (a second join
+        would read the whole table when it has no index on concept_id)."""
+        top = _CONCEPT_COLS.replace("c.", "top.")
         sql = f"""
-SELECT {_CONCEPT_COLS},
-       ARRAY(SELECT s.concept_synonym_name FROM {self.v}.concept_synonym s WHERE s.concept_id = c.concept_id) AS synonyms
+SELECT {top},
+       ARRAY(SELECT s.concept_synonym_name FROM {self.v}.concept_synonym s WHERE s.concept_id = top.concept_id)
+           AS synonyms
 FROM (
-    SELECT c.concept_id, ROW_NUMBER() OVER (PARTITION BY c.domain_id ORDER BY max(h.ws) DESC, c.concept_id) AS rn
+    SELECT {_CONCEPT_COLS},
+           ROW_NUMBER() OVER (PARTITION BY c.domain_id ORDER BY max(h.ws) DESC, c.concept_id) AS rn
     FROM (
         SELECT c.concept_id, word_similarity(%(q)s, lower(c.concept_name)) AS ws
         FROM {self.v}.concept c
@@ -518,11 +552,10 @@ FROM (
     ) h
     JOIN {self.v}.concept c ON c.concept_id = h.concept_id
     WHERE c.standard_concept = 'S' AND c.invalid_reason IS NULL AND c.domain_id = ANY(%(domains)s)
-    GROUP BY c.concept_id, c.domain_id
+    GROUP BY {_CONCEPT_COLS}
 ) top
-JOIN {self.v}.concept c ON c.concept_id = top.concept_id
 WHERE top.rn <= %(pool)s"""
-        setup = f"SET LOCAL pg_trgm.word_similarity_threshold = {float(TRGM_WORD_THRESHOLD)}"
+        setup = f"SET LOCAL pg_trgm.word_similarity_threshold = {float(threshold)}"
         return self._rows(sql, {"q": q, "codes": codes, "domains": domains, "pool": POOL_SIZE}, setup)
 
     def _ilike_rows(self, q: str, codes: list[str], domain: str | None) -> list[dict]:
@@ -556,7 +589,7 @@ LIMIT %(pool)s"""
         ``ALSO_ACCEPTED_CANDIDATES`` best of each other accepted domain (``also``), each domain
         ranked as if searched on its own (so the target domain's candidates are those of a search
         without ``also``), best first; on a tie the target domain's concept comes first. The
-        domains too large to score in full are retrieved with one query."""
+        domains too large to score in full are retrieved together (``_trigram``)."""
         prefer = self.domain(domain)
         others = [d for d in dict.fromkeys(self.domain(a) for a in also) if d is not None and d != prefer]
         if prefer is None or not others:
@@ -569,8 +602,9 @@ LIMIT %(pool)s"""
     def _search_each(self, text: str, wanted: list[tuple[str | None, int]]) -> list[list[_Hit]]:
         """For each (domain, limit) of ``wanted`` (domains spelled by ``domain``), the ``limit`` best
         concepts of that domain for ``text``. A small domain is scored in full; the large ones
-        are retrieved by trigram (one query for all of them) or ILIKE, ``POOL_SIZE`` rows each,
-        and re-scored in Python."""
+        are retrieved by trigram (``_trigram``: one query for all of them, and one more for those
+        whose pool its higher threshold leaves short) or ILIKE, ``POOL_SIZE`` rows each, and
+        re-scored in Python."""
         raw = text.strip()
         q = normalize(raw)
         codes = list(dict.fromkeys(c for c in (raw, raw.upper(), raw.lower()) if c))
@@ -588,10 +622,7 @@ LIMIT %(pool)s"""
             fetched: list[dict] = []
             if self.trigram and q:
                 try:
-                    if len(large) == 1:
-                        fetched = self._trigram_rows(q, codes, large[0])
-                    else:
-                        fetched = self._trigram_rows_each(q, codes, [d for d in large if d is not None])
+                    fetched = self._trigram(q, codes, large)
                 except psycopg.Error:
                     self.trigram = False  # pg_trgm not reachable on the search_path: use ILIKE
             if self.trigram:

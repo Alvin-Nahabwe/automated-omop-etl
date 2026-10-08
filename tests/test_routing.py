@@ -1076,38 +1076,62 @@ def test_search_adds_other_accepted_domains(staged):
 
 
 @pytest.mark.postgres
-def test_one_retrieval_for_all_accepted_domains(staged, monkeypatch):
-    """The domains too large to score in full are retrieved with one trigram query per term (its
-    name and synonym scans do not depend on the domain), with per domain the same candidates as a
-    search of that domain alone: the target domain's recall is unchanged."""
+@pytest.mark.parametrize("pool", [300, 2])
+def test_one_retrieval_for_all_accepted_domains(staged, monkeypatch, pool):
+    """The domains too large to score in full are retrieved together, per term (the name and
+    synonym scans do not depend on the domain), with per domain the same candidates as a search of
+    that domain alone: the target domain's recall is unchanged. The retrieval runs first at a higher
+    similarity threshold, which a full vocabulary answers much faster, and again at the normal one
+    only for the domains whose pool that left short (on the fixture vocabulary: all of them, unless
+    the pool is tiny); the pools are those of a retrieval at the normal threshold."""
     from omop_agent.vocab import mapper
 
     conn, schemas, _ = staged
     monkeypatch.setattr(mapper, "EXHAUSTIVE_DOMAIN_SIZE", 0)  # every domain is too large to score in full
+    monkeypatch.setattr(mapper, "POOL_SIZE", pool)
     if not mapper._Searcher(conn, schemas).trigram:
         pytest.skip("pg_trgm is not available")
 
     def key(h):
         return -h.candidate.score, h.candidate.domain_id != "Measurement", h.candidate.concept_id
 
-    for text in ("haemoglobin", "Road traffic accident", "malaria test", "HB"):
-        searcher = mapper._Searcher(conn, schemas)
-        retrievals: list[str] = []
+    def counting(searcher):
+        retrievals: list[tuple[str, str]] = []
         real = searcher._rows
 
-        def counted(sql, params=None, setup=None, real=real, retrievals=retrievals):
+        def counted(sql, params=None, setup=None):
             if "word_similarity" in sql:
-                retrievals.append(sql)
+                retrievals.append((setup, ",".join(params.get("domains") or [params.get("domain") or ""])))
             return real(sql, params, setup)
 
         searcher._rows = counted  # type: ignore[method-assign]
+        return retrievals
+
+    domains = "Measurement,Observation,Condition"
+    shortcut = 0
+    for text in ("haemoglobin", "Road traffic accident", "malaria test", "HB"):
+        searcher = mapper._Searcher(conn, schemas)
+        retrievals = counting(searcher)
         both = searcher.search(text, "Measurement", 5, also=["Observation", "Condition"])
-        assert len(retrievals) == 1, text
+        first = f"SET LOCAL pg_trgm.word_similarity_threshold = {mapper.TRGM_FIRST_THRESHOLD}"
+        assert retrievals[0] == (first, domains) and len(retrievals) <= 2, text
+        if len(retrievals) == 2:  # again at the normal threshold, for the domains left short only
+            assert retrievals[1][0] == f"SET LOCAL pg_trgm.word_similarity_threshold = {mapper.TRGM_WORD_THRESHOLD}"
+            assert set(retrievals[1][1].split(",")) <= set(domains.split(","))
+        shortcut += len(retrievals) == 1 or len(retrievals[1][1].split(",")) < 3
         alone = mapper._Searcher(conn, schemas)
         expected = (alone.search(text, "Measurement", 5) + alone.search(text, "Observation", 3)
                     + alone.search(text, "Condition", 3))
         assert [(h.candidate.concept_id, h.candidate.score) for h in both] == [
             (h.candidate.concept_id, h.candidate.score) for h in sorted(expected, key=key)], text
+        # the same pools as one retrieval at the normal threshold
+        with monkeypatch.context() as m:
+            m.setattr(mapper, "TRGM_FIRST_THRESHOLD", mapper.TRGM_WORD_THRESHOLD)
+            once = mapper._Searcher(conn, schemas)
+            single = once.search(text, "Measurement", 5, also=["Observation", "Condition"])
+        assert [(h.candidate.concept_id, h.candidate.score) for h in both] == [
+            (h.candidate.concept_id, h.candidate.score) for h in single], text
+    assert shortcut > 0 if pool == 2 else shortcut == 0
 
 
 @pytest.mark.postgres

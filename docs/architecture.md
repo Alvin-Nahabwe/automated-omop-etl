@@ -382,7 +382,9 @@ domains of the table (`cdm.spec.ACCEPTED_DOMAINS`: a condition code may map to a
 Procedure or Measurement concept, a procedure code to an Observation or Measurement concept, a
 measurement to an Observation concept, a drug and a device to each other's domain): the mapper
 finds the target domain's candidates as before and shows the best three of each other accepted
-domain on top of them (one trigram retrieval per term serves all its domains), its exact and
+domain on top of them (one trigram retrieval per term serves all its domains; it runs first at a
+higher similarity threshold, which a full vocabulary answers faster, and again at the normal one
+for the domains whose pool it leaves short, so the candidates do not change), its exact and
 lexical shortcuts pick only concepts of the target domain, and a model's choice of another domain
 is never approved automatically. Fields that share a source vocabulary share one set (the union
 over routed fields, the intersection over the others); the validator warns when a field can get
@@ -475,8 +477,10 @@ s for another template.
 
 The checks `etlInvalidValue` (per field and `where`; convention at 5% for date and required
 fields; characterization for other fields, unless more than half of a field's values are
-unreadable, then convention) and `etlPartialDate` (characterization, never failed) report the
-counts, and the report lists every count per table and field ("Values not loaded as written",
+unreadable, then convention; characterization too for a required field none of whose rows was
+left NULL, because its expression falls back to another value, as in
+`start + COALESCE(days::int, 1) - 1`) and `etlPartialDate` (characterization, never failed)
+report the counts, and the report lists every count per table and field ("Values not loaded as written",
 with the defaulted values, the dropped rows and the offsets; counts below `min_cell_count` are
 shown as `<k` in the shareable copy). A row the `WHERE` could not decide because a value in it is unreadable is left out, and
 counted as a dropped record by `etlRecordRetention` and the fatal `etlRecordLoss`. The validator
@@ -504,7 +508,7 @@ carry the step's label, so a second mapping into a table gets its own key
 | `etlStepError` | a step that failed | fatal; convention for a route or era step | only for a step that runs spec SQL (a mapping, custom SQL, or an id map of a mapping's keys) and did not fail for a missing privilege |
 | `etlRecordRetention` | source rows of a mapping not kept after the person and visit joins and the required-field rules | convention, 5% | yes |
 | `etlRecordLoss` | the same, when more than 100 - `quality.min_record_retention_pct` percent are lost (default: half) | fatal | yes |
-| `etlInvalidValue` | values a conversion could not read, per field and for the `WHERE` | convention, 5%, for date and required fields; characterization for other fields (convention when more than half are unreadable) and the `WHERE` | yes |
+| `etlInvalidValue` | values a conversion could not read, per field and for the `WHERE` | convention, 5%, for date and required fields; characterization for other fields (convention when more than half are unreadable), for a required field whose expression gave every row a value, and for the `WHERE` | yes |
 | `etlPartialDate` | dates with an unknown day or month, completed or left NULL | characterization, never failed | no |
 | `etlRequiredFieldNull` | rows dropped for a NULL required value, per field | convention; 0 for `person` (a dropped person takes their records along), 5% elsewhere | yes |
 | `etlDefaultedValue` | NULL required values given the CDM default | convention, 5% | yes |
@@ -592,6 +596,68 @@ on the CDM the repair loop settled on, through a generated R script
 ran and feed the same gate; the report's engine reads `builtin+dqd`. If R is missing or fails,
 the run says so and falls back to the built-in checks, unless `quality.require_r_dqd` is set,
 in which case the run fails. Vocabulary coverage is measured again on the final build.
+
+## Measured performance
+
+`tests/perf/scale.py` builds synthetic HDSS-like sources with the build's own compiler and runner
+and times every step (it is not part of the test suite). The machine: 4 virtual CPUs (Intel Xeon,
+2.8 GHz), 15 GB of memory, a virtual disk, PostgreSQL 16.13 with its default settings
+(`shared_buffers` 128 MB, `work_mem` 4 MB, two parallel workers per query). The vocabulary was a
+full Athena download (6.5 million concepts, 40 million relationships, 77 million ancestor rows)
+without the lookups by id that `load_vocabulary` indexes (`concept (concept_id)` among them), as a
+vocabulary loaded by someone else can be: the route steps used their hash-join form. The times are
+those of a second run, with the vocabulary in the operating system's cache. A first run reads it
+from disk and is slower: on this disk, with 20,000 people, the first drug_era step took three
+minutes and the second two seconds.
+
+**One build with 1 million people** (1.05 million register rows, 5% of them second registrations,
+half of those with another sex), 2.97 million visit rows (one visit in ten in two ward rows), 3
+million diagnoses with ICD-10 codes of the vocabulary and 2 million prescriptions of 2,000 local
+drug names:
+
+| Step | Rows | Seconds |
+|---|---:|---:|
+| `person_map`, `visit_map` | 1.0 M and 2.7 M keys | 7 and 25 |
+| `person` (one row per person, `dedup_order`) | 1.0 M | 23 |
+| `visit_occurrence` (one row per visit and person, ward rows rolled up) | 2.6 M | 56 |
+| `person_map_prune`, `visit_map_prune` | | 1 and 10 |
+| `condition_occurrence` (`Maps to`, links to the visit of the same person) | 3.5 M | 29, of which 7 for the counts |
+| `drug_exposure` (`source_to_concept_map`, visit links) | 2.0 M | 23, of which 5 for the counts |
+| `route_condition_occurrence`, `route_drug_exposure` | 589,000 and 40,000 moved | 7 and 3 |
+| `condition_era`, `drug_era` | 2.9 M and 1.3 M eras | 9 and 8 |
+| the whole build | | 204 |
+| the checks (737 results; the slowest, `measureDrugEraCompleteness`, 4.5 s) | | 149 |
+
+The count queries of a record mapping (its source rows, and the rows it keeps with their visit
+links classified, which reads the distinct visit keys of the visit source) take a quarter of its
+step's time.
+
+**Observation periods of 1 million people from 5 million residency episodes** (overlaps,
+back-to-back moves, gaps, open and inverted episodes, a death for one person in 17, and 2 million
+records): the `observation_period` insert took 21 s, the merge into 3.8 million periods 33 s and
+the fill (556 people without a valid episode) 4 s; the whole build 99 s and its checks 48 s
+(`withinObservationPeriod` under a second). Profiling these sources took 65 s for the
+5-million-row residency table (three columns, two of them day-first dates), 18 s for the 2 million
+records and 17 s for the register.
+
+**Candidate search of the vocab_map stage**, per local term, for 30 drug, 30 lab and 30 diagnosis
+names, each with the other domains its field accepts (median and 90th percentile, in seconds):
+
+| Terms (other domains) | No `concept_id` index | With the indexes of `load_vocabulary` |
+|---|---:|---:|
+| drugs (Device) | 4.1, 7.8 | 2.9, 6.0 |
+| lab tests (Observation) | 3.3, 7.1 | 3.1, 7.0 |
+| diagnoses (Observation, Procedure, Measurement) | 4.0, 12.2 | 3.8, 9.7 |
+
+So a list of 1,000 local terms takes about an hour of searching on a full vocabulary, whatever the
+model does. Most of it is pg_trgm rechecking the names and synonyms that share trigrams with a
+short term (common trigrams match hundreds of thousands of them). Two changes made the search
+faster, without changing the candidates. The retrieval reads the concept table once per term
+instead of twice, which made every term faster. It also runs first at a higher similarity
+threshold and again at the normal one only for the domains whose pool that leaves short. This
+helps the drug terms, whose pools usually fill at the higher threshold: they took twice as long
+before. For lab and diagnosis terms the other domains rarely fill their pools at the higher
+threshold, so both retrievals run, and the first one adds about a tenth to their time.
 
 ## Review gates, the web app and deployment
 

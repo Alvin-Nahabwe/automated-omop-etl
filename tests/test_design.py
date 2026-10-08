@@ -771,6 +771,32 @@ def test_design_reproduces_reference_spec(staged, tmp_path):
 
 
 @pytest.mark.postgres
+def test_design_drafts_in_load_order(staged, tmp_path):
+    """A plan that lists the records before the people: the person and visit mappings are drafted first,
+    so the prompts of the records show their keys, and the spec keeps the plan's order."""
+    conn, schemas, cfg = staged
+    ref = load_ref()
+    first = ["condition_occurrence", "drug_exposure"]
+    reordered = ref.model_copy(update={"table_mappings": [tm for tm in ref.table_mappings if tm.target_table in first]
+                                       + [tm for tm in ref.table_mappings if tm.target_table not in first]})
+    replay = tmp_path / "replay"
+    record_reference(replay, reordered)
+    ws = Workspace(tmp_path / "work")
+
+    spec = design_etl(profile_from_db(conn, schemas), None, cfg, ReplayLLM(replay, ws), conn, schemas, ws)
+    assert spec.model_dump() == reordered.model_dump()
+    calls = [json.loads(c.read_text()) for c in sorted((ws.root / "llm_calls").glob("*.json"))]
+    assert [c["key"] for c in calls] == [
+        "plan", "table:person", "table:visit_occurrence", "table:condition_occurrence", "table:drug_exposure",
+        "table:measurement", "table:death", "table:observation_period"]
+    prompts = {c["key"]: c["prompt"] for c in calls}
+    for key in ("table:condition_occurrence", "table:drug_exposure"):
+        assert "Person mappings drafted so far" in prompts[key] and "  - individuals (i): i.individual_id" in prompts[key]
+        assert "Visit mappings drafted so far" in prompts[key] and "  - clinic_visits (v): v.visit_id" in prompts[key]
+    assert "Person mappings drafted so far" not in prompts["table:person"]
+
+
+@pytest.mark.postgres
 def test_design_prompts_carry_the_notes(staged, tmp_path):
     conn, schemas, cfg = staged
     ref = load_ref()
