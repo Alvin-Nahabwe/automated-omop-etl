@@ -72,6 +72,40 @@ flowchart LR
 | Report | `report/inspection.py` | `report.md`, `report.html` |
 | Orchestration | `pipeline.py`, `cli.py` | `state.json` |
 
+## Staging and profiling
+
+Staging copies every source table into the staging schema with text columns. Empty values become
+NULL. So do missing-value markers (`source.na_values`): by default `NA`, `NULL`, `\N` and `.` in
+CSV files, and none for database sources, where `NA` may be a real value. The marker is compared
+after trimming, case-sensitively. `staging_manifest.json` counts the markers per column.
+
+The profiler infers each column's type from a sample of up to about 20,000 values. The sample is
+spread over the table (row sampling, or block sampling above 200,000 rows). When the sample holds
+fewer than 100 values of a column, or fewer than 5 different values for the identifier check, the
+profiler reads the column's first values instead. A type must fit 95% of the sample. Besides ISO
+dates and day-first and month-first dates it knows:
+
+* Stata and SAS dates (`05mar2019`, `05MAR2019`) and timestamps (`05MAR2019:14:30:00`);
+* `dd/mm/yyyy HH:MM` timestamps, also with `-` or `.` in the date;
+* two-digit years with the year last (`05/03/19`), with a note on how the build reads the century,
+  and another when no year in the sample shows that it comes last;
+* times of day (`14:30`);
+* day numbers, only when a word of the column name says it holds dates. They are read as Excel
+  serial days, with a note that Stata, SAS and Unix count days from other dates.
+
+A note also says when no day in the sample is above 12, so that day-first is only assumed.
+Partial dates (day or month 00 or 97-99, no day, a year alone) and ISO dates count towards every
+date format, since the build reads them with any template. A full scan of each column then counts
+the values that do not fit its type or format, and the partial dates. It reads the values as the
+build does: any one of `- / . _` may stand for a separator, a time (and a time zone offset) may
+follow a date, a timestamp has seconds only when its format has them, and an impossible date such
+as 31/02 does not fit. Minimum and maximum use complete, valid dates only. The scan also lists
+value shapes (`99/99/9999 99:99`: 9 for a digit, a / A for a letter) and the time zone offsets
+written after the times. Shapes, offsets and listed values follow the small-cell rule: rarer
+offsets are only counted, and a key column's shape needs that many different keys. Direct
+identifiers get no shapes. A note flags a date column in which one date after the profile date is
+common: in an exit-date column that is usually a "still resident" placeholder.
+
 ## The ETL spec
 
 `ETLSpec` (`omop_agent/models.py`) is the hand-off between design and build, in the role of
@@ -373,8 +407,11 @@ counts. A row the `WHERE` could not decide because a value in it is unreadable i
 counted as a dropped record by `etlRecordRetention` and the fatal `etlRecordLoss`. The validator
 warns about a conversion the build has to leave as written, and about casts in joins and keys; an
 ISO cast (or `try_date` without a template) of a column profiled with a day-first or month-first
-format, in a field, join, key or custom SQL, and a strftime template such as `'%d/%m/%Y'`, are
-errors.
+format, in a field, join, key or custom SQL, a date conversion of a column of day numbers,
+and a strftime template such as `'%d/%m/%Y'`, are errors. So is a spec that reads a column whose
+profile shows UTC ('Z' or '+00:00') or several time zone offsets while `etl.timezone` is not set:
+the build would keep each time as written, so the times would not be on one clock. Offsets too
+rare to list count towards "several" only next to a listed one.
 
 ## Quality gate and repair loop
 

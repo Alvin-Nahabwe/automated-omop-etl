@@ -6,9 +6,14 @@ Rules (enforced by construction, not by prompt):
   * values seen fewer than ``min_cell_count`` times are suppressed everywhere they could reach
     the LLM (profile top values, vocabulary terms, repair-agent query results);
   * columns detected as direct identifiers (names, phone numbers, national and register numbers,
-    addresses, GPS, free text) get no values, no min/max, only counts; detection is heuristic, so
-    a person reviews what will be sent before the first live call (the "privacy" review gate);
-  * ``send_values_to_llm: false`` removes all values and keeps only statistics.
+    addresses, GPS, free text) get no values, no min/max, no value shapes, only counts; detection
+    is heuristic, so a person reviews what will be sent before the first live call (the "privacy"
+    review gate);
+  * value shapes ('99/99/9999') and time zone offsets follow the same small-cell rule as values;
+    offsets seen fewer times are only counted; counts of values that do not fit, partial dates,
+    missing-value markers and values with a rare offset between 1 and ``min_cell_count`` - 1 are
+    shown as "<k";
+  * ``send_values_to_llm: false`` removes all values, shapes and offsets and keeps only statistics.
 """
 
 from __future__ import annotations
@@ -40,6 +45,7 @@ _PHONE_WORD = re.compile(r"(phone|mobile|cell|contact|(^|_)tel|msisdn).*(no|num|
 # ICD titles) are long too, but have few function words and no sentence punctuation.
 FREE_TEXT_MIN_WORDS = 8
 FREE_TEXT_MIN_LENGTH = 40
+PII_MIN_VALUES = 5  # distinct sample values detect_pii needs before it judges a column by its values
 _FUNCTION_WORDS = frozenset(
     "a an the and but or so was were is are be been he she his her him they them their we our it its "
     "had has have with for to at on from that this who when after before because then not no "
@@ -171,7 +177,7 @@ def detect_pii(table: str, column: str, sample_values: Iterable[str], cfg: Priva
     if label:
         return f"the column name suggests {label}"
     values = [v.strip() for v in sample_values if v and v.strip()]
-    if len(values) >= 5:
+    if len(values) >= PII_MIN_VALUES:
         n = len(values)
         if sum(bool(_EMAIL.match(v)) for v in values) / n > 0.5:
             return "the values look like e-mail addresses"
@@ -235,26 +241,37 @@ def suppress_small_cells(values: list[ValueFreq], min_cell_count: int) -> tuple[
 
 
 def redact_column(col: ColumnProfile) -> ColumnProfile:
-    """Strip every value-bearing statistic from a column profile."""
+    """Strip every value-bearing statistic from a column profile (values, ranges, value shapes,
+    offsets). Counts and the format notes, which never quote a value, stay."""
     return col.model_copy(
-        update={"top_values": [], "min_value": None, "max_value": None, "mean": None, "n_suppressed_values": 0}
+        update={"top_values": [], "min_value": None, "max_value": None, "mean": None, "n_suppressed_values": 0,
+                "value_shapes": [], "nonconforming_shapes": [], "tz_offsets": []}
     )
 
 
 def llm_view(profile: SourceProfile, cfg: PrivacyConfig) -> SourceProfile:
     """The version of the profile that is allowed into a prompt."""
+    k = max(profile.min_cell_count, cfg.min_cell_count)  # the stricter of the profile's and the current threshold
     tables: list[TableProfile] = []
     for t in profile.tables:
         cols = []
         for c in t.columns:
-            if c.is_pii or not cfg.send_values_to_llm:
+            if c.is_pii:  # identifiers: no values, no shapes, no notes
+                cols.append(redact_column(c).model_copy(update={"format_notes": []}))
+                continue
+            if not cfg.send_values_to_llm:
                 cols.append(redact_column(c))
                 continue
-            # The stricter of the threshold the profile was taken with and the current setting.
-            kept, n_dropped = suppress_small_cells(c.top_values, max(profile.min_cell_count, cfg.min_cell_count))
+            kept, n_dropped = suppress_small_cells(c.top_values, k)
+            offsets = suppress_small_cells(c.tz_offsets, k)[0]
             update: dict = {
                 "top_values": kept[: cfg.max_values_per_column],
                 "n_suppressed_values": c.n_suppressed_values + n_dropped,
+                "value_shapes": suppress_small_cells(c.value_shapes, k)[0],
+                "nonconforming_shapes": suppress_small_cells(c.nonconforming_shapes, k)[0],
+                "tz_offsets": offsets,
+                # offsets the stricter threshold hides are counted with the rare ones
+                "n_rare_offsets": c.n_rare_offsets + sum(v.count for v in c.tz_offsets) - sum(v.count for v in offsets),
             }
             if _range_reveals_rare_value(c, {v.value for v in kept}):
                 update.update(min_value=None, max_value=None)
@@ -274,6 +291,9 @@ def _coarsen(col: ColumnProfile, value: str | None) -> str | None:
     if col.inferred_type in {"date", "datetime"}:
         m = re.match(r"^(\d{4})", value)
         return m.group(1) if m else None
+    if col.inferred_type == "time":  # the hour
+        m = re.match(r"^(\d{2}):", value)
+        return f"{m.group(1)}:00" if m else None
     if col.inferred_type in {"integer", "float"} and col.n_distinct > CODE_LIKE_MAX_DISTINCT:
         try:
             x = float(value)
@@ -294,9 +314,42 @@ def _range_reveals_rare_value(col: ColumnProfile, shown: set[str]) -> bool:
     return any(v is not None and v not in shown for v in (col.min_value, col.max_value))
 
 
+def small_count(n: int, k: int) -> str:
+    """A count for text that may be shared: between 1 and k - 1 it is shown as '<k'."""
+    return f"<{k}" if 0 < n < k else str(n)
+
+
+def _format_bit(c: ColumnProfile) -> str:
+    fmt = c.date_format or ""
+    pg = _pg_template(fmt)
+    if c.inferred_type == "time":
+        return f"format {fmt} (a time of day; PostgreSQL template '{pg}')"
+    # timestamps in the formats profiled before day-first and month-name ones keep their text
+    fn = "to_timestamp" if c.inferred_type == "datetime" and not fmt.startswith("%Y-%m-%d") else "to_date"
+    return f"format {fmt} (PostgreSQL: {fn}(x, '{pg}'))"
+
+
+def _value_bits(c: ColumnProfile, k: int) -> list[str]:
+    """What the profile says about values that need reading with care (nothing when all is plain)."""
+    bits: list[str] = []
+    if c.n_na_markers:
+        bits.append(f"{small_count(c.n_na_markers, k)} missing-value markers (source.na_values) staged as NULL")
+    if c.n_partial_dates:
+        bits.append(f"{small_count(c.n_partial_dates, k)} partial dates (unknown day or month, or no day)")
+    if c.n_nonconforming:
+        what = f"format {c.date_format}" if c.date_format else f"type {c.inferred_type}"
+        bits.append(f"{small_count(c.n_nonconforming, k)} values do not fit the {what}")
+    if c.tz_offsets:
+        bits.append("time zone offsets " + "; ".join(f"{v.value!r}×{v.count}" for v in c.tz_offsets))
+    if c.n_rare_offsets:
+        bits.append(f"{small_count(c.n_rare_offsets, k)} values with a time zone offset seen fewer than {k} times")
+    return bits
+
+
 def profile_prompt_text(profile: SourceProfile, cfg: PrivacyConfig, tables: list[str] | None = None) -> str:
     """Compact, privacy-filtered text rendering of the profile for prompts."""
     view = llm_view(profile, cfg)
+    k = max(profile.min_cell_count, cfg.min_cell_count)
     lines: list[str] = []
     for t in view.tables:
         if tables is not None and t.name not in tables:
@@ -312,17 +365,26 @@ def profile_prompt_text(profile: SourceProfile, cfg: PrivacyConfig, tables: list
             if c.unique:
                 bits.append("unique")
             if c.date_format:
-                bits.append(f"format {c.date_format} (PostgreSQL: to_date(x, '{_pg_template(c.date_format)}'))")
+                bits.append(_format_bit(c))
             if c.min_value is not None or c.max_value is not None:
                 bits.append(f"range [{c.min_value} .. {c.max_value}]")
             if c.is_pii:
                 bits.append(f"PII - values withheld ({c.pii_reason})")
+            bits += _value_bits(c, k)
             line = f"  - {c.name}: " + ", ".join(bits)
             if c.top_values:
                 vals = "; ".join(f"{v.value!r}×{v.count}" for v in c.top_values)
                 line += f"\n      top values: {vals}"
                 if c.n_suppressed_values:
                     line += f" (+{c.n_suppressed_values} values not listed: rare or beyond the top {cfg.max_values_per_column})"
+            if c.value_shapes:
+                line += "\n      value shapes (9 digit, a/A letter): " + "; ".join(
+                    f"{v.value!r}×{v.count}" for v in c.value_shapes)
+            if c.nonconforming_shapes:
+                line += "\n      shapes of the values that do not fit: " + "; ".join(
+                    f"{v.value!r}×{v.count}" for v in c.nonconforming_shapes)
+            for note in c.format_notes:
+                line += f"\n      note: {note}"
             lines.append(line)
         lines.append("")
     return "\n".join(lines)

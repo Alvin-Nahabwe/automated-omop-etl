@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from conftest import make_config
@@ -245,10 +245,11 @@ def test_type_inference(pg, tmp_path):
     empty = t.column("empty")
     assert (empty.n_null, empty.n_distinct, empty.unique, empty.top_values) == (n_rows, 0, False, [])
     # an impossible date among valid dd/mm/yyyy values: still a date column, the scan does not
-    # fail, and the impossible extreme is reported as found
+    # fail, and the impossible date is counted as non-conforming instead of being the maximum
     bad = t.column("bad_date")
     assert (bad.inferred_type, bad.date_format) == ("date", "%d/%m/%Y")
-    assert (bad.min_value, bad.max_value) == ("2010-03-23", "2025-02-31")
+    assert (bad.min_value, bad.max_value) == ("2010-03-23", "2019-12-04")
+    assert (bad.n_nonconforming, bad.n_partial_dates) == (1, 0)
     mostly = t.column("mostly_int")
     assert mostly.inferred_type == "integer" and (mostly.min_value, mostly.max_value) == ("1", "59")
 
@@ -257,6 +258,189 @@ def test_type_inference(pg, tmp_path):
         tmpl = strftime_to_pg(t.column(name).date_format)
         lo = scalar(conn, f"SELECT min(to_date({qi(name)}, %s))::text FROM {schemas.src}.cases", (tmpl,))
         assert lo == t.column(name).min_value, name
+
+
+def _layout_rows(n: int) -> list[list[str | None]]:
+    """Rows of the layouts table: each column cycles through valid values, with named exceptions."""
+    mons = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+    rows = []
+    for i in range(n):
+        d, m, y = 1 + i % 28, 1 + i % 12, 2010 + i % 10
+        if i < 20:
+            dob = "00/06/1975"  # unknown day
+        elif i < 25:
+            dob = "06/1975"  # no day
+        elif i == 25:
+            dob = "99/99/1980"  # unknown day and month
+        elif i == 26:
+            dob = "31/02/1980"  # no such date
+        elif i < 33:
+            dob = "unknown"
+        else:
+            dob = f"{d:02d}/{m:02d}/{1950 + i % 50}"
+        if i < 60:
+            odk = f"{y}-{m:02d}-{d:02d}T23:30:00Z"
+        elif i < 62:
+            odk = f"{y}-{m:02d}-{d:02d}T10:00:00-05:00"  # rare: only counted
+        elif i == 62:
+            odk = f"{y}-{m:02d}-{d:02d}T10:00:00+0300"
+        else:
+            odk = f"{y}-{m:02d}-{d:02d}T10:00:00+03:00"
+        # timestamps with seconds, some without (the build reads none of those) and some with an
+        # offset (it reads those)
+        hms = f"{d:02d}/{m:02d}/{y} {i % 24:02d}:{i % 60:02d}" + ("" if i % 10 < 3 else ":30")
+        hms += "+03:00" if i % 10 == 9 else ""
+        # dates followed by a time: with an offset, after a 'T', with seconds (all read), at hour 25 (not)
+        dmy_t = f"{d:02d}/{m:02d}/{y}" + {0: " 10:30+03:00", 1: "T10:30", 2: " 25:00", 3: " 10:30:15"}.get(i % 100, "")
+        rows.append([
+            f"{d:02d}{mons[m - 1]}{y}",  # Stata %td
+            f"{d:02d}{mons[m - 1].upper()}{y}",  # SAS DATE9
+            f"{d:02d}{mons[m - 1].upper()}{y}:{i % 24:02d}:{i % 60:02d}:00",  # SAS DATETIME
+            f"{d:02d}/{m:02d}/{y} {i % 24}:{i % 60:02d}",
+            f"{d:02d}/{m:02d}/{y % 100:02d}",
+            str(43000 + i),  # Excel serial days, in a column named like a date ...
+            str(43000 + i),  # ... and in ones that are not
+            str(43000 + i),
+            f"{i % 24}:{i % 60:02d}",
+            dob,
+            f"{y}-{m:02d}-{d:02d}" if i % 5 == 0 else f"{d:02d}/{m:02d}/{y}",  # dd/mm with ISO dates
+            odk,
+            "2050-12-31" if i % 4 == 0 else f"{y}-{m:02d}-{d:02d}",  # "still resident" exits
+            "n/a" if i % 30 == 0 else str(i),
+            f"{1 + i % 12:02d}/{1 + i % 12:02d}/{y}",  # day and month <= 12 everywhere
+            f"{1 + i % 12:02d}/{1 + i % 12:02d}/{y} 10:{i % 60:02d}",  # the same with a time
+            hms,
+            f"{d:02d}-{m:02d}-{y} {i % 24:02d}:{i % 60:02d}",  # dd-mm-yyyy HH:MM
+            dmy_t,
+            # birth dates: 10% a year alone, 10% without the day
+            "1975" if i % 10 == 0 else f"{m:02d}.1975" if i % 10 == 5 else f"{d:02d}.{m:02d}.{1950 + i % 50}",
+            f"{d:02d}/{m:02d}/{(1950 + i % 50) % 100:02d}",  # two-digit years above 31: the year is last
+            f"{i % 24}:{i % 60:02d}" if i % 2 else f"{i % 24}:{i % 60:02d}:30",  # times, half with seconds
+            f"{i}.0" if i % 100 == 1 else str(i),  # integers, some written '5.0' (the build reads them)
+            # ISO timestamps; a few with '/': read with the format's own 'T', not with a space
+            f"{y}/{m:02d}/{d:02d}" + (" " if i % 50 == 7 else "T") + "10:30:00" if i % 50 in (7, 27)
+            else f"{y}-{m:02d}-{d:02d}T10:30:00",
+        ])
+    return rows
+
+
+LAYOUT_COLUMNS = ["stata", "sas", "sas_dt", "dmy_hm", "yy", "excel_date", "excel_n", "dt_code", "tod", "dob", "mixed",
+                  "odk", "end_date", "qty", "ambiguous", "ambiguous_ts", "hms_mix", "dash_hm", "dmy_t", "birth_mix",
+                  "yy_old", "tod_mix", "counts", "iso_slash"]
+
+
+@pytest.mark.postgres
+def test_profiler_layouts_and_nonconforming(pg, tmp_path):
+    from omop_agent.cdm.ddl import create_etl_tables
+    from omop_agent.profiling.profiler import (
+        DAY_FIRST_NOTE,
+        EXCEL_NOTE,
+        SAMPLE_VALUES,
+        TWO_DIGIT_YEAR_NOTE,
+        YEAR_FIRST_NOTE,
+    )
+
+    conn, schemas = pg
+    cfg = make_config(tmp_path, tmp_path, schemas)
+    ensure_schema(conn, schemas.src)
+    execute(conn, f"CREATE TABLE {schemas.src}.layouts ({', '.join(f'{qi(c)} text' for c in LAYOUT_COLUMNS)})")
+    n = 200
+    with conn.cursor() as cur:
+        cur.executemany(f"INSERT INTO {schemas.src}.layouts VALUES ({', '.join(['%s'] * len(LAYOUT_COLUMNS))})",
+                        _layout_rows(n))
+    # a table larger than the sample whose values change late in the file: the sample is spread
+    # over the table (its first 20,000 rows hold only dates)
+    late = SAMPLE_VALUES + 10_000
+    execute(conn, f"""CREATE TABLE {schemas.src}.late AS SELECT CASE WHEN g <= {SAMPLE_VALUES + 1000}
+                      THEN to_char(DATE '2015-01-01' + g % 2000, 'YYYY-MM-DD') ELSE 'pending' END AS outcome_date
+                      FROM generate_series(1, {late}) g""")
+    t = profile_staging(conn, schemas, cfg).table("layouts")
+    c = {x.name: x for x in t.columns}
+    expected = {
+        "stata": ("date", "%d%b%Y"), "sas": ("date", "%d%b%Y"), "sas_dt": ("datetime", "%d%b%Y:%H:%M:%S"),
+        "dmy_hm": ("datetime", "%d/%m/%Y %H:%M"), "yy": ("date", "%d/%m/%y"), "excel_date": ("date", None),
+        "excel_n": ("integer", None), "dt_code": ("integer", None), "tod": ("time", "%H:%M"),
+        "dob": ("date", "%d/%m/%Y"), "mixed": ("date", "%d/%m/%Y"), "odk": ("datetime", "%Y-%m-%dT%H:%M:%S"),
+        "end_date": ("date", "%Y-%m-%d"), "qty": ("integer", None), "ambiguous": ("date", "%d/%m/%Y"),
+        "ambiguous_ts": ("datetime", "%d/%m/%Y %H:%M"), "hms_mix": ("datetime", "%d/%m/%Y %H:%M:%S"),
+        "dash_hm": ("datetime", "%d-%m-%Y %H:%M"), "dmy_t": ("date", "%d/%m/%Y"), "birth_mix": ("date", "%d.%m.%Y"),
+        "yy_old": ("date", "%d/%m/%y"), "tod_mix": ("time", "%H:%M"), "counts": ("integer", None),
+        "iso_slash": ("datetime", "%Y-%m-%dT%H:%M:%S"),
+    }
+    assert {k: (x.inferred_type, x.date_format) for k, x in c.items()} == expected
+    days = [date(2010 + i % 10, 1 + i % 12, 1 + i % 28) for i in range(n)]
+    times = [datetime(d.year, d.month, d.day, i % 24, i % 60) for i, d in enumerate(days)]
+    for name in ("stata", "sas", "yy"):
+        assert (c[name].min_value, c[name].max_value) == (min(days).isoformat(), max(days).isoformat()), name
+    for name in ("sas_dt", "dmy_hm", "dash_hm"):
+        assert (c[name].min_value, c[name].max_value) == (str(min(times)), str(max(times))), name
+    assert (c["tod"].min_value, c["tod"].max_value) == ("00:00:00", "23:59:00")
+    # notes where the sample cannot settle the order of the fields
+    assert c["yy"].format_notes == [TWO_DIGIT_YEAR_NOTE, YEAR_FIRST_NOTE]  # every year is 10..19
+    assert c["yy_old"].format_notes == [TWO_DIGIT_YEAR_NOTE]
+    assert c["ambiguous"].format_notes == [DAY_FIRST_NOTE] and c["ambiguous_ts"].format_notes == [DAY_FIRST_NOTE]
+    assert c["excel_date"].format_notes == [EXCEL_NOTE] and c["dt_code"].format_notes == []
+    excel = (date(1899, 12, 30) + timedelta(days=43000), date(1899, 12, 30) + timedelta(days=43000 + n - 1))
+    assert (c["excel_date"].min_value, c["excel_date"].max_value) == tuple(d.isoformat() for d in excel)
+
+    # partial dates are counted apart; min/max cover complete, valid dates only (DTB16)
+    dob = c["dob"]
+    assert (dob.n_partial_dates, dob.n_nonconforming) == (26, 7)
+    assert dob.nonconforming_shapes == [ValueFreq(value="aaaaaaa", count=6)]  # 31/02/1980 is a small cell
+    assert dob.min_value >= "1950-01-01" and dob.max_value <= "1999-12-31"
+    # a year alone, and a month and year, are partial dates in type inference too
+    assert (c["birth_mix"].n_partial_dates, c["birth_mix"].n_nonconforming) == (40, 0)
+    # ISO dates fit a day-first column (the build reads them with any template)
+    mixed = c["mixed"]
+    assert mixed.n_nonconforming == 0 and (mixed.min_value, mixed.max_value) == (min(days).isoformat(),
+                                                                               max(days).isoformat())
+    assert {v.value for v in mixed.value_shapes} == {"99/99/9999", "9999-99-99"}
+    # a time without the seconds the format has (or with seconds it lacks) is not read; an offset
+    # after it is (and is counted)
+    hms = c["hms_mix"]
+    assert (hms.n_nonconforming, hms.n_partial_dates) == (60, 0)
+    assert hms.tz_offsets == [ValueFreq(value="+03:00", count=20)]
+    assert c["tod_mix"].n_nonconforming == 100
+    dmy_t = c["dmy_t"]  # a date-only layout reads a time after the date, with an offset
+    assert (dmy_t.n_nonconforming, dmy_t.n_partial_dates, dmy_t.tz_offsets, dmy_t.n_rare_offsets) == (2, 0, [], 2)
+    two_digit_hours = sum(i % 24 >= 10 for i in range(n))
+    assert c["dmy_hm"].value_shapes == [ValueFreq(value="99/99/9999 99:99", count=two_digit_hours),
+                                        ValueFreq(value="99/99/9999 9:99", count=n - two_digit_hours)]
+    assert c["stata"].value_shapes == []  # one shape for every value says no more than the format
+    qty = c["qty"]
+    assert (qty.n_nonconforming, qty.nonconforming_shapes) == (7, [ValueFreq(value="a/a", count=7)])
+    assert c["counts"].n_nonconforming == 0  # '101.0' is read as an integer
+    assert (c["iso_slash"].n_nonconforming, c["iso_slash"].n_partial_dates) == (4, 0)
+    # offsets: '+0300' is '+03:00'; the two '-05:00' are below the small-cell threshold and only counted
+    odk = c["odk"]
+    assert odk.tz_offsets == [ValueFreq(value="+03:00", count=138), ValueFreq(value="Z", count=60)]
+    assert (odk.n_rare_offsets, odk.format_notes) == (2, [])
+    assert "-05:00" not in odk.model_dump_json()
+    (note,) = c["end_date"].format_notes
+    assert note.startswith("50 values (25%) are one and the same date after the profile date") and "2050" not in note
+    late_col = profile_staging(conn, schemas, cfg).table("late").column("outcome_date")
+    assert late_col.inferred_type == "string"
+    assert late_col.value_shapes == [ValueFreq(value="9999-99-99", count=SAMPLE_VALUES + 1000),
+                                     ValueFreq(value="aaaaaaa", count=9000)]
+
+    # the build reads every value as the profile says: complete, partial or not at all, and the
+    # same earliest and latest values
+    create_etl_tables(conn, schemas)
+    etl = schemas.etl
+    for name, x in c.items():
+        if x.inferred_type not in ("date", "datetime") or x.date_format is None:
+            continue
+        fn = "try_date" if x.inferred_type == "date" else "try_timestamp"
+        tmpl = strftime_to_pg(x.date_format)
+        got = fetch_all(conn, f"""SELECT
+            min({etl}.{fn}({qi(name)}, %(t)s))::text AS lo, max({etl}.{fn}({qi(name)}, %(t)s))::text AS hi,
+            count(*) FILTER (WHERE {etl}.{fn}({qi(name)}, %(t)s, 'first') IS NULL AND {qi(name)} IS NOT NULL) AS nc,
+            count(*) FILTER (WHERE {etl}.{fn}({qi(name)}, %(t)s, 'first') IS NOT NULL
+                             AND {etl}.{fn}({qi(name)}, %(t)s) IS NULL) AS np
+            FROM {schemas.src}.layouts""", {"t": tmpl})[0]
+        assert got == {"lo": x.min_value, "hi": x.max_value, "nc": x.n_nonconforming, "np": x.n_partial_dates}, name
+    lo = scalar(conn, f"SELECT min(DATE '1899-12-30' + excel_date::integer)::text FROM {schemas.src}.layouts")
+    assert lo == c["excel_date"].min_value
 
 
 def test_strftime_to_pg():

@@ -146,7 +146,10 @@ keys and are evaluated as written: where such a value can be unreadable, use \
 {etl}.try_date(x, 'DD/MM/YYYY') (or try_timestamp, try_integer, try_number), which gives NULL.
 - <PARTIAL_DATES>
 - <OFFSETS>
-- Empty source values were loaded as NULL.
+- Empty source values, and the missing-value markers the profile counts (source.na_values, by \
+default NA, NULL, \\N and '.' in CSV files), were loaded as NULL. The profile also counts the \
+values that do not fit a column's type or date format, and lists value shapes (9 for a digit, \
+a / A for a letter): read them before you choose a template.
 - Refer to columns through the aliases you declare in source.alias and joins[].alias (for \
 example v.visit_date::date). Join other source tables by their bare name, and vocabulary or \
 ETL tables as {vocab}.<table> or {etl}.<table>. Inside an expression (a correlated subquery) \

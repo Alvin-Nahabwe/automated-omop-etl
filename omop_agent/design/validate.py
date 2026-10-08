@@ -86,8 +86,9 @@ from ..etl.policies import OPEN_ENDS
 from ..etl.routing import hand_routing_issue, route_sources, shared_codes, vocab_indexed, vocabulary_domains
 from ..etl.session import apply_session
 from ..etl.tolerant import DATE_KINDS, LexError, lex, rewrite, without_conversions
-from ..models import CustomSQL, ETLSpec, KeySpec, SourceProfile, TableMapping
+from ..models import ColumnProfile, CustomSQL, ETLSpec, KeySpec, SourceProfile, TableMapping
 from ..privacy import pii_columns, pii_references
+from ..profiling.profiler import EXCEL_NOTE
 from ..sqlguard import fragment_issues, strip_literals
 
 # Qualifiers that are schemas, not table aliases (e.g. pg_catalog.to_char(...)::pg_catalog.text).
@@ -337,23 +338,39 @@ def _pii_loaded(tm: TableMapping, profile: SourceProfile | None, privacy: Privac
 
 # Kinds of field whose expression the build evaluates as written (keys of the id maps and lookups).
 _KEY_KINDS = ("person_id", "visit_id", "vocab_code", "concept_map")
+# what the validator calls a column of Excel serial day numbers (it has no strftime format)
+EXCEL_DAYS = "day numbers (Excel serial days or another epoch)"
 _TRY_FUNCTION = {"date": "try_date", "timestamp": "try_timestamp", "timestamptz": "try_timestamptz",
                  "integer": "try_integer", "bigint": "try_bigint", "number": "try_number"}
 
 
 def _iso_readable(date_format: str) -> bool:
     """True when ``::date`` reads values of this profiled (strftime) format under DateStyle
-    'ISO, YMD': year first, or an English month name with a four-digit year."""
-    return date_format.startswith("%Y") or (("%b" in date_format or "%B" in date_format) and "%Y" in date_format)
+    'ISO, YMD': year first, or an English month name with a four-digit year (not the SAS
+    '05MAR2019:14:30:00', whose time follows a colon). A time of day reads too (it is usually
+    joined to a date before the cast)."""
+    if date_format.startswith(("%H", "%I")):
+        return True
+    month_name = ("%b" in date_format or "%B" in date_format) and "%Y" in date_format and "%Y:" not in date_format
+    return date_format.startswith("%Y") or month_name
 
 
 def _pg_template(date_format: str) -> str | None:
     from ..profiling.profiler import strftime_to_pg
 
+    if "%" not in date_format:  # Excel serial day numbers have no template
+        return None
     try:
         return strftime_to_pg(date_format)
     except ValueError:
         return None
+
+
+def _column_format(col: ColumnProfile) -> str | None:
+    """The profiled date format of a column, or EXCEL_DAYS for a column of day numbers."""
+    if col.date_format:
+        return col.date_format
+    return EXCEL_DAYS if EXCEL_NOTE in col.format_notes else None
 
 
 def _profiled_formats(operand: str, aliases: dict[str, str], cat: _SourceCatalog) -> list[tuple[str, str]]:
@@ -367,8 +384,9 @@ def _profiled_formats(operand: str, aliases: dict[str, str], cat: _SourceCatalog
         if t is None:
             t = next((x for x in cat.profile.tables if table and x.name.lower() == table.lower()), None)
         col = next((c for c in t.columns if c.name.lower() == column), None) if t is not None else None
-        if col is not None and col.date_format and (f"{alias}.{column}", col.date_format) not in out:
-            out.append((f"{alias}.{column}", col.date_format))
+        fmt = _column_format(col) if col is not None else None
+        if fmt and (f"{alias}.{column}", fmt) not in out:
+            out.append((f"{alias}.{column}", fmt))
     return out
 
 
@@ -380,7 +398,7 @@ def _bare_formats(expr: str, table: str, cat: _SourceCatalog) -> list[tuple[str,
     if t is None:
         return []
     words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", strip_literals(expr)))
-    return [(c.name, c.date_format) for c in t.columns if c.date_format and c.name in words]
+    return [(c.name, fmt) for c in t.columns if (fmt := _column_format(c)) and c.name in words]
 
 
 def _conversion_problems(
@@ -405,6 +423,13 @@ def _conversion_problems(
             cols = _profiled_formats(operand, aliases or {}, cat) if cat else []
         bad = [(col, fmt) for col, fmt in cols if not _iso_readable(fmt)]
         iso = c.template is None and c.function in (None, f"try_{c.kind}")  # a cast, or try_* without a template
+        excel = [col for col, fmt in cols if fmt == EXCEL_DAYS]
+        if c.kind in DATE_KINDS and excel:  # no date conversion reads a day number
+            out.append(("error", f"{where}: {c.text} reads {excel[0]}, profiled as {EXCEL_DAYS}, which no date "
+                                 f"conversion reads (those values would be NULL): write DATE '1899-12-30' + "
+                                 f"{excel[0]}::integer for Excel days, or the source's epoch (DATE '1960-01-01' "
+                                 "for Stata and SAS)"))
+            continue
         if c.kind in DATE_KINDS and iso and bad:
             col, fmt = bad[0]
             pg = _pg_template(fmt)
@@ -817,6 +842,70 @@ def _static_spec(spec: ETLSpec, cat: _SourceCatalog) -> list[SpecIssue]:
     return issues
 
 
+def _offset_problem(col: ColumnProfile) -> str | None:
+    """Why the offsets profiled in ``col`` need etl.timezone, or None. Offsets seen fewer than
+    min_cell_count times are only counted (n_rare_offsets): with a listed offset they make several;
+    alone they may all be one offset, which is not flagged."""
+    offsets = [v.value for v in col.tz_offsets]
+    if len(offsets) > 1 or (offsets and col.n_rare_offsets):
+        rare = " and others seen too rarely to name" if col.n_rare_offsets else ""
+        return "several time zone offsets (" + ", ".join(repr(o) for o in offsets) + rare + ")"
+    if offsets and offsets[0] in ("Z", "+00:00", "-00:00"):
+        return f"the offset {offsets[0]!r} (UTC)"
+    return None
+
+
+def _offset_issues(spec: ETLSpec, cat: _SourceCatalog, timezone: str | None) -> list[SpecIssue]:
+    """Columns the spec reads whose profile shows 'Z' or several offsets while etl.timezone is
+    unset: the build would then keep every time as written, so the times are not on one clock
+    (an ODK time in UTC lands hours, and sometimes a day, away from the site's)."""
+    if timezone or cat.profile is None:
+        return []
+
+    def column(table: str | None, name: str) -> ColumnProfile | None:
+        t = next((x for x in cat.profile.tables if table and x.name.lower() == table.lower()), None)  # type: ignore[union-attr]
+        return next((c for c in t.columns if c.name.lower() == name.lower()), None) if t else None
+
+    def issue(target: str | None, field: str | None, ref: str, problem: str) -> SpecIssue:
+        return SpecIssue(severity="error", target_table=target, target_field=field, message=(
+            f"{ref} holds timestamps written with {problem} (source profile), but etl.timezone is not set: the "
+            "build would keep each time as written and ignore its offset, so these times are not on one clock. "
+            "Set etl.timezone in the project config to the site's time zone (e.g. Africa/Nairobi); the build then "
+            "converts every offset to it"))
+
+    issues: list[SpecIssue] = []
+    seen: set[tuple[str, str]] = set()
+
+    def check(target: str | None, field: str | None, text: str | None, aliases: dict[str, str]) -> None:
+        for alias, name in alias_refs(text):
+            table = _staged_name(aliases[alias]) if alias in aliases else None
+            col = column(table, name)
+            problem = _offset_problem(col) if col is not None else None
+            if problem and (str(table), name) not in seen:
+                seen.add((str(table), name))
+                issues.append(issue(target, field, f"{alias}.{name}", problem))
+
+    for tm in spec.table_mappings:
+        aliases = {tm.source.alias.lower(): tm.source.table, **{j.alias.lower(): j.table for j in tm.joins}}
+        for fm in tm.fields:
+            check(tm.target_table, fm.target_field, fm.expression, aliases)
+        for text in [tm.where, tm.dedup_order, *(j.on for j in tm.joins)]:
+            check(tm.target_table, None, text, aliases)
+    for cs in spec.custom_sql:
+        check(cs.target_table, None, cs.sql, _custom_aliases(cs.sql))
+    for key, what in [(spec.person_key, "person_key"), (spec.visit_key, "visit_key")]:
+        if key is None or _staged_name(key.table) is None:
+            continue
+        words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", strip_literals(key.expression)))
+        for name in sorted(words):
+            col = column(_staged_name(key.table), name)
+            problem = _offset_problem(col) if col is not None else None
+            if problem and (str(_staged_name(key.table)), name) not in seen:
+                seen.add((str(_staged_name(key.table)), name))
+                issues.append(issue(None, None, f"{what} column {name}", problem))
+    return issues
+
+
 _FROM_ITEM = re.compile(
     r"\b(?:from|join)\s+((?:\{src\}\s*\.\s*)?(?:\"[^\"]+\"|[a-z_][a-z0-9_]*))(?:\s+(?:as\s+)?([a-z_][a-z0-9_]*))?",
     re.I,
@@ -1183,6 +1272,9 @@ def validate_spec(
     """
     cat = _SourceCatalog(profile, conn, schemas)
     issues = _static_spec(spec, cat)
+    # a project setting, not a spec edit: checked for the whole spec only (the designer's and the
+    # repair agent's per-mapping loops cannot fix it)
+    issues += _offset_issues(spec, cat, cfg.etl.timezone if cfg is not None else None)
     clean: list[TableMapping] = []
     for tm in spec.table_mappings:
         table_issues = _static_mapping(tm, spec, cat, privacy)

@@ -347,6 +347,77 @@ def _issues(spec: ETLSpec, severity: str, table: str | None = None, field: str |
             and (field is None or i.target_field == field)]
 
 
+def _with_column(profile: SourceProfile, table: str, column: str, **changes) -> SourceProfile:
+    for c in profile.table(table).columns:
+        if c.name == column:
+            for k, v in changes.items():
+                setattr(c, k, v)
+    return profile
+
+
+def test_timestamps_with_offsets_need_the_site_time_zone():
+    """DTA3: 'Z' or several offsets in a column the spec reads, and etl.timezone unset: an error."""
+    from omop_agent.models import ValueFreq
+
+    ref = load_ref()
+    cfg = ProjectConfig.model_validate({"name": "t", "source": {"type": "csv", "path": "."},
+                                        "target": {"url": "postgresql://unused"}})
+    zoned = cfg.model_copy(update={"etl": cfg.etl.model_copy(update={"timezone": "Africa/Nairobi"})})
+
+    def offset_errors(offsets: list[str], config: ProjectConfig | None = cfg, spec: ETLSpec = ref,
+                      rare: int = 0) -> list[SpecIssue]:
+        profile = _with_column(dated_profile(), "clinic_visits", "visit_date", n_rare_offsets=rare,
+                               tz_offsets=[ValueFreq(value=o, count=50) for o in offsets])
+        return [i for i in validate_spec(spec, profile, cfg=config) if "etl.timezone" in i.message]
+
+    (issue,) = offset_errors(["+03:00", "Z"])
+    assert issue.severity == "error" and issue.target_table == "visit_occurrence"
+    assert issue.target_field == "visit_start_date"  # the first field that reads the column
+    assert "v.visit_date" in issue.message and "several time zone offsets ('+03:00', 'Z')" in issue.message
+    assert "Set etl.timezone" in issue.message
+    assert len(offset_errors(["Z"])) == 1 and "'Z' (UTC)" in offset_errors(["Z"])[0].message
+    assert offset_errors(["+03:00"]) == []  # one offset: every time is on one clock
+    # UTC written as an offset; one offset plus offsets too rare to list (counted only)
+    assert "'+00:00' (UTC)" in offset_errors(["+00:00"])[0].message
+    (issue,) = offset_errors(["+03:00"], rare=2)
+    assert "several time zone offsets ('+03:00' and others seen too rarely to name)" in issue.message
+    assert "2 values" not in issue.message  # a count below min_cell_count is not quoted
+    assert offset_errors([], rare=3) == []  # rare offsets alone may all be one: not flagged
+    assert offset_errors(["+03:00", "Z"], zoned) == []  # converted to the site's zone
+    assert len(offset_errors(["Z"], None)) == 1  # without a config: the default (unset)
+    # a column the spec does not read does not matter
+    unread = set_field(ref, "visit_occurrence", "visit_start_date", expression="v.discharge_date::date")
+    unread = set_field(unread, "visit_occurrence", "visit_start_datetime", expression="NULL::timestamp", kind="constant")
+    assert offset_errors(["Z"], spec=unread) == []
+    # nor is the per-mapping validation (the designer's and repair agent's loops) told: they cannot fix it
+    profile = _with_column(dated_profile(), "clinic_visits", "visit_date", tz_offsets=[ValueFreq(value="Z", count=50)])
+    assert not [i for i in validate_table_mapping(ref.mapping_for("visit_occurrence"), ref, profile)
+                if "etl.timezone" in i.message]
+
+
+def test_new_profiled_formats_in_the_validator():
+    from omop_agent.profiling.profiler import EXCEL_NOTE
+
+    ref = load_ref()
+    # Excel day numbers: no date conversion reads them
+    excel = _with_column(dated_profile(), "clinic_visits", "visit_date", date_format=None, format_notes=[EXCEL_NOTE],
+                         inferred_type="date")
+    msgs = _issues(ref, "error", "visit_occurrence", "visit_start_date", profile=excel)
+    assert any("day numbers" in m and "DATE '1899-12-30' + v.visit_date::integer" in m for m in msgs)
+    fixed = set_field(ref, "visit_occurrence", "visit_start_date", expression="DATE '1899-12-30' + v.visit_date::integer")
+    assert _issues(fixed, "error", "visit_occurrence", "visit_start_date", profile=excel) == []
+    # SAS timestamps (05MAR2019:14:30:00) are not read by ::timestamp; Stata dates (05mar2019) are
+    sas = dated_profile(clinic_visits__visit_date="%d%b%Y:%H:%M:%S")
+    msgs = _issues(ref, "error", "visit_occurrence", "visit_start_datetime", profile=sas)
+    assert any("to_timestamp(v.visit_date, 'DDMonYYYY:HH24:MI:SS')" in m for m in msgs)
+    assert _issues(ref, "error", "visit_occurrence", profile=dated_profile(clinic_visits__visit_date="%d%b%Y")) == []
+    # a time of day joined to an ISO date reads with ::timestamp
+    timed = dated_profile(clinic_visits__discharge_date="%H:%M")
+    spec = set_field(ref, "visit_occurrence", "visit_start_datetime",
+                     expression="(v.visit_date || ' ' || v.discharge_date)::timestamp")
+    assert _issues(spec, "error", "visit_occurrence", "visit_start_datetime", profile=timed) == []
+
+
 def test_conversion_issues():
     ref = load_ref()
     assert errors(validate_spec(ref, dated_profile())) == []

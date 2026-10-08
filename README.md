@@ -122,6 +122,8 @@ example WHO `ICD10` when only `ICD10CM` was selected).
 `omop-agent init` writes a commented template. The main settings:
 
 * `source`: `type: csv` with `path`, or `type: database` with a SQLAlchemy `url` and `schema`.
+  `na_values` lists the missing-value markers staged as NULL (default `NA`, `NULL`, `\N` and `.`
+  for CSV files, none for databases; `[]` keeps them as data).
 * `target`: the PostgreSQL URL and the schema names (`cdm`, `vocab`, `src` staging, `etl` working tables, `results`).
 * `vocabulary.athena_dir`: an unzipped Athena download.
 * `llm`: `provider` (`anthropic` | `replay` | `none`), `model` (default `claude-opus-5-5`), `effort`, `record_dir`/`replay_dir`.

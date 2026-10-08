@@ -155,3 +155,65 @@ def test_reload_when_the_bundle_adds_vocabularies(staged, tmp_path):
         fh.write("RxNorm Extension\tRxNorm Extension (synthetic fixture)\tomop-agent demo fixture\tfixture-2026-09\t2000009999\n")
     counts = load_athena(conn, schemas, bigger)
     assert counts["vocabulary"] == 10
+
+
+# --------------------------------------------------------------------------------------
+# missing-value markers (source.na_values)
+# --------------------------------------------------------------------------------------
+
+NA_CSV = (
+    "id,dob,result,code\n"
+    "1,NA,POS,NA\n"
+    "2, NA ,.,na\n"  # trimmed before the comparison; the comparison is case-sensitive
+    "3,25/05/1998,NULL,A1\n"
+    "4,\\N,7.5,.5\n"
+)
+
+
+def test_na_values_csv_only(pg, tmp_path):
+    conn, schemas = pg
+    cfg = make_config(tmp_path, _data_dir(tmp_path, {"labs.csv": NA_CSV.encode()}), schemas)
+    ws = Workspace(tmp_path / "work")
+    manifest = stage_source(cfg, conn, schemas, ws)
+    rows = fetch_all(conn, f"SELECT id, dob, result, code FROM {schemas.src}.labs ORDER BY id")
+    assert rows == [
+        {"id": "1", "dob": None, "result": "POS", "code": None},
+        {"id": "2", "dob": None, "result": None, "code": "na"},
+        {"id": "3", "dob": "25/05/1998", "result": None, "code": "A1"},
+        {"id": "4", "dob": None, "result": "7.5", "code": ".5"},
+    ]
+    markers = {c["name"]: c["na_markers"] for c in manifest["labs"]["columns"]}
+    assert markers == {"id": {}, "dob": {"NA": 2, "\\N": 1}, "result": {".": 1, "NULL": 1}, "code": {"NA": 1}}
+    event = next(e for e in ws.read_audit() if e["event"] == "source_staged")
+    assert event["na_markers_as_null"] == {"labs": 6}
+    # the profile counts them as NULL, and says how many were markers
+    from omop_agent.profiling.profiler import profile_staging
+
+    dob = profile_staging(conn, schemas, cfg, manifest).table("labs").column("dob")
+    assert (dob.n_null, dob.n_na_markers) == (3, 3)
+
+    # set [] to keep them as data
+    cfg.source.na_values = []
+    manifest = stage_source(cfg, conn, schemas)
+    assert scalar(conn, f"SELECT count(*) FROM {schemas.src}.labs WHERE dob = 'NA' OR result = '.'") == 2
+    assert all(not c["na_markers"] for c in manifest["labs"]["columns"])
+
+    # a database source keeps them unless na_values is set: 'NA' may be a real value there (Namibia)
+    from conftest import DB_URL
+
+    src = schemas.etl  # any other test schema serves as the source database schema
+    execute(conn, f"CREATE SCHEMA {qi(src)}")
+    execute(conn, f"CREATE TABLE {qi(src)}.countries (code text, n integer)")
+    execute(conn, f"INSERT INTO {qi(src)}.countries VALUES ('NA', 1), ('KE', NULL), ('.', 3)")
+    conn.commit()
+    db_cfg = cfg.model_copy(update={"source": cfg.source.model_validate({
+        "type": "database", "url": DB_URL.replace("postgresql://", "postgresql+psycopg://", 1), "db_schema": src})})
+    assert db_cfg.source.effective_na_values == []
+    manifest = stage_source(db_cfg, conn, schemas)
+    assert scalar(conn, f"SELECT count(*) FROM {schemas.src}.countries WHERE code IN ('NA', '.')") == 2
+    assert all(not c["na_markers"] for c in manifest["countries"]["columns"])
+    db_cfg.source.na_values = ["NA"]
+    manifest = stage_source(db_cfg, conn, schemas)
+    assert fetch_all(conn, f"SELECT code FROM {schemas.src}.countries ORDER BY n") == [
+        {"code": None}, {"code": "."}, {"code": "KE"}]
+    assert {c["name"]: c["na_markers"] for c in manifest["countries"]["columns"]} == {"code": {"NA": 1}, "n": {}}

@@ -28,12 +28,14 @@ class ValueFreq(BaseModel):
 class ColumnProfile(BaseModel):
     name: str
     declared_type: str | None = Field(None, description="Type reported by the source database, if any.")
-    inferred_type: Literal["integer", "float", "boolean", "date", "datetime", "string", "empty"]
+    inferred_type: Literal["integer", "float", "boolean", "date", "datetime", "time", "string", "empty"]
     n_rows: int
-    n_null: int = Field(..., description="NULL or empty-string values.")
+    n_null: int = Field(..., description="NULL or empty-string values (missing-value markers included).")
     n_distinct: int
     unique: bool = Field(..., description="Every non-null value is distinct.")
-    min_value: str | None = None
+    min_value: str | None = Field(
+        None, description="Smallest value; for dates and times the earliest complete, valid one (ISO)."
+    )
     max_value: str | None = None
     mean: float | None = None
     min_length: int | None = None
@@ -46,6 +48,41 @@ class ColumnProfile(BaseModel):
     n_suppressed_values: int = Field(0, description="Distinct values hidden by small-cell suppression.")
     is_pii: bool = False
     pii_reason: str | None = None
+    # Added with the tolerant date reading; the defaults keep older profile.json files loading.
+    n_na_markers: int = Field(
+        0, description="Values staged as NULL because they were a missing-value marker (source.na_values); "
+        "part of n_null."
+    )
+    n_nonconforming: int = Field(
+        0, description="Non-null values (whole column) that do not fit the inferred type or date format. As in "
+        "the build, ISO dates fit every date format, any one of - / . _ may stand for a separator and a time may "
+        "follow a date. Impossible dates (31/02) do not fit; partial dates are counted apart."
+    )
+    nonconforming_shapes: list[ValueFreq] = Field(
+        default_factory=list,
+        description="Shapes of the non-conforming values (digits as 9, letters as a / A, other characters "
+        "kept), each seen at least min_cell_count times.",
+    )
+    n_partial_dates: int = Field(
+        0, description="Dates with an unknown day or month (00, 97-99), without their day ('06/1975'), or "
+        "only a year; the build completes or rejects them (etl.partial_dates)."
+    )
+    value_shapes: list[ValueFreq] = Field(
+        default_factory=list,
+        description="The most common shapes of the values (e.g. '99/99/9999 99:99'), each seen at least "
+        "min_cell_count times. Never for direct identifiers.",
+    )
+    tz_offsets: list[ValueFreq] = Field(
+        default_factory=list,
+        description="Time zone offsets written after the times ('Z', '+03:00'), each seen at least "
+        "min_cell_count times.",
+    )
+    n_rare_offsets: int = Field(
+        0, description="Values whose offset is seen fewer than min_cell_count times (not in tz_offsets)."
+    )
+    format_notes: list[str] = Field(
+        default_factory=list, description="How to read the values, where the type and format alone do not say."
+    )
 
 
 class TableProfile(BaseModel):
