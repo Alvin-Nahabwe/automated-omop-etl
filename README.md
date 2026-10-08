@@ -139,10 +139,13 @@ example WHO `ICD10` when only `ICD10CM` was selected).
 * `etl.timezone`: the site's time zone, e.g. `Africa/Nairobi`. Times written with an offset or `Z`
   (ODK submission times, for example) are converted to it. Unset, an offset is ignored and the
   time is kept as written; a spec that reads a column with `Z`, `+00:00` or several different
-  offsets then fails validation, because its times would not be on one clock.
+  offsets then fails validation (also when its expression converts explicitly with `AT TIME
+  ZONE`), because the CDM's times must be on one clock: set `etl.timezone` for such a source.
 * `etl.partial_dates`: how a date with an unknown day or month (`00`, `97`-`99`, or no day, as in
   `06/1975`) is read, except birth and death dates, which follow the THEMIS rules. `widest` (the
   default): a start date takes the first day, an end date the last day, any other date the 15th.
+  An end computed from the start's columns (`start + days_supply - 1`, or a fallback onto the start
+  column) reads them as the start does, so it is not stretched to the end of the month or year.
   `reject`: the date is left NULL.
 
 `${VAR}` references are read from the environment, so credentials stay out of the file.
@@ -346,13 +349,19 @@ does with every spec. What changes:
   runs as another user stops with a message saying so). Installing drops EXECUTE grants made by
   hand to other roles: the new functions are executable by PUBLIC (PostgreSQL's default) and
   granted to `etl_role`.
+* `target.etl_role` now needs DELETE (and SELECT) on the CDM tables, not only INSERT: the
+  observation-period merge (`DELETE FROM observation_period ... RETURNING`, a blocking step) and
+  the route steps move rows by deleting them from one table. A role that worked with an older
+  version fails the first build at `observation_period_merge`. Grant it as under "Privacy and
+  safety": `GRANT SELECT, INSERT, DELETE ON ALL TABLES IN SCHEMA <cdm>, <etl> TO <etl_role>;`.
 * A step that fails for a missing privilege is not sent to the repair agent; its error names the
-  GRANT to run.
+  GRANT to run. So is a step the server stopped (out of disk or memory, a statement or lock
+  timeout, an administrator's cancel): its error names the setting or resource.
 * Spec SQL may no longer call functions named `omop_*` (the build's helper functions in the ETL
   schema, which keep its counts) or use Unicode-escaped names and strings (`U&"..."`,
   `U&'...'`): a spec that does fails validation.
-* Spec SQL runs with DateStyle `ISO, YMD` and `standard_conforming_strings` on, and with the
-  time zone `etl.timezone` when it is set (the server's zone otherwise), in the build as in the
+* Spec SQL runs with DateStyle `ISO, YMD`, `standard_conforming_strings` on and `jit` off, and
+  with the time zone `etl.timezone` when it is set (the server's zone otherwise), in the build as in the
   validator and the repair agent's counts; the files in `sql/`
   start with these settings as comments. In custom SQL, a hard cast of a day-first text date
   with a four-digit year (`'31/12/2020'::date`) now fails whatever the server's DateStyle, and
@@ -437,10 +446,18 @@ does with every spec. What changes:
 * `from_events` together with an `observation_period` mapping or custom SQL is a validator error.
 * `measurePersonCompleteness.observation_period` still blocks, but is not sent to the repair agent
   once the build derived periods; the repair agent may not change which episodes are open, and
-  the repair loop compares builds by the valid episodes loaded plus the periods the fill gave.
+  the repair loop compares builds by the valid episodes loaded (not the periods the fill gives:
+  they would make up for episodes a repair lost).
 
 **Routing by domain**
 
+* Every build now empties all the tables records can be moved to (`condition_occurrence`,
+  `procedure_occurrence`, `drug_exposure`, `device_exposure`, `measurement`, `observation`)
+  whenever the spec loads any of them and `route_by_domain` is on, even a table the spec does not
+  load and no record was moved to. Rows loaded into those tables outside the spec (a separate
+  procedure load into the same CDM schema) are lost on the first build after the update: load
+  them through the spec (a mapping or custom SQL) instead. A build that was cancelled or crashed
+  is remembered (`etl_tables.json`), so the next build empties every table it may have written.
 * Records move to the table of their standard concept's domain (`route_by_domain: true`). A spec
   that routed records by hand (a second mapping of the same codes with a filter on
   `{vocab}.concept.domain_id`) now loads them twice: the validator warns, and every build reports
@@ -512,8 +529,10 @@ does with every spec. What changes:
   * Reconciling the records of each source table one by one, design guidance for HDSS events
     beyond residency (migrations, births and pregnancies, mother-child links), de-duplication of
     `location` and `care_site`, and moving `specimen` records by domain.
-* `visit_detail`, `note`/NLP and `cost` are not generated automatically; add them as table
-  mappings or `custom_sql` in the spec. Custom SQL that writes event records and an era table in
+* NLP (`note_nlp`) is not produced. `visit_detail`, `note` and `cost` are drafted like any other
+  table, but get no build conventions beyond their mappings: there is no visit_detail id map or
+  field kind, so an event's `visit_detail_id` and `cost.cost_event_id` must be written as
+  expressions or joins. Custom SQL that writes event records and an era table in
   one step runs at the era table's place, so its event records are not moved by domain and the
   observation periods do not read them: split it in two.
 * The rules that recognise hand-made routing see only a literal event-domain name next to
@@ -530,10 +549,10 @@ does with every spec. What changes:
   value (for a required field the check sees that the build had no NULL to complete or drop).
 * An exit date that exists but cannot be read is loaded as an open episode (it runs to the release
   date or to death); `etlObservationPeriodMerge` counts such episodes.
-* Some steps and checks added for HDSS data were not yet timed on a full HDSS (about 1M people and
-  14M records): one row per key, the era steps and checks, and the route steps with their final
-  SQL. The observation-period merge took about 6 s for 900,000 episodes. Profiling a date-heavy
-  table takes about twice as long as before.
+* The HDSS steps were timed on synthetic sources of a million people ("Measured performance" in
+  docs/architecture.md); a build on a vocabulary that has the `concept_id` index this version
+  creates was not timed (each concept check then avoids a 1-2 s hash join of the concept table).
+  Profiling a date-heavy table takes about twice as long as before.
 * The profile's split between values that fit and values that do not can differ from the build's
   reader in rare cases: one-digit minutes (`7:5`) count as not fitting, a two-digit year-first date
   (`19/03/05`) is read day-first, day numbers are read as Excel serial days (Stata, SAS and Unix

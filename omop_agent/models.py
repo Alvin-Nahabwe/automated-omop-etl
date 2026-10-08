@@ -248,7 +248,8 @@ class TableMapping(BaseModel):
         "A SQL ORDER BY list over the aliases that ranks the source rows of one key, best first, e.g. "
         "\"x.dod::date DESC\" (latest death) or \"(v.visit_type = 'IPD') DESC\". A missing or unreadable "
         "value ranks last, and rows whose required fields are NULL never win. Leave it empty to keep the most "
-        "complete row (for death: a date known to the day, then the latest).",
+        "complete row (for death: a date known to the day, then the latest). It ranks this mapping's rows only: "
+        "between the mappings of one table, the first in spec order that loads a key wins.",
     )
     fields: list[FieldMapping]
     rationale: str = ""

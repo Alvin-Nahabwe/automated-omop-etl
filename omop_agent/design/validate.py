@@ -245,6 +245,21 @@ def paren_problem(text: str) -> str | None:
     return "a '(' is not closed" if depth else None
 
 
+def dedup_order_issue(order: str | None) -> str | None:
+    """Why a dedup_order cannot decide between the rows of a key (None: it may): a function whose
+    value changes from call to call (``random()``) ranks every row differently in each build, so
+    etlKeyConflict sees every key decided while the row loaded (a person's sex and birth year) is a
+    draw, and differs between builds."""
+    from ..etl.tolerant import volatile_calls
+
+    calls = volatile_calls(order)
+    if not calls:
+        return None
+    return (f"dedup_order calls {', '.join(c + '()' for c in calls)}, whose value changes from call to call: the row "
+            "it loads for a key is a draw that differs between builds. Rank by a column of the source (the latest "
+            "registration date, a verified flag)")
+
+
 def _mapping_sql_problems(tm: TableMapping) -> list[tuple[str | None, str]]:
     """``(field, problem)``: unsafe fragments and tables the mapping may not read."""
     out: list[tuple[str | None, str]] = []
@@ -318,14 +333,11 @@ def _check_source_table(cat: _SourceCatalog, table: str, tt: str | None, what: s
     return None
 
 
-def _pii_loaded(tm: TableMapping, profile: SourceProfile | None, privacy: PrivacyConfig) -> list[str]:
-    """Direct-identifier columns whose values a mapping loads into the CDM.
-
-    Fields of kind person_id / visit_id only resolve the key through the id maps (the CDM gets
-    the integer id), and join conditions, filters and the dedup_order only select rows, so those
-    are not counted.
-    """
-    loading = tm.model_copy(
+def loading_view(tm: TableMapping) -> TableMapping:
+    """The parts of a mapping whose values go into the CDM: fields of kind person_id / visit_id only
+    resolve the key through the id maps (the CDM gets the integer id), and join conditions,
+    filters and the dedup_order only select rows, so they are left out."""
+    return tm.model_copy(
         update={
             "fields": [f for f in tm.fields if f.kind not in ("person_id", "visit_id")],
             "where": None,
@@ -333,7 +345,11 @@ def _pii_loaded(tm: TableMapping, profile: SourceProfile | None, privacy: Privac
             "joins": [j.model_copy(update={"on": "TRUE"}) for j in tm.joins],
         }
     )
-    return pii_references(loading, profile, privacy)
+
+
+def _pii_loaded(tm: TableMapping, profile: SourceProfile | None, privacy: PrivacyConfig) -> list[str]:
+    """Direct-identifier columns whose values a mapping loads into the CDM (``loading_view``)."""
+    return pii_references(loading_view(tm), profile, privacy)
 
 
 # Kinds of field whose expression the build evaluates as written (keys of the id maps and lookups).
@@ -751,6 +767,9 @@ def _static_mapping(
             for severity, msg in _conversion_problems(tm.dedup_order, "dedup_order", hard=False, aliases=aliases,
                                                       cat=cat):
                 (err if severity == "error" else warn)(msg)
+            volatile = dedup_order_issue(tm.dedup_order)
+            if volatile:
+                err(volatile)
     for j in tm.joins:
         for severity, msg in _conversion_problems(j.on, f"join '{j.alias}' condition", hard=True, aliases=aliases,
                                                   cat=cat):
@@ -868,10 +887,11 @@ def _offset_issues(spec: ETLSpec, cat: _SourceCatalog, timezone: str | None) -> 
 
     def issue(target: str | None, field: str | None, ref: str, problem: str) -> SpecIssue:
         return SpecIssue(severity="error", target_table=target, target_field=field, message=(
-            f"{ref} holds timestamps written with {problem} (source profile), but etl.timezone is not set: the "
-            "build would keep each time as written and ignore its offset, so these times are not on one clock. "
-            "Set etl.timezone in the project config to the site's time zone (e.g. Africa/Nairobi); the build then "
-            "converts every offset to it"))
+            f"{ref} holds timestamps written with {problem} (source profile), so it needs etl.timezone, which is not "
+            "set: without it the build reads such times as written (an explicit ::timestamptz AT TIME ZONE "
+            "conversion aside), and the times of the CDM would not be on one clock. Set etl.timezone in the "
+            "project config to the site's time zone (e.g. Africa/Nairobi); the build then converts every offset "
+            "to it"))
 
     issues: list[SpecIssue] = []
     seen: set[tuple[str, str]] = set()
@@ -993,9 +1013,10 @@ def _key_source_issues(spec: ETLSpec) -> list[SpecIssue]:
                 issues.append(SpecIssue(
                     severity="warning", target_table=table, target_field=field,
                     message=f"the mapping from {tm.source.table} adds its keys ({written}) to the same id space as "
-                    f"{key.table}: a key found in both is one {what}. If {tm.source.table} numbers its {plural} "
-                    "independently, prefix its keys (for example 'EMR:' || ...) here and in every mapping that "
-                    "refers to them"))
+                    f"{key.table}: a key found in both is one {what}, loaded from the mapping that comes first in "
+                    "the spec (a later mapping's rows of that key are skipped, not merged). If "
+                    f"{tm.source.table} numbers its {plural} independently, prefix its keys (for example "
+                    "'EMR:' || ...) here and in every mapping that refers to them"))
     if spec.visit_key is None:
         return issues
     vk = spec.visit_key

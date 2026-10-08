@@ -1052,6 +1052,67 @@ def test_update_field_mapping_rejects_unsafe_sql(repair_env):
 
 
 @pytest.mark.postgres
+def test_repair_refuses_a_dedup_order_that_draws(repair_env):
+    """random() in a dedup_order would silence etlKeyConflict while the row loaded is a draw."""
+    state, tools = repair_env
+    tm = state.spec.mapping_for("person").model_dump(mode="json")
+    for order in ("random()", "i.sex DESC, random()"):
+        out = tools["replace_table_mapping"].invoke({"target_table": "person", "rationale": "x",
+                                                     "mapping_yaml": yaml.safe_dump({**tm, "dedup_order": order})})
+        assert out.startswith("REJECTED:") and "changes from call to call" in out, out
+    assert state.actions == []
+
+
+@pytest.mark.postgres
+def test_repair_refuses_a_second_mapping_of_the_same_codes(repair_env):
+    """A copy of a mapping for a subset of its rows loads those rows twice, and no check counts
+    records loaded twice (the larger denominators even make rate checks pass): refused. A mapping
+    of another code column of the same table (a secondary diagnosis) adds records: applied."""
+    state, tools = repair_env
+    replace = tools["replace_table_mapping"].invoke
+    tm = state.spec.mapping_for("condition_occurrence").model_dump(mode="json")
+    copy_ = {**copy.deepcopy(tm), "where": "d.dx_date >= '2021-01-01'"}
+    out = replace({"target_table": "condition_occurrence", "mapping_index": 1, "rationale": "x",
+                   "mapping_yaml": yaml.safe_dump(copy_)})
+    assert out.startswith("REJECTED: condition_occurrence mapping #0 already reads the same codes"), out
+    assert "loaded twice" in out and state.actions == []
+    other = copy.deepcopy(tm)
+    for fm in other["fields"]:
+        if fm["expression"] == "d.icd10":
+            fm["expression"] = "upper(d.icd10)"  # stands for another column of codes
+    assert replace({"target_table": "condition_occurrence", "mapping_index": 1, "rationale": "x",
+                    "mapping_yaml": yaml.safe_dump(other)}).startswith("OK:")
+
+
+@pytest.mark.postgres
+def test_identifier_keyed_mappings_stay_editable(repair_env):
+    """A mapping whose person key reads an identifier column (a clinic's patient number, here the
+    phone) loads only the integer person_id: its other fields may still be repaired, as the
+    validator allows. A value field that loads the identifier is still refused, and a column that
+    privacy.not_pii_columns clears is not an identifier, whatever its name."""
+    state, tools = repair_env
+    tm = state.spec.mapping_for("person")
+    key = next(f for f in tm.fields if f.target_field == "person_id")
+    key.expression = "COALESCE(i.individual_id, 'TEL:' || i.phone)"  # as a person designed it
+    update = tools["update_field_mapping"].invoke
+    out = update({"target_table": "person", "target_field": "gender_source_value", "kind": "expression",
+                  "expression": "upper(i.sex)", "rationale": "x"})
+    assert out.startswith("OK:"), out
+    out = update({"target_table": "person", "target_field": "person_source_value", "kind": "expression",
+                  "expression": "i.phone", "rationale": "x"})
+    assert out.startswith("REJECTED:") and "individuals.phone" in out and "never be loaded" in out, out
+    # a name that looks like an identifier, cleared by a person: a value field may load it
+    from omop_agent.quality.repair import _pii_tokens
+
+    loading = tm.model_copy(update={"fields": [f.model_copy(update={"expression": "i.phone"})
+                                               if f.target_field == "person_source_value" else f for f in tm.fields]})
+    assert "individuals.phone" in _pii_tokens(state, loading)
+    state.cfg = state.cfg.model_copy(update={"privacy": state.cfg.privacy.model_copy(
+        update={"not_pii_columns": ["individuals.phone"]})})
+    assert "individuals.phone" not in _pii_tokens(state, loading)
+
+
+@pytest.mark.postgres
 def test_replace_table_mapping(repair_env):
     state, tools = repair_env
     replace = tools["replace_table_mapping"].invoke
@@ -1175,6 +1236,38 @@ def test_dry_run_guard_rejects_nulling_edit(repair_env):
         f.model_copy(update={"expression": "v.no_such_column::date"}) if f.target_field == "visit_start_date" else f
         for f in current.fields]})
     assert repair.drop_guard(broken, new_tm, state.spec, conn, schemas, state.cfg) is None
+
+
+@pytest.mark.postgres
+def test_dry_run_guard_rejects_invented_values(repair_env):
+    """A required field whose NULL drops the row must not get a value the source does not hold: a
+    fallback onto a literal birth year, a constant or the build date brings back people (deaths)
+    the CDM convention leaves out. A fallback onto another source column is a fix."""
+    from omop_agent.etl.runner import run_etl
+
+    state, tools = repair_env
+    run_etl(state.conn, state.schemas, state.spec, state.cfg)
+    update = tools["update_field_mapping"].invoke
+    before = state.spec
+    for table, field, kind, expression in [
+        ("person", "year_of_birth", "expression", "COALESCE(EXTRACT(YEAR FROM to_date(i.dob, 'DD/MM/YYYY'))::int, 1900)"),
+        ("person", "year_of_birth", "constant", "1900"),
+        ("death", "death_date", "expression", "COALESCE(x.dod::date, CURRENT_DATE)"),
+        ("death", "death_date", "expression", "CASE WHEN x.dod IS NULL THEN DATE '2000-01-01' ELSE x.dod::date END"),
+        ("visit_occurrence", "visit_start_date", "expression", "COALESCE(v.visit_date::date, now()::date)"),
+    ]:
+        out = update({"target_table": table, "target_field": field, "kind": kind, "expression": expression,
+                      "rationale": "fill the missing values"})
+        assert out.startswith(f"REJECTED: it would give {table}.{field} a value of its own"), (expression, out)
+        assert state.spec is before and state.actions == []
+    # another source column, or another layout of the same column, is read from the source: applied
+    out = update({"target_table": "visit_occurrence", "target_field": "visit_start_date", "kind": "expression",
+                  "expression": "COALESCE(v.visit_date::date, v.discharge_date::date)", "rationale": "x"})
+    assert out.startswith("OK:"), out
+    out = update({"target_table": "person", "target_field": "year_of_birth", "kind": "expression",
+                  "expression": "EXTRACT(YEAR FROM COALESCE(to_date(i.dob, 'DD/MM/YYYY'), to_date(i.dob, 'YYYY-MM-DD')))::int",
+                  "rationale": "x"})
+    assert out.startswith("OK:"), out
 
 
 def test_repair_prompt_suppresses_small_counts(tmp_path):

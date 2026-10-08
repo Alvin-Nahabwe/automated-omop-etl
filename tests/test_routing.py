@@ -369,6 +369,52 @@ def test_other_domains_never_take_the_target_domains_places():
     assert len([x for x in _format_term(1, term, more, 10, None) if "| Observation |" in x]) == 3
 
 
+def test_domains_that_differ_in_case_only_are_one_domain():
+    """'Meas Value' and 'meas value' (or 'Unit' and 'unit') in two fields of one source vocabulary
+    are one domain: no conflict, auto-approval stays on, and the domain is listed once."""
+    spec = load_ref().model_copy(deep=True)
+    tm = spec.mapping_for("measurement").model_copy(deep=True)
+    fm = next(f for f in tm.fields if f.target_field == "unit_concept_id")
+    assert fm.kind == "concept_map" and fm.target_domain == "Unit"
+    fm.target_domain = "unit"
+    spec.table_mappings.append(tm)
+    vd = vocabulary_domains(spec)[fm.vocabulary]
+    assert (vd.target_domain, vd.accepted, vd.conflict, vd.auto_approve) == ("Unit", [], None, True)
+
+
+def test_other_domains_compete_by_name_not_by_code(monkeypatch):
+    """A short local code that equals the code of a concept of another accepted domain (TB, CR:
+    HCPCS modifiers in Observation) does not rank that concept above the target domain's: the
+    other domains' concepts are scored by their names. The target domain keeps its code matches."""
+    from omop_agent.models import ConceptCandidate
+    from omop_agent.vocab.mapper import _Searcher
+
+    def hit(cid, name, domain, score, code):
+        return _Hit(ConceptCandidate(concept_id=cid, concept_name=name, domain_id=domain, vocabulary_id="X",
+                                     concept_class_id="X", standard_concept="S", concept_code=code, score=score), [name])
+
+    searcher = _Searcher.__new__(_Searcher)
+    monkeypatch.setattr(_Searcher, "domain", lambda self, d: d)
+    monkeypatch.setattr(_Searcher, "_search_each", lambda self, text, wanted: [
+        [hit(1, "Tuberculosis", "Condition", 0.55, "A15"), hit(4, "Tb disease", "Condition", 0.95, "TB")],
+        [hit(2, "Drug or biological acquired with 340b drug pricing program discount", "Observation", 0.95, "TB")]])
+    out = searcher.search("TB", "Condition", 5, also=["Observation"])
+    by_id = {h.candidate.concept_id: h.candidate for h in out}
+    assert by_id[2].score < by_id[1].score and [h.candidate.concept_id for h in out][-1] == 2
+    assert by_id[4].score == 0.95  # a code match in the target domain keeps its score
+
+
+def test_prompt_shows_the_domain_whenever_others_are_accepted():
+    from omop_agent.models import SourceTerm
+
+    term = SourceTerm(source_vocabulary_id="SRC_DX", source_code="ANC", source_name="ANC", frequency=40,
+                      target_domain="Condition", accepted_domains=["Condition", "Observation", "Procedure", "Measurement"])
+    lines = "\n".join(_format_term(1, term, [_hit(1, "Antenatal care", "Observation", 0.9),
+                                             _hit(2, "Antenatal care visit", "Observation", 0.8)], 10, None))
+    assert "candidates (concept_id | name | domain | class | vocabulary | score):" in lines
+    assert "1 | Antenatal care | Observation | X | X | 0.90" in lines
+
+
 def test_vocabulary_shared_by_tables_of_different_domains(tmp_path):
     """One vocabulary read by the main concept fields of two routed tables of different domains
     (an events table split by row type): every code would be searched in the first field's domain
@@ -398,6 +444,7 @@ def test_vocabulary_shared_by_tables_of_different_domains(tmp_path):
 
 def test_import_review_refreshes_domains_first(tmp_path, monkeypatch):
     """DA9: a reviewer's concept is checked against the domains the current spec accepts."""
+    from omop_agent.models import ConceptCandidate
     ws = Workspace(tmp_path / "work")
     d = MappingDecision(source_vocabulary_id="SRC_LAB", source_code="MRDT", source_name="MRDT", frequency=50,
                         target_domain="Measurement", target_concept_id=0)
@@ -416,10 +463,55 @@ def test_import_review_refreshes_domains_first(tmp_path, monkeypatch):
     out = review.import_review(ws, object(), S, domains=vocabulary_domains(load_ref()))  # type: ignore[arg-type]
     assert seen == [["Measurement", "Observation"]]
     assert out[0].accepted_domains == ["Measurement", "Observation"] and out[0].target_concept_id == 77
+    # the reviewer is told the pick moves the record, here and in the review file
+    assert "Reviewer's Observation concept, not Measurement: the record moves to the table of the Observation" \
+        in out[0].rationale
     # without the spec's domains, the decision's own (here its target domain only)
     seen.clear()
     review.import_review(ws, object(), S)  # type: ignore[arg-type]
     assert seen == [["Measurement"]]
+    review.export_review(ws, [out[0].model_copy(update={"candidates": [
+        ConceptCandidate(concept_id=5, concept_name="Malaria smear", domain_id="Measurement", vocabulary_id="X",
+                         concept_class_id="X", standard_concept="S", concept_code="5")]})])
+    import csv as _csv
+
+    with (ws.mappings_dir / "SRC_LAB.csv").open(newline="") as fh:
+        row = next(_csv.DictReader(fh))
+    assert row["accepted_domains"] == "Measurement; also Observation (the record moves to that domain's table)"
+    assert row["alternatives"] == "5:Malaria smear [Measurement]"
+
+
+def test_kept_decisions_are_checked_against_the_current_domains(tmp_path):
+    """A decision kept from an earlier run is checked against the domains the spec accepts now, not
+    only an edited cell: a concept of a domain the field no longer accepts (routing turned off) is
+    FLAGGED, so it is not loaded; an automatic approval of a vocabulary that has become shared by
+    fields of different domains goes back to UNCHECKED; a person's choice of an accepted domain stays."""
+    ws = Workspace(tmp_path / "work")
+    common = {"source_vocabulary_id": "SRC_LAB", "frequency": 50, "target_domain": "Measurement",
+              "accepted_domains": ["Measurement", "Observation"]}
+    mrdt = MappingDecision(source_code="MRDT", source_name="MRDT", target_concept_id=ROAD_TRAFFIC_ACCIDENT,
+                           target_concept_name="Road traffic accident", target_domain_id="Observation",
+                           status="APPROVED", method="manual", **common)
+    hb = MappingDecision(source_code="HB", source_name="HB", target_concept_id=2000004001, target_domain_id="Measurement",
+                         target_concept_name="Hemoglobin", status="APPROVED", method="llm", **common)
+    review.export_review(ws, [mrdt, hb])
+    out = {d.source_code: d for d in review.import_review(ws, domains=vocabulary_domains(load_ref()))}
+    assert out["MRDT"].status == "APPROVED" and out["HB"].status == "APPROVED"
+    off = vocabulary_domains(load_ref().model_copy(update={"route_by_domain": False}))
+    out = {d.source_code: d for d in review.import_review(ws, domains=off)}
+    flagged = out["MRDT"]
+    assert (flagged.status, flagged.target_concept_id) == ("FLAGGED", ROAD_TRAFFIC_ACCIDENT)
+    assert "is in domain Observation, which the field no longer accepts (Measurement)" in flagged.rationale
+    assert out["HB"].status == "APPROVED"
+    review.export_review(ws, list(out.values()))
+    again = {d.source_code: d for d in review.import_review(ws, domains=off)}
+    assert again == out  # checked once: the rationale does not grow
+    mixed, _, _ = _concept_field(load_ref(), "condition_occurrence", "condition_concept_id", kind="concept_map",
+                                 expression="d.icd10", vocabulary="SRC_LAB", target_domain="Condition")
+    review.export_review(ws, [mrdt, hb])
+    out = {d.source_code: d for d in review.import_review(ws, domains=vocabulary_domains(mixed))}
+    assert out["HB"].status == "UNCHECKED" and "expect concepts of different domains" in out["HB"].rationale
+    assert out["MRDT"].status == "APPROVED"  # a reviewer chose it
 
 
 def test_reapplied_review_edits_use_the_current_spec(tmp_path, monkeypatch):
@@ -457,7 +549,7 @@ def test_reapplied_review_edits_use_the_current_spec(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------------------
 
 
-def test_prompts_explain_routing():
+def test_prompts_explain_routing(tmp_path):
     assert "the build then moves the record to that domain's table" in DESIGN_SYSTEM
     assert "Only the standard concept decides: unmapped records (concept 0) stay where you load them" in DESIGN_SYSTEM
     assert "concepts of other domains (values, units, types) are never moved" in DESIGN_SYSTEM
@@ -472,6 +564,19 @@ def test_prompts_explain_routing():
     md = render_spec_md(load_ref())
     assert "**Routing by domain:** after loading" in md
     assert "**Routing by domain:** off" in render_spec_md(load_ref().model_copy(update={"route_by_domain": False}))
+    # the repair prompt says whether this spec routes: the system prompt describes routing as it works when on
+    from omop_agent.quality.repair import build_repair_prompt
+
+    assert 'When the spec routes by domain (the "Routing by domain" line' in text
+    cfg = plain_config(tmp_path)
+
+    def line(spec):
+        return next(x for x in build_repair_prompt(spec, 1, [], [], cfg).splitlines() if x.startswith("Routing by"))
+
+    assert line(load_ref()).startswith("Routing by domain: on: after loading, every condition_occurrence")
+    off = line(load_ref().model_copy(update={"route_by_domain": False}))
+    assert off.startswith("Routing by domain: off (route_by_domain: false): records stay in the table that loads them")
+    assert "do not apply" in off and "leave a correct lookup as it is" in off
 
 
 HAND_ROUTED_WHERE = ("EXISTS (SELECT 1 FROM {vocab}.concept c JOIN {vocab}.concept_relationship r ON "
@@ -1048,6 +1153,41 @@ def test_rebuild_truncates_route_targets(staged):
     assert off.ok and not any(s.kind == "route" for s in off.steps)
     assert count(conn, schemas, "observation") == 0 and count(conn, schemas, "procedure_occurrence") == 0
     assert count(conn, schemas, "condition_occurrence", "condition_source_value IN ('Z34.9', 'Z30.0')") == 2 * n
+
+
+@pytest.mark.postgres
+def test_cancelled_build_leaves_no_rows_behind(staged, monkeypatch):
+    """A build cancelled after its route and era steps committed (the web app's cancel raises
+    SystemExit) leaves moved records and eras that no etl_run.json names; the next build empties
+    them even when it neither routes nor derives eras, so no record is loaded twice."""
+    from omop_agent.etl import runner
+
+    conn, schemas, cfg = staged
+    n = add_codes(conn, schemas, per_code=2)["visits"]
+    ws = Workspace(cfg.workdir)
+    spec = fixed_ref()
+    off = spec.model_copy(update={"route_by_domain": False, "derive_eras": False})
+    assert run_etl(conn, schemas, off, cfg, ws).ok  # its etl_run.json names no route destination
+    real = runner._run_step
+
+    def cancel(conn, step, cfg=None):
+        if step.kind == "metadata":  # after the routes and the eras
+            raise SystemExit(143)
+        return real(conn, step, cfg)
+
+    monkeypatch.setattr(runner, "_run_step", cancel)
+    with pytest.raises(SystemExit):
+        run_etl(conn, schemas, spec, cfg, ws)
+    conn.rollback()
+    monkeypatch.setattr(runner, "_run_step", real)
+    assert count(conn, schemas, "observation") == 2 * n and count(conn, schemas, "procedure_occurrence") == n
+    eras = count(conn, schemas, "condition_era")
+    assert eras > 0 and ws.etl_tables_json.exists()
+    assert run_etl(conn, schemas, off, cfg, ws).ok
+    assert count(conn, schemas, "observation") == 0 and count(conn, schemas, "procedure_occurrence") == 0
+    assert count(conn, schemas, "condition_era") == 0 and count(conn, schemas, "drug_era") == 0
+    assert count(conn, schemas, "condition_occurrence", "condition_source_value IN ('Z34.9', 'Z30.0')") == 2 * n
+    assert not ws.etl_tables_json.exists()  # the build finished: etl_run.json names what it wrote
 
 
 # --------------------------------------------------------------------------------------

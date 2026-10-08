@@ -25,6 +25,8 @@ birth and death fields follow THEMIS (the birth year and month are kept, a missi
 the 1st, a year-only birth date gives no birth_datetime; a death date takes the last day of the
 known period); the start of a DQD start/end pair takes the first day and its end the last day
 (the widest interval, which cannot invert a correctly ordered pair); other dates take the 15th.
+An end computed from the start's own columns (``start + days_supply - 1``) reads them with the
+start's rule (``etl.compiler._date_rule``): the widest interval is for values recorded apart.
 ``etl.partial_dates: reject`` makes every non-THEMIS date NULL instead. Fields that are not dates
 reject partial dates: a number computed from one would be a guess.
 """

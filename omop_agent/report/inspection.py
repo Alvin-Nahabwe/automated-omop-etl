@@ -397,6 +397,13 @@ def _timeline(stages: dict[str, dict[str, Any]], audit: list[dict[str, Any]], ro
     return {"stages": rows, "has_state": bool(stages)}
 
 
+def nonblocking_notes(ws: Workspace) -> list[str]:
+    """The steps of the last build in ``ws`` that failed without failing it, with what the CDM lacks
+    because of each (``_nonblocking_notes``); [] without a readable etl_run.json."""
+    problems: list[str] = []
+    return _nonblocking_notes(_load(ws.etl_run_json, ETLRunResult.model_validate_json, problems))
+
+
 def review_caveats(cfg: ProjectConfig, ws: Workspace) -> list[str]:
     """What still needs a person's review before the CDM built in ``ws`` is used (see _reviews)."""
     problems: list[str] = []
@@ -492,9 +499,14 @@ def _reading(table: str, c: ColumnProfile, k: int) -> dict[str, Any] | None:
     return {"table": table, "column": c.name, "type": c.inferred_type, **row}
 
 
-def _source_section(profile: SourceProfile, annotations: SourceAnnotations | None) -> dict[str, Any]:
+def _source_section(
+    profile: SourceProfile, annotations: SourceAnnotations | None, min_cell_count: int = 0,
+) -> dict[str, Any]:
+    """The source profile section. Small counts are suppressed at the stricter of the profile's
+    threshold and the project's current ``min_cell_count`` (as ``privacy.llm_view`` does): a
+    threshold raised after profiling applies at once, without profiling again."""
     ann = {t.table: t for t in annotations.tables} if annotations else {}
-    k = profile.min_cell_count
+    k = max(profile.min_cell_count, min_cell_count)
     tables, pii, reading = [], [], []
     for t in profile.tables:
         a = ann.get(t.name)
@@ -706,9 +718,11 @@ def _key_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
 
 def _link_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
     """Visit links of a step's records: linked of those with a visit key, how many name another
-    person's visit and how many a visit a visit mapping left out (filtered out, or not loaded)."""
+    person's visit and how many a visit a visit mapping left out (filtered out, or not loaded). A
+    step that failed or was skipped loaded nothing, so it has none (an older etl_run.json kept the
+    counts read before its INSERT failed)."""
     links = s.stats.get("visit_links") or {}
-    if not links:
+    if not links or s.error or s.skipped:
         return ""
     text = f"{count(int(links.get('linked') or 0))}/{count(int(links.get('with_key') or 0))}"
     extra = [f"{count(int(links[k]))} {label}" for k, label in (("other_person", "other person"),
@@ -808,12 +822,23 @@ def _value_rows(run: ETLRunResult, count: Callable[[int], str]) -> list[dict[str
 
 
 def _retention(s: TableLoadResult) -> float | None:
-    """Rows inserted per source row; for a step that keeps one row per key, the source rows kept
-    (``retained_rows``, the etlRecordRetention basis): rows that lost to another row of their key,
-    or rolled up into one visit, are not lost (the Statistics column counts them)."""
-    if "keys" in s.stats and s.retained_rows is not None:
+    """The source rows kept per source row (``retained_rows``, the etlRecordRetention basis), as
+    the check measures it: the extra rows of a code mapped to several concepts do not hide rows
+    that were dropped, and rows that lost to another row of their key, or rolled up into one
+    visit, are not lost (the Statistics column counts both). Rows inserted per source row for a
+    step without that count (custom SQL, older results)."""
+    if s.retained_rows is not None:
         return _ratio(s.retained_rows, s.source_rows)
     return _ratio(s.rows_inserted, s.source_rows)
+
+
+def _fan_out_stats(s: TableLoadResult, count: Callable[[int], str]) -> str:
+    """The extra rows a mapping's codes with several concepts added (rows inserted beyond the
+    source rows kept), for a step that does not keep one row per key."""
+    if s.error or s.skipped or s.retained_rows is None or "keys" in s.stats or s.kind not in (None, "insert"):
+        return ""
+    extra = int(s.rows_inserted or 0) - s.retained_rows
+    return f"{count(extra)} added by 1-to-many mappings" if extra > 0 else ""
 
 
 def _etl_section(run: ETLRunResult, min_cell_count: int = 5, shareable: bool = False) -> dict[str, Any]:
@@ -835,6 +860,7 @@ def _etl_section(run: ETLRunResult, min_cell_count: int = 5, shareable: bool = F
             "moved": _moved_stats(s, count),
             "derived": _derived_stats(s),
             "id_keys": _map_stats(s, count),
+            "fan_out": _fan_out_stats(s, count),
             "visit_links": _link_stats(s, count),
             "seconds": s.seconds,
             "error": _short(s.error, 600) if s.error else "",
@@ -1363,6 +1389,9 @@ def collect_report_data(
             cdm_note = f"CDM characterisation failed: {short_error(e)}"
 
     verdict, reasons, verdict_notes = _verdict(dq, etl_run, stages)
+    from ..etl.runner import OLDER_BUILD_NOTE, built_by_older_version
+
+    older_build = OLDER_BUILD_NOTE[0].upper() + OLDER_BUILD_NOTE[1:] + "." if built_by_older_version(etl_run) else ""
     review_rows, caveats = _reviews(cfg, ws, audit, repairs, decisions)
     design = _design_section(spec) if spec else None
     vocab = _vocab_section(vocab_eval, mcc, shareable) if vocab_eval is not None else None
@@ -1398,9 +1427,11 @@ def collect_report_data(
         "verdict_reasons": reasons,
         "verdict_caveats": caveats if verdict == PASSED else [],
         "verdict_notes": verdict_notes,  # steps that failed without failing the build
+        "older_build": older_build,  # the CDM was built by a version before this one's build behaviours
         "reviews": review_rows,
         "timeline": _timeline(stages, audit, ws.root),
-        "source": _source_section(apply_overrides(profile, cfg.privacy, annotations), annotations) if profile else None,
+        "source": (_source_section(apply_overrides(profile, cfg.privacy, annotations), annotations,
+                                   cfg.privacy.min_cell_count) if profile else None),
         "annotations": {"notes": notes, "n_tables": len(annotations.tables)} if annotations else None,
         "design": design,
         "vocab": vocab,

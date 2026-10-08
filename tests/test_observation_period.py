@@ -763,6 +763,11 @@ def test_merge_checks(tmp_path):
     assert (err.check_name, err.severity, err.repairable) == ("etlStepError", "fatal", False)
 
 
+def fill_result(n: int) -> TableLoadResult:
+    return TableLoadResult(target_table="observation_period", step="13_observation_period_fill", kind="derived",
+                           rows_inserted=n, stats={"inserted": n, "persons_without_period": n})
+
+
 def test_build_history_counts_the_final_periods():
     steps = [
         TableLoadResult(target_table="person", step="03_person", kind="insert", rows_inserted=80),
@@ -774,8 +779,8 @@ def test_build_history_counts_the_final_periods():
         TableLoadResult(target_table="cdm_source", step="14_cdm_source", kind="metadata", rows_inserted=1),
     ]
     run = ETLRunResult(started_at=NOW, steps=steps)
-    # the valid episodes the merge took (100 - 2 dropped) and the fill's periods
-    assert _BuildHistory._rows(run) == {"person": 80, "observation_period": 105, "cdm_source": 1}
+    # the valid episodes the merge took (100 - 2 dropped), not the fill's periods
+    assert _BuildHistory._rows(run) == {"person": 80, "observation_period": 98, "cdm_source": 1}
     # the merge replaces counted rows; the fill's periods are derived rows, counted apart
     assert run.rows_loaded() == 80 + 100 + 1 and run.rows_derived() == 7
     # from_events: the derived periods are what the merge took
@@ -791,7 +796,15 @@ def test_build_history_counts_the_final_periods():
     history.add(run, None)
     worse = ETLRunResult(started_at=NOW, steps=[steps[0], steps[1], merge_result(inserted=40, dropped_inverted=60),
                                                 steps[3], steps[4]])
-    assert history.losses(worse, None) == ["observation_period loaded 47 rows, 105 before"]
+    assert history.losses(worse, None) == ["observation_period loaded 40 rows, 98 before"]
+    # a repair that inverts the only episode of people with records: the fill gives them periods from
+    # their records, which must not make up for the lost episodes
+    history = _BuildHistory()
+    history.add(ETLRunResult(started_at=NOW, steps=[
+        merge_result(episodes=32, dropped_inverted=2, inserted=30), fill_result(6)]), None)
+    inverted = ETLRunResult(started_at=NOW, steps=[merge_result(episodes=32, dropped_inverted=5, inserted=27),
+                                                   fill_result(9)])
+    assert history.losses(inverted, None) == ["observation_period loaded 27 rows, 30 before"]
     # a repair that fixes the exit dates of middle episodes joins periods (fewer of them): no loss
     history = _BuildHistory()
     history.add(ETLRunResult(started_at=NOW, steps=[merge_result(episodes=600, dropped_inverted=100, inserted=300)]),

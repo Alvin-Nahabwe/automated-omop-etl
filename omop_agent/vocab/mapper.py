@@ -414,6 +414,16 @@ class _Hit:
     names: list[str] = field(default_factory=list)  # concept name first, then synonyms
 
 
+def _by_name(h: _Hit, q: str) -> _Hit:
+    """``h``, a concept of another accepted domain, scored by its names only: a concept code equal to
+    a short local code ('TB', 'CR': HCPCS modifiers in Observation) says nothing of its meaning, so
+    such a match must not rank above the target domain's concepts (``_Searcher.search``)."""
+    if not h.names:
+        return h
+    score = round(max(text_score(q, normalize(n)) for n in h.names), 3)
+    return h if score >= h.candidate.score else _Hit(h.candidate.model_copy(update={"score": score}), h.names)
+
+
 def _exact_key(text: str) -> str:
     return " ".join(text.lower().split())
 
@@ -595,7 +605,8 @@ LIMIT %(pool)s"""
         if prefer is None or not others:
             return self._search_each(text, [(prefer, limit)])[0]
         found = self._search_each(text, [(prefer, limit)] + [(d, ALSO_ACCEPTED_CANDIDATES) for d in others])
-        merged = [h for hits in found for h in hits]
+        q = normalize(text.strip())
+        merged = found[0] + [_by_name(h, q) for hits in found[1:] for h in hits]
         merged.sort(key=lambda h: (-h.candidate.score, h.candidate.domain_id != prefer, h.candidate.concept_id))
         return merged
 
@@ -771,7 +782,7 @@ def _decision(t: SourceTerm, hits: list[_Hit], **kw) -> MappingDecision:
     )
 
 
-_MIXED_DOMAINS = (" (The fields that use this source vocabulary expect concepts of different domains, so a reviewer "
+MIXED_DOMAINS_NOTE = (" (The fields that use this source vocabulary expect concepts of different domains, so a reviewer "
                   "checks every code.)")
 
 
@@ -803,7 +814,7 @@ def _exact_match(t: SourceTerm, hits: list[_Hit]) -> MappingDecision | None:
         status="APPROVED" if t.auto_approve else "UNCHECKED",
         method="exact",
         rationale=f"The source term equals {how} of the only matching standard concept."
-        + ("" if t.auto_approve else _MIXED_DOMAINS),
+        + ("" if t.auto_approve else MIXED_DOMAINS_NOTE),
     )
 
 
@@ -846,7 +857,7 @@ def _format_term(i: int, t: SourceTerm, hits: list[_Hit], k: int, phrases: list[
     if phrases:
         lines.append(f"   searched again for: {'; '.join(phrases)}")
     shown = _shown(t, hits, k)
-    if len({h.candidate.domain_id for h in shown}) > 1:  # several domains: show each candidate's
+    if others or len({h.candidate.domain_id for h in shown}) > 1:  # other domains accepted: show each candidate's
         lines.append("   candidates (concept_id | name | domain | class | vocabulary | score):")
         for h in shown:
             c = h.candidate
@@ -981,7 +992,7 @@ class _VocabMapper:
         auto = ch.confidence >= self.cfg.mapping.auto_approve_confidence and in_domain and t.auto_approve
         note = "" if in_domain else (f" (A {cand.domain_id} concept, not {t.target_domain}: the record moves to the "
                                      f"table of the {cand.domain_id} domain; review it.)")
-        note += "" if t.auto_approve else _MIXED_DOMAINS
+        note += "" if t.auto_approve else MIXED_DOMAINS_NOTE
         return _decision(
             t,
             hits,

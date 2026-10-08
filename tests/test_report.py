@@ -703,6 +703,17 @@ def test_reading_the_values(full_ws):
     assert ("| individuals.dob | date | %d/%m/%Y | 99/99/9999 ×380 | 12 | 99-99-99 ×12 | &lt;5 |  | 7 |  |") in md
     assert "+03:00 ×50, &lt;5 with rarer offsets" in md and "<h3>Reading the values</h3>" in html
     assert "hh_id" not in md.split("**Reading the values**")[1].split("**Notes and questions")[0]
+    # a threshold raised after profiling applies at once, as in what Claude sees (privacy.llm_view)
+    strict = cfg.model_copy(update={"privacy": cfg.privacy.model_copy(update={"min_cell_count": 30})})
+    source = collect_report_data(strict, ws, shareable=True)["source"]
+    assert source["min_cell_count"] == 30
+    dob, submitted = source["reading"]
+    assert (dob["shapes"], dob["nonconforming"], dob["nonconforming_shapes"], dob["na_markers"]) == (
+        "99/99/9999 ×380", "<30", "", "<30")
+    assert submitted["offsets"] == "+03:00 ×50, <30 with rarer offsets"
+    shared = render_markdown(collect_report_data(strict, ws, shareable=True))
+    assert 'Counts below 30 are shown as "&lt;30"' in shared
+    assert "| individuals.dob | date | %d/%m/%Y | 99/99/9999 ×380 | &lt;30 |  | &lt;30 |  | &lt;30 |  |" in shared
 
 
 def test_design_section_says_what_the_build_does(full_ws):
@@ -758,3 +769,19 @@ def _minimal_data() -> dict:
     with tempfile.TemporaryDirectory() as d:
         cfg = _cfg(Path(d))
         return collect_report_data(cfg, Workspace(cfg.workdir))
+
+
+def test_report_says_when_an_older_version_built_the_cdm(full_ws):
+    """After an update and before a rebuild, the CDM lacks this version's build behaviours that the
+    design section lists: the report says so (an older etl_run.json: steps without a kind)."""
+    cfg, ws = full_ws
+    run = ws.load_json(ws.etl_run_json, ETLRunResult)
+    assert run.steps and all(s.kind is None for s in run.steps)
+    data = collect_report_data(cfg, ws)
+    assert data["older_build"].startswith("The CDM was built by an earlier version of omop-agent")
+    assert "**Built by an earlier version:** The CDM was built" in render_markdown(data)
+    assert "<strong>Built by an earlier version.</strong>" in render_html(data)
+    ws.save_json(ws.etl_run_json, run.model_copy(update={
+        "steps": [s.model_copy(update={"kind": "insert"}) for s in run.steps]}))
+    data = collect_report_data(cfg, ws)
+    assert data["older_build"] == "" and "Built by an earlier version" not in render_markdown(data)

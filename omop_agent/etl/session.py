@@ -20,7 +20,11 @@ every one of them, whatever the server or role defaults are:
 * ``omop_agent.imputation_cap``: the latest date a partial date may be completed to, the
   configured ``cdm_source.source_release_date`` or else the current date;
 * ``standard_conforming_strings = on`` (the default): a backslash is an ordinary character in
-  '...' strings, as ``sqlguard`` reads them, and as the literals the compiler writes assume.
+  '...' strings, as ``sqlguard`` reads them, and as the literals the compiler writes assume;
+* ``jit = off``: the conversion helpers keep PostgreSQL's default function cost, so a large step's
+  plan is estimated far above the JIT thresholds, and compiling it (dozens of functions, up to
+  several seconds a statement) buys nothing: plpgsql bodies cannot be inlined. A setting of the
+  plan only; the results are the same.
 
 Every setting is transaction-local (``SET LOCAL``, ``set_config(..., true)``): run them inside
 the transaction or savepoint of the statements they apply to.
@@ -42,6 +46,7 @@ def session_sql(cfg: ProjectConfig | None = None) -> list[str]:
     return [
         "SET LOCAL datestyle = 'ISO, YMD';",
         "SET LOCAL standard_conforming_strings = on;",
+        "SET LOCAL jit = off;",
         *([f"SET LOCAL timezone = {ql(zone)};"] if zone else []),
         f"SELECT set_config('omop_agent.imputation_cap', {cap}, true),"
         f" set_config('omop_agent.timezone', {ql(zone or '')}, true);",

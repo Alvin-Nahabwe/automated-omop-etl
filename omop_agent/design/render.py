@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from ..cdm.spec import DERIVED_ERAS, LOAD_ORDER
-from ..etl.compiler import ERA_PAD_DAYS, era_status, key_sources
-from ..etl.routing import route_sources
+from ..etl.compiler import ERA_PAD_DAYS, era_status, key_sources, target_tables
+from ..etl.routing import route_sources, route_targets
 from ..models import ETLSpec, FieldMapping, TableMapping
 
 # How each era table is built (``etl.compiler.era_status``), for the review views.
@@ -34,7 +34,9 @@ def eras_text(spec: ETLSpec) -> str:
 ONE_ROW_PER_KEY_TEXT = (
     "person and death keep one row per person, visit_occurrence one per visit and person (from the earliest start "
     "to the latest end of its rows); a mapping's dedup_order picks the row, then, for death, a date known to the "
-    "day and the latest date, then the most complete row; duplicate and conflicting rows are counted and reported"
+    "day and the latest date, then the most complete row; between the mappings of one table the first (in spec "
+    "order) that loads a key wins outright, with no spanning or ranking across mappings; duplicate and conflicting "
+    "rows are counted and reported"
 )
 
 
@@ -60,6 +62,18 @@ def routing_text(spec: ETLSpec) -> str:
     return ("after loading, every condition_occurrence, procedure_occurrence, drug_exposure, device_exposure and "
             "measurement record whose standard concept belongs to another event domain moves to that domain's table "
             "(a measurement with a result goes to observation); records with concept 0 stay")
+
+
+def tables_filled(spec: ETLSpec) -> dict[str, list[str]]:
+    """The CDM tables a build of ``spec`` writes: ``mapped`` by its mappings and custom SQL,
+    ``derived`` by the build itself (observation periods from the records, the eras, cdm_source),
+    and ``moved``, the tables only records moved by domain can reach (they stay empty when no
+    record's concept belongs to their domain)."""
+    mapped = list(dict.fromkeys([tm.target_table.lower() for tm in spec.table_mappings]
+                                + [c.target_table.lower() for c in spec.custom_sql]))
+    derived = [t for t in target_tables(spec) if t not in mapped]
+    moved = [t for t in route_targets(spec) if t not in mapped and t not in derived]
+    return {"mapped": mapped, "derived": derived, "moved": moved}
 
 
 def build_rules(spec: ETLSpec) -> list[tuple[str, str]]:

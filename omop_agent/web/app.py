@@ -40,9 +40,10 @@ from ..approvals import (
     gate_state,
     mapping_changes,
     record_approval,
+    without_default_lines,
 )
 from ..db import Schemas, connect
-from ..design.render import build_rules
+from ..design.render import build_rules, tables_filled
 from ..etl.compiler import key_sources
 from ..models import ConceptCandidate, DQReport, ETLSpec, MappingDecision
 from ..runlock import RunInProgress, run_lock
@@ -426,7 +427,8 @@ def create_app(
         proj = configured(project_or_404(pid))
         ws = proj.ws
         ctx: dict[str, Any] = {"project": proj, "gate": gate_state(ws, "design"), "spec": None, "spec_error": None,
-                               "key_sources": {"person": [], "visit": []}, "rules": []}
+                               "key_sources": {"person": [], "visit": []}, "rules": [],
+                               "tables": {"mapped": [], "derived": [], "moved": []}}
         if ws.spec_yaml.exists():
             text = ws.spec_yaml.read_text()
             ctx["spec_text"] = text
@@ -440,11 +442,14 @@ def create_app(
                     for what, t in (("person", "person"), ("visit", "visit_occurrence"))
                 }
                 ctx["rules"] = build_rules(ctx["spec"])  # one row per key, periods, routing, eras
+                ctx["tables"] = tables_filled(ctx["spec"])
             approved = approved_snapshot(ws, "design")
             if approved is not None and not ctx["gate"].current:
+                # lines that only write a field this version added at its default are not a change
                 ctx["diff"] = list(
                     difflib.unified_diff(
-                        approved.splitlines(), text.splitlines(), "approved", "current", lineterm="", n=2
+                        without_default_lines(approved).splitlines(), without_default_lines(text).splitlines(),
+                        "approved", "current", lineterm="", n=2,
                     )
                 )
         issues_path = ws.root / "design_issues.json"
@@ -580,21 +585,23 @@ def create_app(
                     target = int(form.get("concept_id", str(d.target_concept_id)))
                 except ValueError:
                     raise HTTPException(400, "The selected concept is not a number.")
-                if target != d.target_concept_id:
-                    if target == 0:
+                if target == 0:
+                    if target != d.target_concept_id:
                         changes.update(target_concept_id="0", target_concept_name="", target_domain_id="", target_vocabulary_id="")
-                    else:
-                        concept = next((c for c in d.candidates if c.concept_id == target), None)
-                        if conn is not None:
-                            from ..vocab.mapper import accepted_domains, check_concept
+                else:  # every approval of a concept is checked, also of the one the decision holds (it may be
+                    # one the domain check rejected, or one of a domain the design no longer accepts)
+                    concept = next((c for c in d.candidates if c.concept_id == target), None)
+                    if conn is not None:
+                        from ..vocab.mapper import accepted_domains, check_concept
 
-                            concept, why = check_concept(conn, schemas, target, accepted_domains(d))
-                            if concept is None:
-                                flash(request, "error", f"Not saved: {why}.")
-                                return redirect(back)
-                        elif concept is None:
-                            flash(request, "error", "Not saved: the vocabulary database cannot be reached to check that concept.")
+                        concept, why = check_concept(conn, schemas, target, accepted_domains(d))
+                        if concept is None:
+                            flash(request, "error", f"Not saved: {why}.")
                             return redirect(back)
+                    elif concept is None and target != d.target_concept_id:
+                        flash(request, "error", "Not saved: the vocabulary database cannot be reached to check that concept.")
+                        return redirect(back)
+                    if concept is not None:  # also the same concept: the review file may hold a rejected id
                         changes.update(
                             target_concept_id=str(concept.concept_id), target_concept_name=concept.concept_name,
                             target_domain_id=concept.domain_id, target_vocabulary_id=concept.vocabulary_id,

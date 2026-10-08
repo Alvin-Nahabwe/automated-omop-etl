@@ -186,13 +186,21 @@ them.
 - Every person and visit_occurrence mapping adds the keys of the rows it loads to the person or \
 visit id map, so people and visits can come from several source tables (the HDSS register and a \
 clinic register; outpatient visits and admissions). A key found in two sources is one person \
-(visit). When a source numbers its people or visits independently of the person_key or \
+(visit), and the mappings of one table are applied in spec order: the first mapping that loads a \
+key wins outright, and a later mapping's rows of that key are skipped (counted); spanning, \
+dedup_order and the death ranking compare the rows of one mapping only. List the authoritative \
+source first (the HDSS register before a clinic register; the death source whose date should win) \
+and bring in what another source adds (a verbal autopsy's cause) through a join of that mapping. \
+When a source numbers its people or visits independently of the person_key or \
 visit_key table, prefix its keys (for example 'EMR:' || e.patient_no or 'IPD:' || a.admission_no), \
 here and in every mapping that refers to them.
 - person, death and visit_occurrence keep one row per key: person and death one per person, \
 visit_occurrence one per visit and person. Several rows of one visit (ward stays, diagnoses) may \
-feed visit_occurrence: the build keeps one row per visit and person, taking the earliest start and \
-the latest end (admitted_from from the first row, discharged_to from the last). Rows of one visit \
+feed one visit_occurrence mapping: the build keeps one row per visit and person, taking the earliest \
+start and the latest end of that mapping's rows (admitted_from from the first row, discharged_to \
+from the last). Rows that belong to a visit another mapping loads (the ward stays of an admission \
+table) must come through that mapping (as its driving table or a join), or go to visit_detail: a \
+mapping of their own adds nothing to the visits loaded before it. Rows of one visit \
 key that are separate stays (days apart) fail etlVisitGrain: the visit key must identify one \
 visit. Set dedup_order (an ORDER BY list over the aliases, best row first, for example \
 "x.verified = '1' DESC" or "i.reg_date::date DESC"; a missing or unreadable value ranks last) when \
@@ -289,8 +297,8 @@ def staging_conventions(cfg: ProjectConfig | None = None) -> str:
     and the partial-date rule; defaults without it)."""
     etl = cfg.etl if cfg is not None else EtlConfig()
     if etl.partial_dates == "widest":
-        partial = ("start dates take the first day, end dates the last day (the widest interval), other dates "
-                   "the 15th")
+        partial = ("start dates take the first day, end dates the last day (the widest interval; an end computed "
+                   "from the start's columns reads them as the start does), other dates the 15th")
     else:
         partial = "they are left NULL (etl.partial_dates: reject)"
     if etl.timezone:
@@ -298,7 +306,9 @@ def staging_conventions(cfg: ProjectConfig | None = None) -> str:
                    "'<zone>' only when you need another zone")
     else:
         offsets = ("keep the time as written (no site time zone is configured, so the offset is ignored and "
-                   "counted); write ::timestamptz AT TIME ZONE '<zone>' only when you need another zone")
+                   "counted). A column whose profile shows 'Z', '+00:00' or several offsets needs etl.timezone: "
+                   "the validator stops the build until a person sets it, whatever the expression, so write the "
+                   "plain conversion and say so in open_questions")
     return STAGING_CONVENTIONS.replace("<PARTIAL_DATES>", (
         "Dates with an unknown day or month (00/06/1975, 1975-00-00, or a template without DD or MM) are "
         f"completed by the build and counted: {partial}. Birth and death dates follow THEMIS: year_of_birth and "
@@ -412,8 +422,10 @@ the patient key over that table's bare column names. Plan one person mapping per
 that lists people (for example the HDSS register, and a clinic register of patients who are not \
 in it): each adds the people it loads to the person id map.
 2. visit_key: the source table of visits/encounters and its key expression, if there is one. \
-Plan one visit_occurrence mapping per source of visits (outpatient visits, admissions, ward \
-stays): each adds its visits to the visit id map. If visit numbers restart for each person, \
+Plan one visit_occurrence mapping per source of visits (outpatient visits, admissions): each adds \
+its visits to the visit id map. The ward stays of an admission are rows of that admission's \
+visit: load them through the admission's mapping (or as visit_detail), not as a mapping of their \
+own. If visit numbers restart for each person, \
 include the person key in the visit key.
 3. observation_period: 'table_mapping' if a source table records enrollment, residency or \
 follow-up episodes (then plan an observation_period table from it, one row per episode: the build \
@@ -421,7 +433,9 @@ merges each person's episodes, ends open ones and gives persons without an episo
 their events), otherwise 'from_events'.
 4. tables: one entry per table mapping, in load order (person first). For each, the CDM \
 target table and its source tables (the first one provides the rows; any others are joined). \
-A CDM table may appear more than once when several source tables feed it. Only plan tables \
+A CDM table may appear more than once when several source tables feed it; for person, death and \
+visit_occurrence the first mapping that loads a key wins outright, so list the authoritative \
+source first. Only plan tables \
 the data supports. Do not plan mappings that only split a source table by the domain of its \
 codes: the build moves each record to the table of its concept's domain. Do not plan \
 condition_era or drug_era: the build derives them from the condition and drug records.

@@ -240,7 +240,10 @@ approved. Things to check after an update:
 * The first build installs a new version of the helper functions in the project's ETL schema. The
   app's `omop` role owns that schema, so this needs nothing from you. If a project sets
   `target.etl_role`, the build grants the ETL tables it creates to that role; the role needs the
-  privileges listed under "Privacy and safety" in the README.
+  privileges listed under "Privacy and safety" in the README, now including DELETE on the CDM
+  tables (the observation-period merge and the route steps move rows by deleting them).
+* Every build now empties all the tables records can be moved to by domain, also those the
+  design does not load: rows put into the CDM schema by anything other than the design are lost.
 * CSV sources: staging now stores `NA`, `NULL`, `\N` and `.` as empty values. This takes effect
   when the source is staged again:
   `docker compose run --rm app profile -c /srv/projects/<name>/omop_agent.yaml`, then **Continue

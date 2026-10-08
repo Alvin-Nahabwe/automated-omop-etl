@@ -98,6 +98,22 @@ def _spec_payload_of(text: str) -> Any:
     return _without_new_defaults(payload)
 
 
+def without_default_lines(text: str) -> str:
+    """Spec YAML ``text`` without the lines that only write a DIGEST_IGNORED_DEFAULTS field at its
+    default (``route_by_domain: true``, ``dedup_order: null``). A spec approved before those fields
+    existed gains them the first time this version saves it; a diff of the two texts should show
+    the changes someone made, not those lines (they change no digest either)."""
+    import re
+
+    def literal(value: Any) -> str:
+        return {True: "true", False: "false", None: "(?:null|~)?"}.get(value, re.escape(str(value)))
+
+    names = {**DIGEST_IGNORED_DEFAULTS["spec"], **DIGEST_IGNORED_DEFAULTS["table_mapping"]}
+    pattern = re.compile(r"^\s*(?:" + "|".join(f"{re.escape(n)}:\\s*{literal(v)}" for n, v in names.items())
+                         + r")\s*$")
+    return "\n".join(line for line in text.splitlines() if not pattern.match(line))
+
+
 def _without_new_defaults(payload: dict[str, Any]) -> dict[str, Any]:
     """``payload`` without the fields of DIGEST_IGNORED_DEFAULTS that hold their default: a spec
     approved before those fields existed keeps its digest; setting one changes it."""

@@ -60,11 +60,17 @@ def test_retention_is_not_netted_against_fan_out():
     assert (res.num_violated_rows, res.num_denominator_rows, res.pct_violated_rows) == (20, 100, 0.2)
     assert res.failed
     assert "20 of 100 records dropped" in res.description
-    assert "Another 30 rows were added by 1-to-many vocabulary mappings" in res.description
-    assert "110 rows inserted" in res.description
+    assert "30 of 110 rows inserted are extra rows added by 1-to-many vocabulary mappings" in res.description
+    # every count is "<n> of <m>", so the repair prompt suppresses the small ones (the fan-out and the
+    # rows inserted would otherwise give away a suppressed number of dropped records)
+    from omop_agent.quality.repair import _check_summary
+
+    _, text = _check_summary(retention(19, 19, 18), 5)
+    assert "<5 of 19 records dropped" in text and "<5 of 19 rows inserted are extra rows" in text
+    assert " 1 " not in text and "1 rows" not in text
 
     res = retention(100, 150, 100)  # fan-out only
-    assert res.num_violated_rows == 0 and not res.failed and "Another 50 rows" in res.description
+    assert res.num_violated_rows == 0 and not res.failed and "50 of 150 rows inserted are extra" in res.description
     res = retention(100, 96, 96)  # plain drops, no fan-out: 4% is under the 5% threshold
     assert res.num_violated_rows == 4 and not res.failed and "1-to-many" not in res.description
     # results written before retained_rows existed fall back to the net comparison

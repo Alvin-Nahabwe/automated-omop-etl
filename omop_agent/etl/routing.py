@@ -420,6 +420,21 @@ def shared_codes(spec: ETLSpec) -> list[SharedCodes]:
     return out
 
 
+def same_table_twin(spec: ETLSpec, new: TableMapping) -> int | None:
+    """The position in ``spec.table_mappings`` of a mapping into the same event table, from the same
+    source table, whose main concept field reads the same codes as ``new`` (None: none). Whatever
+    their filters, a source row both select is loaded twice; that they never overlap cannot be told
+    from the SQL. ``shared_codes`` judges pairs of different tables."""
+    c = _main_code(new) if new.target_table.lower() in EVENT_FIELD_ROLES else None
+    if c is None:
+        return None
+    for i, tm in enumerate(spec.table_mappings):
+        if (tm is not new and tm.target_table.lower() == new.target_table.lower()
+                and tm.source.table.lower() == new.source.table.lower() and (_main_code(tm) or ("", ""))[1] == c[1]):
+            return i
+    return None
+
+
 def hand_routed(spec: ETLSpec) -> list[tuple[int, str]]:
     """(position in spec.table_mappings, why) of every mapping that routes records by hand while
     the build routes them (``hand_routing_issue``, ``shared_codes``): its records are loaded twice."""
@@ -436,6 +451,20 @@ def hand_routed(spec: ETLSpec) -> list[tuple[int, str]]:
 def _canonical(domain: str) -> str:
     """The spelling of an event domain ('observation' -> 'Observation'); other domains as given."""
     return next((d for d in DOMAIN_TABLE if d.lower() == domain.strip().lower()), domain.strip())
+
+
+def _key(domain: str) -> str:
+    """What two spellings of one domain share ('Meas Value', 'meas value'): domain_id is compared
+    without case everywhere else too (the concept checks, the searcher)."""
+    return domain.strip().lower()
+
+
+def _distinct(domains: list[str]) -> list[str]:
+    """``domains`` once each (compared by ``_key``), in order, in their first spelling."""
+    out: dict[str, str] = {}
+    for d in domains:
+        out.setdefault(_key(d), _canonical(d))
+    return list(out.values())
 
 
 def routed_field(spec: ETLSpec, tm: TableMapping, fm: FieldMapping) -> bool:
@@ -475,14 +504,14 @@ class VocabularyDomains:
 
 
 def _union(sets: list[list[str]]) -> list[str]:
-    return list(dict.fromkeys(_canonical(d) for s in sets for d in s))
+    return _distinct([d for s in sets for d in s])
 
 
 def _intersection(sets: list[list[str]]) -> list[str]:
     if not sets:
         return []
-    keep = set.intersection(*({_canonical(d) for d in s} for s in sets))
-    return [d for d in _union(sets) if d in keep]
+    keep = set.intersection(*({_key(d) for d in s} for s in sets))
+    return [d for d in _union(sets) if _key(d) in keep]
 
 
 @dataclass
@@ -531,10 +560,10 @@ def vocabulary_domains(
         routed = [f.accepted for f in fields if f.routed and f.accepted]
         other = [f.accepted for f in fields if not f.routed and f.accepted]
         common = _intersection(other) or _union(other)
-        accepted = list(dict.fromkeys(_canonical(d) for d in ([target] if target else []) + _union(routed) + common))
+        accepted = _distinct(([target] if target else []) + _union(routed) + common)
         conflict = None
         for f in fields:
-            extra = [d for d in accepted if d not in {_canonical(a) for a in f.accepted}]
+            extra = [d for d in accepted if _key(d) not in {_key(a) for a in f.accepted}]
             if f.standard and not f.routed and f.accepted and extra:
                 others = "; ".join(f"{g.name} ({', '.join(g.accepted)})" for g in fields if g is not f and g.accepted)
                 conflict = (f"source vocabulary {vocab} is used by {f.name} ({', '.join(f.accepted)}) and by {others}: "
@@ -543,7 +572,7 @@ def vocabulary_domains(
                             "its own")
                 break
         loading = [f for f in fields if f.standard and f.target]
-        mixed = len({_canonical(f.target or "") for f in loading}) > 1
+        mixed = len({_key(f.target or "") for f in loading}) > 1
         if mixed:
             why = (f"the fields that use source vocabulary {vocab} expect concepts of different domains ("
                    + "; ".join(f"{f.name}: {f.target}" for f in loading)

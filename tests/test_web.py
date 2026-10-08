@@ -353,6 +353,62 @@ def test_spec_page_shows_key_sources_and_dedup_order(site):
     assert "<dt>Routing by domain</dt><dd>after loading" in page
 
 
+def test_spec_page_lists_every_table_the_build_fills(site):
+    client, ws, *_ = site
+    login(client, "rita")
+    page = client.get("/p/demo/spec").text
+    filled = page.split("<dt>CDM tables filled</dt><dd>")[1].split("</dd>")[0]
+    assert filled.startswith("person, observation_period, visit_occurrence")
+    assert "also by the build: condition_era, drug_era, cdm_source" in filled
+    assert "records moved by domain can also go to: procedure_occurrence, device_exposure, observation" in filled
+
+
+def test_spec_diff_leaves_out_the_new_fields_at_their_default(site):
+    """A spec approved before route_by_domain, derive_eras and dedup_order existed gains those lines
+    the first time this version saves it; the diff shows the edit, not them."""
+    from omop_agent.models import ETLSpec
+
+    client, ws, *_ = site
+    login(client, "rita")
+    old = ws.spec_yaml.read_text()
+    assert "route_by_domain" not in old and "dedup_order" not in old  # an older spec
+    record_approval(ws, "design", "rita")
+    spec = ETLSpec.model_validate(yaml.safe_load(old))
+    spec.table_mappings[0].rationale = "edited by repair"
+    ws.save_yaml(ws.spec_yaml, spec)
+    assert "route_by_domain: true" in ws.spec_yaml.read_text()
+    page = client.get("/p/demo/spec").text
+    assert "changed since approval" in page and "edited by repair" in page
+    diff = page.split('<pre class="diff">')[1].split("</pre>")[0]
+    assert "edited by repair" in diff
+    assert "route_by_domain" not in diff and "derive_eras" not in diff and "dedup_order: null" not in diff
+
+
+def test_a_passed_run_says_what_failed_without_failing_it(site, monkeypatch):
+    """A route or era step that failed without failing the build is named in the run's message."""
+    from datetime import datetime, timezone
+
+    from omop_agent.models import DQReport, ETLRunResult, TableLoadResult
+    from omop_agent.pipeline import Pipeline
+    from omop_agent.web import projects, worker
+    from omop_agent.web.jobs import Job
+
+    _, ws, *_ = site
+    now = datetime.now(timezone.utc)
+    cfg_path = ws.root.parent / "omop_agent.yaml"
+    ws.save_json(ws.etl_run_json, ETLRunResult(started_at=now, steps=[
+        TableLoadResult(target_table="measurement", step="11_route_prepare", kind="route", blocking=False,
+                        error="boom in route_prepare")]))
+    monkeypatch.setattr(Pipeline, "run_all", lambda self, **kw: DQReport(run_at=now, results=[], passed=True))
+    monkeypatch.setattr(projects, "schema_conflicts_for", lambda *a: [])
+    store = JobStore(ws)
+    job = Job(id="20261008T064045-700b39", kind="continue", by="olive", config_path=str(cfg_path), created_at=now)
+    worker._run(job, load_config(cfg_path), ws, store)
+    assert job.status == "passed" and job.message.startswith("The CDM passed the data-quality gate.")
+    assert ("11_route_prepare failed without failing the build: no records were moved to the table of their "
+            "concept's domain") in job.message
+
+
 def test_report_is_served_with_a_strict_policy(site):
     client, ws, *_ = site
     login(client, "vera")
@@ -447,7 +503,33 @@ def test_review_cycle_with_recorded_approvals(tmp_path):
         users.add("rita", PASSWORDS["rita"], "reviewer")
         client = TestClient(create_app(projects, data, secret_key="y" * 40))
         login(client, "rita")
-        d = next(x for x in import_review(ws) if x.source_vocabulary_id == "SRC_LAB" and x.source_code == "HB")
+        # a concept the domain check rejects (a Unit concept for a lab code) is FLAGGED with the concept
+        # the term had, never the rejected id under that concept's labels; approving it is refused
+        from omop_agent.db import Schemas
+        from omop_agent.vocab.review import update_review_row
+
+        before = next(x for x in import_review(ws) if x.source_vocabulary_id == "SRC_LAB" and x.source_code == "HB")
+        update_review_row(ws, "SRC_LAB", "HB", {"target_concept_id": "2000005001"})
+
+        def checked():  # the decision as the app sees it: imported with the vocabulary database
+            vconn = connect(DB_URL)  # type: ignore[arg-type]
+            try:
+                return next(x for x in import_review(ws, vconn, Schemas.from_config(load_config(cfg_path).target))
+                            if x.source_vocabulary_id == "SRC_LAB" and x.source_code == "HB")
+            finally:
+                vconn.close()
+
+        d = checked()
+        assert (d.status, d.target_concept_id, d.target_concept_name) == (
+            "FLAGGED", before.target_concept_id, before.target_concept_name)
+        assert "target_concept_id 2000005001 rejected" in d.rationale and "domain Unit" in d.rationale
+        r = client.post("/p/demo/mappings/decide", data={
+            "csrf_token": _csrf(client, "/p/demo/mappings"), "vocab_id": "SRC_LAB", "code": "HB", "action": "approve",
+            "concept_id": "2000005001", "expected_target": str(d.target_concept_id), "expected_status": d.status,
+        }, follow_redirects=False)
+        page = client.get(r.headers["location"]).text
+        assert "Not saved" in page and "domain Unit" in page
+        assert checked().status == "FLAGGED"
         anchor = term_anchor(d.source_vocabulary_id, d.source_code)
         page = client.get(f"/p/demo/mappings?filter=all&vocab=SRC_LAB&term={anchor}&q=hemoglobin").text
         assert "Hemoglobin" in page  # the vocabulary search works against the database

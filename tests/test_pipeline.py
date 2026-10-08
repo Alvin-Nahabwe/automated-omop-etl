@@ -324,6 +324,19 @@ def test_upgrade_notice_is_given_once(tmp_path, monkeypatch):
     spec = ETLSpec.model_validate(yaml.safe_load((Path(__file__).parent / "fixtures" / "demo_etl_spec.yaml").read_text()))
     logs: list[str] = []
     p = Pipeline(cfg, log=logs.append)
+    # `build --no-repair` with a spec the validator refuses builds nothing: the notice is kept for the
+    # build that runs
+    from omop_agent.pipeline import SpecInvalid
+
+    def refused(self):
+        raise SpecInvalid("etl_spec.yaml has 1 error(s)")
+
+    monkeypatch.setattr(Pipeline, "validated_spec", refused)
+    with pytest.raises(SpecInvalid):
+        p.build()
+    assert not [e for e in ws.read_audit() if e["event"] == "upgrade_notice"]
+    assert not any("the first build of this project with the new version" in m for m in logs)
+    assert runner.upgrade_notice(ws) == list(runner.UPGRADE_BEHAVIOURS)
     p.build(spec)
     notices = [e for e in ws.read_audit() if e["event"] == "upgrade_notice"]
     assert len(notices) == 1 and notices[0]["behaviours"] == list(runner.UPGRADE_BEHAVIOURS)

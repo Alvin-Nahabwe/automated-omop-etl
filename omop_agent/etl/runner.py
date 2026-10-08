@@ -42,6 +42,7 @@ now do differently (``UPGRADE_BEHAVIOURS``); the pipeline logs it once and recor
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import date, datetime
 from decimal import Decimal
@@ -54,6 +55,7 @@ from ..cdm.ddl import create_cdm_tables, create_etl_tables, truncate_cdm_tables
 from ..cdm.spec import load_cdm_spec
 from ..config import ProjectConfig
 from ..db import Schemas, execute, fetch_all, fetch_one, qi, scalar, short_error
+from ..fsutil import atomic_write_text
 from ..models import ETLRunResult, ETLSpec, RoutedRows, TableLoadResult
 from ..workspace import Workspace, utcnow
 from .compiler import CompiledStep, compile_spec, target_tables
@@ -78,14 +80,25 @@ def _is_cdm_table(name: str | None) -> bool:
 
 
 def _previous_tables(ws: Workspace | None) -> set[str]:
-    """CDM tables loaded by the previous run (so tables dropped from the spec are emptied too)."""
-    if ws is None or not ws.etl_run_json.exists():
+    """CDM tables loaded by the previous run (so tables dropped from the spec are emptied too), and
+    every table a build that never finished may have written (``Workspace.etl_tables_json``: a
+    cancelled build keeps the rows of the steps it committed, e.g. records moved to another table
+    or eras, though no etl_run.json names them)."""
+    if ws is None:
         return set()
-    try:
-        prev = ws.load_json(ws.etl_run_json, ETLRunResult)
-    except Exception:  # an unreadable old result must not block a new run
-        return set()
-    names = {s.target_table for s in prev.steps} | {m.to_table for s in prev.steps for m in s.moved}
+    names: set[str] = set()
+    if ws.etl_tables_json.exists():
+        try:
+            names |= {str(n) for n in json.loads(ws.etl_tables_json.read_text())}
+        except (ValueError, TypeError):
+            pass
+    if ws.etl_run_json.exists():
+        try:
+            prev = ws.load_json(ws.etl_run_json, ETLRunResult)
+        except Exception:  # an unreadable old result must not block a new run
+            prev = None
+        if prev is not None:
+            names |= {s.target_table for s in prev.steps} | {m.to_table for s in prev.steps for m in s.moved}
     return {n for n in names if _is_cdm_table(n)}
 
 
@@ -99,10 +112,26 @@ UPGRADE_BEHAVIOURS = (
     "values that cannot be read become NULL and are counted, and NULL required values follow the CDM conventions "
     "(concept 0, end date = start date, or the row is dropped)",
     "each person's observation periods are merged, and open episodes end at the source release date or at death",
-    "records move to the table of their standard concept's domain (route_by_domain)",
+    "records move to the table of their standard concept's domain (route_by_domain), and every table they can move "
+    "to is emptied before each build, also one the spec does not load",
     "condition_era and drug_era are derived with the OHDSI era logic (derive_eras)",
     "custom SQL of a table without a mapping runs at that table's place in the load order",
 )
+
+
+# What the report and `check` say about a CDM whose last build an older version made (``built_by_older_version``).
+OLDER_BUILD_NOTE = (
+    "the CDM was built by an earlier version of omop-agent (its ETL run records no step kinds), without what this "
+    "version's build does beyond the mappings (one row per key, merged observation periods, routing by domain, "
+    "derived eras); the design section and the checks describe this version's build, so the era checks fail on "
+    "era tables that were never built. Rebuild it (omop-agent build, or run) before relying on these results"
+)
+
+
+def built_by_older_version(run: ETLRunResult | None) -> bool:
+    """Whether ``run`` was written by a version before these build behaviours (its steps carry no
+    ``kind``): its CDM lacks them until the project is rebuilt."""
+    return run is not None and bool(run.steps) and all(s.kind is None for s in run.steps)
 
 
 def upgrade_notice(ws: Workspace) -> list[str]:
@@ -115,7 +144,7 @@ def upgrade_notice(ws: Workspace) -> list[str]:
         prev = ws.load_json(ws.etl_run_json, ETLRunResult)
     except Exception:  # an unreadable old result: no notice rather than a failed build
         return []
-    if not prev.steps or any(s.kind is not None for s in prev.steps):
+    if not built_by_older_version(prev):
         return []
     if ws.audit_log.exists():
         for line in ws.audit_log.read_text(encoding="utf-8").splitlines():
@@ -263,9 +292,14 @@ def _run_step(conn: psycopg.Connection, step: CompiledStep, cfg: ProjectConfig |
         res.error = f"{short_error(e)}. {_privilege_hint(cfg)}"[:1000]
         res.repairable = False  # a grant, not the spec: never sent to the repair agent
     except psycopg.Error as e:
-        res.error = short_error(e)  # nothing was loaded: no statistics, moves or value counts
+        hint = _server_hint(e)
+        res.error = f"{short_error(e)}. {hint}"[:1000] if hint else short_error(e)
+        if hint:
+            res.repairable = False  # the server's limits, not the spec: the repair agent cannot help
     except _UnreadableResult as e:
         res.error = str(e)
+    if res.error:  # nothing was loaded: no statistics (the visit links read before it), moves or value counts
+        res.stats = {}
     else:
         res.rows_inserted, res.moved, res.value_counts = rows_inserted, moved, value_counts
         res.stats.update(stats)
@@ -273,6 +307,35 @@ def _run_step(conn: psycopg.Connection, step: CompiledStep, cfg: ProjectConfig |
         res.retained_rows = max(res.id_retained_rows - res.value_counts.get(ROW_SITE, {}).get("dropped", 0), 0)
     res.seconds = round(time.time() - started, 3)
     return res
+
+
+def _server_hint(e: psycopg.Error) -> str | None:
+    """What to do when a step was stopped by the database server rather than by its SQL: out of
+    disk, memory or connections (SQLSTATE class 53), a lock it waited for too long (55P03), a
+    statement timeout, an administrator's cancel or a shutdown (class 57). None for other errors.
+    Such a step is not sent to the repair agent: its tools cannot change the server."""
+    state = getattr(e, "sqlstate", None) or ""
+    message = str(e).lower()
+    if state == "53100":
+        return ("The database server ran out of disk space (a large sort or join writes temporary files); this is "
+                "not a problem of the ETL spec. Free disk space on the server, or point temp_tablespaces at a larger "
+                "disk, and build again.")
+    if state.startswith("53"):
+        return ("The database server ran out of a resource (memory or connections); this is not a problem of the "
+                "ETL spec. Ask an administrator to check the server's limits, and build again.")
+    if state == "55P03":
+        return ("The step waited longer than the server's lock_timeout for a table another session was using; this "
+                "is not a problem of the ETL spec. Build again when that session has finished, or raise lock_timeout "
+                "for the build's user.")
+    if state == "57014" and "statement timeout" in message:
+        return ("The step ran longer than the server's statement_timeout (set for the database or the build's "
+                "user); this is usually not a problem of the ETL spec. An administrator can raise it for the build's "
+                "user (ALTER ROLE <user> SET statement_timeout = 0); if the step is slow because of its SQL (a "
+                "subquery per row, a join without its key), a person should look at the spec.")
+    if state.startswith("57"):
+        return ("The step was stopped on the database server (cancelled by an administrator, or the server shut "
+                "down); this is not a problem of the ETL spec. Build again.")
+    return None
 
 
 def _privilege_hint(cfg: ProjectConfig | None) -> str:
@@ -358,6 +421,8 @@ def run_etl(
     create_etl_tables(conn, schemas, cfg.target.etl_role)
     # the route destinations too, and the tables an earlier build moved records to
     tables = sorted(set(target_tables(spec)) | set(route_targets(spec)) | _previous_tables(ws))
+    if ws is not None:  # until etl_run.json names them, a cancelled build must not leave rows behind
+        atomic_write_text(ws.etl_tables_json, json.dumps(tables) + "\n")
     truncate_cdm_tables(conn, schemas, tables)
     # what an earlier build derived (the release date) goes with the rows it was derived from
     execute(conn, f"DELETE FROM {qi(schemas.etl)}.build_facts")
@@ -418,16 +483,21 @@ def run_etl(
     result.finished_at = utcnow()
     if ws is not None:
         ws.save_json(ws.etl_run_json, result)
+        ws.etl_tables_json.unlink(missing_ok=True)
         ws.audit(
             "etl_run",
             ok=result.ok,
             errors=[f"{r.step}: {r.error}" for r in result.errors()],
             rows={r.step: r.rows_inserted for r in result.steps},
             totals={
-                # route steps move rows (moved_rows); route_prepare's count is ETL bookkeeping
-                "rows_inserted": sum(r.rows_inserted for r in result.steps if r.error is None and r.kind != "route"),
-                "derived_rows": result.rows_derived(),  # of rows_inserted: observation periods, eras
+                # what the log and the report call the rows loaded: the mappings' and custom SQL's rows
+                "rows_loaded": result.rows_loaded(),
+                "derived_rows": result.rows_derived(),  # observation periods, eras (apart from rows_loaded)
                 "moved_rows": result.rows_moved(),
+                # every step's count but the routes' (they move rows; route_prepare's count is ETL
+                # bookkeeping): the rows loaded and derived plus the id-map keys numbered and retired and
+                # the merged periods (which replace episodes counted in rows_loaded)
+                "rows_inserted": sum(r.rows_inserted for r in result.steps if r.error is None and r.kind != "route"),
                 "errors": len(result.errors()),
                 "blocking_errors": len(result.blocking_errors()),
                 "skipped": sum(1 for r in result.steps if r.skipped),

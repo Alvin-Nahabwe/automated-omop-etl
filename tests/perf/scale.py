@@ -177,9 +177,28 @@ SELECT {key('p')}, CASE WHEN p % 40 = 0 THEN (2 - p % 2)::text ELSE (1 + p % 2):
 FROM generate_series(20, {n}, 20) p""")
 
 
-def write_events(conn, src: str, vocab: str, n: int, visits: int, diagnoses: int, prescriptions: int) -> dict:
-    # visit v belongs to person 1 + v * 7919 mod n; one visit in 10 is an admission with two ward rows
+def odk_columns(k: int, var: str) -> tuple[str, str]:
+    """``k`` extra text columns like an ODK export's (skipped questions NULL, yes/no and short codes,
+    some dates and numbers), as the select lists of the first and the second branch of a UNION."""
+    cols, nulls = [], []
+    for i in range(k):
+        kind = i % 4
+        value = (f"(ARRAY['yes', 'no', 'dk'])[1 + ({var} + {i}) % 3]" if kind == 0 else
+                 f"'C' || (({var} + {i}) % 40)::text" if kind == 1 else
+                 f"(DATE '2012-01-01' + (({var}::bigint * {i + 7}) % 4000)::int)::text" if kind == 2 else
+                 f"(({var}::bigint * {i + 3}) % 1000)::text")
+        cols.append(f",\n       CASE WHEN ({var} + {i}) % 5 < 3 THEN NULL ELSE {value} END AS q{i}")
+        nulls.append(", NULL")
+    return "".join(cols), "".join(nulls)
+
+
+def write_events(conn, src: str, vocab: str, n: int, visits: int, diagnoses: int, prescriptions: int,
+                 wide: int = 0) -> dict:
+    # visit v belongs to person 1 + v * 7919 mod n; one visit in 10 is an admission with two ward rows;
+    # ``wide`` extra columns make clinic_visits as wide as an ODK export (one row per key reads only
+    # the mapped ones: a hash of the whole row is its last tie-break)
     person_of = f"1 + (v::bigint * 7919 % {n})"
+    extra, extra_nulls = odk_columns(wide, "v")
     execute(conn, f"""
 CREATE UNLOGGED TABLE {src}.clinic_visits AS
 SELECT v::text AS visit_id, {key(person_of)} AS individual_id,
@@ -189,11 +208,11 @@ SELECT v::text AS visit_id, {key(person_of)} AS individual_id,
             ELSE (DATE '2012-01-01' + (v::bigint * 31 % 4000)::int)::text END AS discharge_date,
        CASE WHEN v % 50 = 1 THEN 'EMERG' WHEN v % 10 = 0 THEN 'IPD' ELSE 'OPD' END AS visit_type,
        CASE WHEN v % 4 = 0 THEN to_char(DATE '2012-01-01' + (v::bigint * 31 % 4000)::int, 'YYYY-MM-DD')
-                                || 'T09:30:00+03:00' END AS submitted_at
+                                || 'T09:30:00+03:00' END AS submitted_at{extra}
 FROM generate_series(1, {visits}) v
 UNION ALL  -- the second ward row of the admissions
 SELECT v::text, {key(person_of)}, (DATE '2012-01-01' + (v::bigint * 31 % 4000)::int + 2)::text,
-       (DATE '2012-01-01' + (v::bigint * 31 % 4000)::int + 5)::text, 'IPD', NULL
+       (DATE '2012-01-01' + (v::bigint * 31 % 4000)::int + 5)::text, 'IPD', NULL{extra_nulls}
 FROM generate_series(10, {visits}, 10) v""")
     # ICD-10 codes of the vocabulary with a standard target; every third code, in code order
     execute(conn, f"""
@@ -321,17 +340,28 @@ def schema_mb(conn, schemas: Schemas) -> float:
                          (names,)))
 
 
+def temp_bytes(conn) -> int:
+    """The bytes of temporary files the database has written so far (pg_stat_database)."""
+    with contextlib.suppress(Exception):
+        scalar(conn, "SELECT pg_stat_force_next_flush()")
+    value = int(scalar(conn, "SELECT temp_bytes FROM pg_stat_database WHERE datname = current_database()") or 0)
+    conn.commit()
+    return value
+
+
 def build(conn, schemas: Schemas, cfg: ProjectConfig, ws: Workspace, spec: ETLSpec, title: str) -> None:
     timers = Timers()
+    temp_before = temp_bytes(conn)
     with timers.patched():
         t = time.time()
         result = runner.run_etl(conn, schemas, spec, cfg, ws)
         build_s = time.time() - t
+        temp_mb = (temp_bytes(conn) - temp_before) / 1e6
         t = time.time()
         report = checks.run_builtin_checks(conn, schemas, cfg, spec, result)
         checks_s = time.time() - t
     print(f"\n### {title}: build {build_s:.1f} s, checks {checks_s:.1f} s ({len(report.results)} results), "
-          f"schemas {schema_mb(conn, schemas):.0f} MB")
+          f"schemas {schema_mb(conn, schemas):.0f} MB, temporary files written by the build {temp_mb:.0f} MB")
     print("| step | rows | seconds | of which counts |\n|---|---:|---:|---:|")
     for s in result.steps:
         rows = s.rows_inserted if not s.moved else sum(m.moved_rows for m in s.moved)
@@ -444,6 +474,8 @@ def main() -> None:
     ap.add_argument("--indexed-copy", action="store_true",
                     help="measure on a copy of the concept table with the indexes load_vocabulary creates")
     ap.add_argument("--keep", action="store_true", help="keep the schemas")
+    ap.add_argument("--wide", type=int, default=0,
+                    help="extra ODK-like text columns in clinic_visits (e.g. 150: a wide visit export)")
     args = ap.parse_args()
 
     n = args.persons
@@ -485,7 +517,7 @@ def main() -> None:
         if args.phase in ("all", "events"):
             t = time.time()
             facts = write_events(conn, schemas.src, qi(vocab), n, visits=int(n * 2.7), diagnoses=3 * n,
-                                 prescriptions=2 * n)
+                                 prescriptions=2 * n, wide=args.wide)
             execute(conn, f"""
                 INSERT INTO {schemas.etl}.source_to_concept_map (source_code, source_vocabulary_id, target_concept_id,
                                                                  target_vocabulary_id)

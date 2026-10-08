@@ -113,7 +113,14 @@ from ..etl.compiler import (
     step_label,
     target_tables,
 )
-from ..etl.policies import END_FROM_START, THEMIS_PARTIAL, WHERE_SITE, partial_policy, required_null_policy
+from ..etl.policies import (
+    END_FROM_START,
+    THEMIS_PARTIAL,
+    WHERE_SITE,
+    partial_policy,
+    required_null_policy,
+    start_end_pairs,
+)
 from ..etl.routing import ROUTE_PREPARE, hand_routed, route_only_tables, route_targets
 from ..models import CheckResult, DQReport, ETLRunResult, ETLSpec, TableLoadResult
 from ..workspace import utcnow
@@ -527,6 +534,7 @@ def _evaluate(ctx: _Ctx, res: CheckResult, sql: str) -> CheckResult:
     try:
         with ctx.conn.transaction(force_rollback=True):
             execute(ctx.conn, f"SET LOCAL statement_timeout = {CHECK_TIMEOUT_MS}")
+            execute(ctx.conn, "SET LOCAL jit = off")  # compiling the plan costs more than it saves (etl.session)
             row = fetch_one(ctx.conn, sql) or {}
     except psycopg.Error as e:
         return res.model_copy(update={"error": short_error(e), "sql": sql})
@@ -1078,6 +1086,9 @@ def _filled_required(s: TableLoadResult, name: str) -> bool:
 def _partial_rule(table: str, name: str, etl: EtlConfig | None) -> str:
     """What the partial-date rule of ``table.name`` did with an unknown day or month."""
     policy = partial_policy(table, name, etl)
+    if policy == "last" and any(t == table and e == name for (t, _), e in start_end_pairs().items()):
+        return (_PARTIAL_RULES[policy] + " (a value of a column the start date also reads took the first day, "
+                "as the start did, so an end computed from the start is not stretched)")
     if policy != "reject":
         return _PARTIAL_RULES[policy]
     if (table, name) in THEMIS_PARTIAL:
@@ -1180,9 +1191,9 @@ def _retention(s: TableLoadResult) -> CheckResult:
         dropped = max(source - s.rows_inserted, 0)
         fan_out = 0
     pct = dropped / source if source else 0.0
-    extra = (
-        f" Another {fan_out} rows were added by 1-to-many vocabulary mappings ('Maps to' or "
-        f"source_to_concept_map rows with several targets): {s.rows_inserted} rows inserted."
+    extra = (  # "<n> of <m>", so the repair prompt suppresses small counts here too
+        f" Also, {fan_out} of {s.rows_inserted} rows inserted are extra rows added by 1-to-many vocabulary mappings "
+        "('Maps to' or source_to_concept_map rows with several targets)."
         if fan_out
         else ""
     )
@@ -1275,10 +1286,12 @@ def _key_checks(s: TableLoadResult, label: str) -> list[CheckResult]:
             severity="convention", threshold=ETL_DUPLICATE_THRESHOLD, repairable=False,
         ))
     else:
-        rollup = (" Several rows of one visit (ward stays, diagnoses) are one visit, from the earliest start to the "
-                  "latest end of its rows." if t == "visit_occurrence" else
-                  " A death date known to the day was kept before one completed from a year or month, then the "
-                  "latest, unless the mapping's dedup_order chose another.")
+        rollup = (" Several rows of one visit (ward stays, diagnoses) of this mapping are one visit, from the earliest "
+                  "start to the latest end of its rows." if t == "visit_occurrence" else
+                  " Among the rows of this mapping, a death date known to the day was kept before one completed from "
+                  "a year or month, then the latest, unless the mapping's dedup_order chose another.")
+        rollup += (f" A key an earlier mapping of {t} loaded keeps that mapping's row ({earlier} such keys): rows "
+                   "are not ranked or merged across mappings." if earlier else "")
         out.append(_key_check(
             s, label, "etlDuplicateRecords", dup + earlier, kept,
             f"{t} keeps one row per {what}. Source rows of ETL step '{s.step}' not loaded as a row of their own, "
@@ -1330,7 +1343,8 @@ def _key_checks(s: TableLoadResult, label: str) -> list[CheckResult]:
         out.append(_key_check(
             s, label, "etlVisitGrain", gaps, keys,
             f"Visits of ETL step '{s.step}' loaded from rows that are separate stays (a row starts more than a day "
-            f"after the earlier rows of the visit ended): {gaps} of {keys} visits. The rows of one visit key are "
+            f"after the earlier rows of the visit ended; an end the source does not give, or that could not be read, "
+            f"does not count): {gaps} of {keys} visits. The rows of one visit key are "
             "loaded as one visit from the earliest start to the latest end, which is right for the ward stays of one "
             "admission but not for separate visits: many such visits mean the visit key is coarser than one visit (a "
             "person or facility key), so each of them spans several visits. A person must fix the visit key (the "

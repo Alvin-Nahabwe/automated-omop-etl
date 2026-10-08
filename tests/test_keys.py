@@ -4,6 +4,8 @@ rules and repair guards around them."""
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from omop_agent.db import execute, fetch_all, scalar
@@ -175,8 +177,14 @@ def test_one_row_per_key_tables_are_deduplicated():
         # the anti-join on the loaded keys runs on the chosen rows, outside DISTINCT ON
         assert f"    FROM picked p\n    WHERE NOT EXISTS (SELECT 1 FROM cdm.{steps[name].target_table} x " \
                "WHERE x.person_id = p.person_id)\n    RETURNING 1\n" in sql, name
-        # the source row's text breaks ties byte-wise, whatever the server's collation
-        assert "AS _src_text  -- the last tie-break, never stored" in sql and 'c._src_text COLLATE "C",' in sql
+        # a hash of the source row's text breaks ties byte-wise, whatever the server's collation; it
+        # is computed at the scan of the source (a fenced subquery), so a wide source row is not
+        # carried through the joins and sorts
+        assert "AS _src_text  -- the last tie-break (a hash of the source row)" in sql
+        assert 'c._src_text COLLATE "C",' in sql and "._omop_src_hash" in sql
+        assert re.search(r"FROM \(SELECT (\w+)\.\*, md5\(\(\1\.\*\)::text\) AS _omop_src_hash FROM src\.\w+ \1 "
+                         r"OFFSET 0\) \1\n", sql), name
+        assert "::text AS _src_text" not in sql
     for name in ("visit_occurrence", "visit_occurrence_2"):
         sql = steps[name].sql
         assert "    SELECT DISTINCT ON (c.visit_occurrence_id, c.person_id)\n" in sql
@@ -189,8 +197,10 @@ def test_one_row_per_key_tables_are_deduplicated():
         assert "JOIN cdm.visit_occurrence x ON x.visit_occurrence_id = c.visit_occurrence_id AND x.person_id <> " \
                "c.person_id" in sql
         # rows of one visit key that are separate stays: a row starting more than a day after the
-        # earlier rows ended
-        assert ("        SELECT c.*, c.visit_start_date > MAX(c.visit_end_date) OVER (\n"
+        # earlier rows ended (only ends read from the source: one the 'start' policy completed does
+        # not end a row)
+        assert "v.visit_end_date IS NOT NULL AS _end_known  -- visit_end_date as read" in sql
+        assert ("        SELECT c.*, c.visit_start_date > MAX(CASE WHEN c._end_known THEN c.visit_end_date END) OVER (\n"
                 "            PARTITION BY c.visit_occurrence_id, c.person_id ORDER BY c.visit_start_date, "
                 "c.visit_end_date\n            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) + 1 AS _gap\n") in sql
         assert "COUNT(*) FILTER (WHERE k.gap) AS gap_keys" in sql and "undecided_keys" not in sql
@@ -298,6 +308,21 @@ def test_dedup_order_paren_refused_at_runtime():
     assert refused == ["death_2"]
     # a balanced one inside literals or comments is fine
     assert sql_safety_issues(va_deaths("w.verified = ')' DESC")) == []
+
+
+def test_dedup_order_must_not_draw():
+    """A dedup_order whose value changes from call to call ranks every row of a key apart, so
+    etlKeyConflict sees every key decided while the row loaded is a draw that changes between
+    builds: the validator and the repair agent refuse it."""
+    from omop_agent.design.validate import dedup_order_issue
+
+    for order in ("random()", "w.verified DESC, RANDOM()", "clock_timestamp()", "md5(gen_random_uuid()::text)"):
+        assert "changes from call to call" in dedup_order_issue(order), order
+        spec = multi_spec(order)
+        assert any(i.severity == "error" and i.target_table == "death" and "changes from call to call" in i.message
+                   for i in validate_spec(spec)), order
+    for order in ("w.verified = '1' DESC", "to_date(w.va_date, 'DD/MM/YYYY') DESC", "'random()'", None):
+        assert dedup_order_issue(order) is None, order
 
 
 def test_identity_edits_refused():
@@ -1075,3 +1100,29 @@ def test_designer_lists_the_drafted_keys():
     assert ("Visit mappings drafted so far (their visit keys):\n  - clinic_visits (v): v.visit_id\n"
             "  - ipd_admissions (a): 'IPD:' || a.admission_id") in text
     assert "drafted so far" not in _keys_text(spec.person_key, spec.visit_key, [])
+
+
+def test_prompts_say_the_first_mapping_wins():
+    """Rows of one key are ranked and spanned within one mapping; between the mappings of a table the
+    first in spec order that loads a key wins outright. The prompts, the field description, the
+    review text and the validator say so (a VA death after the register's loses its cause)."""
+    from omop_agent.design.designer import STAGING_CONVENTIONS, _plan_prompt
+    from omop_agent.design.render import ONE_ROW_PER_KEY_TEXT
+    from omop_agent.quality.repair import REPAIR_SYSTEM
+
+    conventions = " ".join(STAGING_CONVENTIONS.split())
+    assert "the first mapping that loads a key wins outright" in conventions
+    assert "List the authoritative source first" in conventions and "must come through that mapping" in conventions
+    plan = " ".join(_plan_prompt("p", "a").split())
+    assert "(outpatient visits, admissions, ward stays)" not in plan
+    assert "load them through the admission's mapping (or as visit_detail)" in plan
+    assert "the first mapping that loads a key wins outright, so list the authoritative source first" in plan
+    assert "the first in spec order that loads a key wins" in TableMapping.model_fields["dedup_order"].description
+    assert "the first in spec order that loads a key wins" in " ".join(REPAIR_SYSTEM.split())
+    assert "the first (in spec order) that loads a key wins outright" in ONE_ROW_PER_KEY_TEXT
+    spec = fixed_ref().model_copy(deep=True)
+    emr = emr_person()
+    key = next(f for f in emr.fields if f.target_field == "person_id")
+    key.expression = "e.patient_no"  # no prefix: a key found in both registers is one person
+    spec.table_mappings.append(emr)
+    assert any("loaded from the mapping that comes first in the spec" in i.message for i in validate_spec(spec))

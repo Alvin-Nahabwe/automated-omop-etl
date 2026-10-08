@@ -27,7 +27,7 @@ the planner neither merges them nor evaluates a value twice:
 4. for person, death and visit_occurrence, which keep one row per key (``ONE_ROW_PER``), one
    statement that keeps the best row of each key (the mapping's ``dedup_order`` with NULLs last,
    then for death a date known to the day and the latest date, then the most complete row, then
-   the source row's text; a visit spans the earliest start to the latest end of its rows), skips
+   a hash of the source row's text; a visit spans the earliest start to the latest end of its rows), skips
    the keys an earlier mapping loaded and returns its statistics.
 
 A record's visit_occurrence_id links only to a visit of the row's person: the visit-map join also
@@ -94,9 +94,10 @@ from .policies import (
     Policy,
     partial_policy,
     required_null_policy,
+    start_end_pairs,
 )
 from .routing import ROUTE_PREPARE, route_prepare_sql, route_sources, route_sql, route_targets
-from .tolerant import LexError, Rewrite, kind_of, lex, rewrite, tolerant_value
+from .tolerant import LexError, PolicyArg, Rewrite, column_refs, kind_of, lex, rewrite, tolerant_value
 
 StepKind = Literal["id_map", "insert", "custom", "prune", "route", "merge", "derived", "metadata"]
 # Steps that run the spec's own SQL (keys, mappings, custom SQL): only their errors are sent to
@@ -118,6 +119,10 @@ _LAYER_1_KINDS = frozenset({"column", "expression", "constant", "person_id", "vi
 # visible there, so they cannot clash.
 _ROWS = "s"
 _VALUES = "v"
+# The layer-2 column that says a visit's end was read from the source, not completed from its start.
+_END_KNOWN = "_end_known"
+# The column a keyed mapping's source subquery adds: a hash of the whole source row (_from_clause).
+_SRC_HASH = "_omop_src_hash"
 # The comment that opens layer 1, where the spec's expressions, joins and WHERE are: the repair
 # prompt shows a long INSERT from there (quality.repair).
 LAYER_1_MARKER = "-- 1) the source rows"
@@ -408,10 +413,37 @@ def _refuse_bad_templates(rw: Rewrite, where: str) -> Rewrite:
     return rw
 
 
-def _tolerant_field(expr: str, f: CdmField, table: CdmTable, joins: _Joins, etl: EtlConfig | None) -> str:
+def _date_rule(tm: TableMapping | None, table: CdmTable, f: CdmField, etl: EtlConfig | None) -> PolicyArg:
+    """The partial-date rule of ``table.f`` in the mapping ``tm`` (``etl.policies.partial_policy``).
+    The end of a start/end pair takes the last day of an incomplete date (the widest interval), but
+    only for values of its own: a conversion whose operand reads only columns the start field also
+    reads (``start + days_supply - 1``, ``COALESCE(discharge_date, visit_date)``) takes the start's
+    rule, so an end computed from the start is not stretched to the end of the month or year."""
+    policy = partial_policy(table.name, f.name, etl)
+    if tm is None or policy != "last":
+        return policy
+    start = next((s for (t, s), e in start_end_pairs().items() if t == table.name and e == f.name), None)
+    sm = next((fm for fm in tm.fields if fm.target_field.lower() == start), None) if start else None
+    if start is None or sm is None or sm.kind not in ("column", "expression"):
+        return policy
+    shared = column_refs(sm.expression)
+    if not shared:
+        return policy
+    start_policy = partial_policy(table.name, start, etl)
+
+    def rule(operand: str) -> str:
+        refs = column_refs(operand)
+        return start_policy if refs and refs <= shared else policy
+
+    return rule
+
+
+def _tolerant_field(
+    expr: str, f: CdmField, table: CdmTable, joins: _Joins, etl: EtlConfig | None, tm: TableMapping | None = None,
+) -> str:
     """A column or expression value converted tolerantly (``etl.tolerant``), counted at the field."""
     rw = _refuse_bad_templates(
-        tolerant_value(expr, f.datatype, f.name, partial_policy(table.name, f.name, etl)), f"{table.name}.{f.name}")
+        tolerant_value(expr, f.datatype, f.name, _date_rule(tm, table, f, etl)), f"{table.name}.{f.name}")
     joins.sites.update(rw.sites)
     return rw.sql if kind_of(f.datatype) else cast_to(rw.sql, f.datatype)
 
@@ -438,7 +470,7 @@ def _field_value(
     if kind == "null":
         return typed_null(f.datatype)
     if kind in ("column", "expression"):
-        return _tolerant_field(expr, f, table, joins, etl)
+        return _tolerant_field(expr, f, table, joins, etl, tm)
     if kind == "constant":
         return cast_to(expr, f.datatype)
     if kind == "auto_id":
@@ -479,8 +511,16 @@ def _field_value(
     raise CompileError(f"{where}: unknown field kind '{kind}'")  # pragma: no cover - pydantic guards kinds
 
 
-def _from_clause(tm: TableMapping) -> list[str]:
-    lines = [f"FROM {source_ref(tm.source.table)} {qi(tm.source.alias)}"]
+def _from_clause(tm: TableMapping, hashed: bool = False) -> list[str]:
+    """The mapping's FROM and joins. ``hashed`` reads the source table through a fenced subquery that
+    adds ``_SRC_HASH``, a hash of the whole source row (the neutral last tie-break of the rows of
+    one key): the hash is computed at the scan, so the columns no value reads are dropped there and
+    wide source rows never travel through the joins, the candidates and their sorts."""
+    a = qi(tm.source.alias)
+    src = f"{source_ref(tm.source.table)} {a}"
+    if hashed:
+        src = f"(SELECT {a}.*, md5(({a}.*)::text) AS {_SRC_HASH} FROM {src} OFFSET 0) {a}"
+    lines = [f"FROM {src}"]
     for j in tm.joins:
         jt = "INNER" if j.join_type == "inner" else "LEFT"
         lines.append(f"{jt} JOIN {source_ref(j.table)} {qi(j.alias)} ON {j.on.strip()}")
@@ -559,7 +599,8 @@ def _source_rows(
     items += [(f"{value} AS {name}", note) for name, value, note in extra or []]
     rows = [
         f"{LAYER_1_MARKER}: every value computed once per row, below the lookups that can fan out",
-        "SELECT", *_select_list(items), *_from_clause(tm), *joins.id_joins,
+        "SELECT", *_select_list(items), *_from_clause(tm, any(name == "_src_text" for name, _, _ in extra or [])),
+        *joins.id_joins,
     ]
     if where:
         rows.append(f"WHERE {_p(where)}")
@@ -569,11 +610,13 @@ def _source_rows(
 def _required_values(
     table: CdmTable, layer_1: list[tuple[CdmField, FieldMapping, str]], joins: _Joins,
     required: dict[str, Policy], rows: list[str], extra: list[str] | None = None,
+    known: dict[str, str] | None = None,
 ) -> list[str]:
     """Layer 2 over the layer-1 ``rows``: required values that are NULL get the CDM convention of
     their field (``required``), and each one is counted. Rows with a NULL drop-policy field are
     dropped; the counters are called only on the NULL branches. The ``extra`` columns of layer 1
-    are passed on."""
+    are passed on, and for each ``known`` column (name -> field) whether the field's layer-1 value
+    was there before its policy gave it one."""
 
     def col(name: str) -> str:
         return f"{_VALUES}.{qi(name)}"
@@ -596,6 +639,8 @@ def _required_values(
             items.append((col(name), "NULL: the row is dropped (counted)" if policy == "drop" else ""))
     items += [(f"{_VALUES}.{k}", "") for k, _ in joins.key_exprs]
     items += [(f"{_VALUES}.{name}", "") for name in extra or []]
+    items += [(f"{col(field)} IS NOT NULL AS {name}", f"{field} as read, not completed by its policy")
+              for name, field in (known or {}).items()]
     out = [
         "-- 2) required values that are NULL: the CDM convention, counted per field",
         "SELECT", *_select_list(items), "FROM (", *_indent(rows), f") {_VALUES}",
@@ -640,13 +685,16 @@ def _compile(tm: TableMapping, spec: ETLSpec, etl: EtlConfig | None = None) -> _
     keys = _one_row_keys(table, values)
     extra = _candidate_columns(tm, table, values, keys, etl) if keys else []
     rows = _source_rows(tm, joins, layer_1, where, extra)
+    # a visit end the 'start' policy completed is not known: it must not split the visit (_gap)
+    known = ({_END_KNOWN: "visit_end_date"} if keys and table.name == "visit_occurrence"
+             and required.get("visit_end_date") == "start" else {})
     if required:
-        rows = _required_values(table, layer_1, joins, required, rows, [name for name, _, _ in extra])
+        rows = _required_values(table, layer_1, joins, required, rows, [name for name, _, _ in extra], known)
     items: list[tuple[str, str]] = [
         (f"{_ROWS}.{qi(f.name)}", "") if fm.kind in _LAYER_1_KINDS else (f"{v} AS {qi(f.name)}", fm.kind)
         for f, fm, v in values
     ]
-    items += [(f"{_ROWS}.{name}", "") for name, _, _ in extra]
+    items += [(f"{_ROWS}.{name}", "") for name in [*(n for n, _, _ in extra), *known]]
     select = ["SELECT", *_select_list(items), "FROM (", *_indent(rows), f") {_ROWS}", *joins.lines]
 
     header = f"{table.name} <- {tm.source.table} ({tm.source.alias})"
@@ -656,7 +704,7 @@ def _compile(tm: TableMapping, spec: ETLSpec, etl: EtlConfig | None = None) -> _
     if tm.rationale.strip():
         out.append(_comment(tm.rationale))
     if keys:
-        out += _one_row_per_key(table, values, select, keys, {n for n, _, _ in extra})
+        out += _one_row_per_key(table, values, select, keys, {n for n, _, _ in extra} | set(known))
     else:
         out.append(f"INSERT INTO {{cdm}}.{qi(table.name)} (")
         out += [f"    {qi(f.name)}{',' if i < len(values) - 1 else ''}" for i, (f, _, _) in enumerate(values)]
@@ -801,7 +849,8 @@ def _candidate_columns(
     (``_src_row``, to tell rows from vocabulary fan-out), the rank by the mapping's dedup_order
     (``_pref``, computed over the source aliases), whether the ``EXACT_FIRST`` field was read as
     written (``_exact``: its value, read uncounted with partial dates rejected, is not NULL) and
-    the source row's text (``_src_text``, the neutral last tie-break; never stored)."""
+    a hash of the source row's text (``_src_text``, the neutral last tie-break; never stored; see
+    ``_from_clause``)."""
     computed = {f.name: v for f, _, v in values}
     out = [("_src_row", "ROW_NUMBER() OVER ()", "one number per source row")]
     order = _dedup_order_sql(tm, etl)
@@ -815,7 +864,7 @@ def _candidate_columns(
         f = table.field(exact)  # type: ignore[arg-type]
         rw = tolerant_value(fm.expression or "", f.datatype, f.name, "reject", counted=False)  # type: ignore[union-attr]
         out.append(("_exact", f"{_p(rw.sql)} IS NOT NULL", f"{exact} known as written (not a completed partial date)"))
-    out.append(("_src_text", f"({qi(tm.source.alias)}.*)::text", "the last tie-break, never stored"))
+    out.append(("_src_text", f"{qi(tm.source.alias)}.{_SRC_HASH}", "the last tie-break (a hash of the source row)"))
     return out
 
 
@@ -831,7 +880,7 @@ def _one_row_per_key(
     returns its statistics in one row. Among the rows of one key the mapping's dedup_order wins
     (``_pref`` in ``extra``), then a value known as written (``_exact``, ``EXACT_FIRST``), then the
     table's ``DEFAULT_PREFERENCE``, then the most complete row (a concept 0 counts as missing), then
-    the source row's text, then the values: the choice is deterministic and prefers no sex, concept
+    a hash of the source row's text, then the values: the choice is deterministic and prefers no sex, concept
     or value (text compares byte-wise, COLLATE "C", so it does not depend on the server's
     collation). visit_occurrence takes the earliest start and the latest end of the rows of a
     visit, where the patient came from as in its first row and where they went as in its last
@@ -848,7 +897,8 @@ def _one_row_per_key(
     the row loaded is arbitrary; all their rows rank best without a dedup_order); ``fan_out_keys``
     (keys with more candidates than source rows: a code with several concepts); for
     visit_occurrence ``gap_keys`` (visits whose rows are separate stays: a row starts more than a
-    day after the earlier rows end, so the visit key is coarser than one visit); ``dedup_order``
+    day after the earlier rows end, so the visit key is coarser than one visit; only ends read from
+    the source count, not an end the 'start' policy completed, ``_END_KNOWN``); ``dedup_order``
     (whether the mapping ranks its rows)."""
     t = qi(table.name)
     names = [f.name for f, _, _ in values]
@@ -914,9 +964,13 @@ def _one_row_per_key(
     ]
     gaps = rollup.get("visit_start_date") == "MIN" and rollup.get("visit_end_date") == "MAX"
     if gaps:  # a row that starts more than a day after every earlier row of its visit has ended
+        # only an end read from the source tells that a row ended: one the 'start' policy completed
+        # (a ward stay whose ward_out is missing or unreadable) may have lasted until the next row
+        end = (f"CASE WHEN c.{_END_KNOWN} THEN c.visit_end_date END" if _END_KNOWN in extra
+               else "c.visit_end_date")
         rows = [
             "FROM (",
-            "    SELECT c.*, c.visit_start_date > MAX(c.visit_end_date) OVER (",
+            f"    SELECT c.*, c.visit_start_date > MAX({end}) OVER (",
             f"        PARTITION BY {partition} ORDER BY c.visit_start_date, c.visit_end_date",
             "        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) + 1 AS _gap",
             "    FROM cand c",
@@ -954,7 +1008,7 @@ def _one_row_per_key(
         "),",
         "picked AS (",
         "    -- the best row of each key: "
-        + ", then ".join(best + ["the most complete row (a concept 0 is missing)", "the source row's text"]),
+        + ", then ".join(best + ["the most complete row (a concept 0 is missing)", "a hash of the source row"]),
         *_indent(picked),
         "),",
         "ins AS (",
@@ -1015,9 +1069,11 @@ def _source_count(
     return "\n".join(lines)
 
 
-def _uncounted_value(fm: FieldMapping, f: CdmField, table: CdmTable, etl: EtlConfig | None) -> str | None:
-    """The value of a column, expression, constant or null field as the build computes it, without
-    counters (None for other kinds)."""
+def _uncounted_value(
+    fm: FieldMapping, f: CdmField, table: CdmTable, etl: EtlConfig | None, tm: TableMapping | None = None,
+) -> str | None:
+    """The value of a column, expression, constant or null field of the mapping ``tm`` as the build
+    computes it, without counters (None for other kinds)."""
     expr = (fm.expression or "").strip()
     if fm.kind == "null":
         return "NULL"
@@ -1027,7 +1083,7 @@ def _uncounted_value(fm: FieldMapping, f: CdmField, table: CdmTable, etl: EtlCon
         return cast_to(expr, f.datatype)
     if fm.kind not in ("column", "expression"):
         return None
-    rw = tolerant_value(expr, f.datatype, f.name, partial_policy(table.name, f.name, etl), counted=False)
+    rw = tolerant_value(expr, f.datatype, f.name, _date_rule(tm, table, f, etl), counted=False)
     return rw.sql if kind_of(f.datatype) else cast_to(rw.sql, f.datatype)
 
 
@@ -1091,15 +1147,15 @@ def nulling_count_sql(
         if was is not None and (was.kind, _norm(was.expression or "")) == (fm.kind, _norm(fm.expression or "")):
             continue
         if c.required.get(f.name) == "open":
-            counts = _open_end_count(new, before, after, f, table, c.id_lines, etl)
+            counts = _open_end_count(new, old, before, after, f, table, c.id_lines, etl)
             if counts is not None:
                 out[f.name] = NullingCount(schemas.render(counts), schemas.render(counts), None, what="open")
             continue
-        new_value = _key_value(fm) if fm.kind == "visit_id" else _uncounted_value(fm, f, table, etl)
+        new_value = _key_value(fm) if fm.kind == "visit_id" else _uncounted_value(fm, f, table, etl, new)
         if visit_key:
             old_value = _key_value(was)  # type: ignore[arg-type]
         else:
-            old_value = _uncounted_value(was, f, table, etl) if was is not None else "NULL"
+            old_value = _uncounted_value(was, f, table, etl, old) if was is not None else "NULL"
         if new_value is None or old_value is None:
             continue
         also = [f"{_p(new_value)} IS NULL", f"{_p(old_value)} IS NOT NULL"]
@@ -1115,27 +1171,85 @@ def nulling_count_sql(
     return out
 
 
+def _without_source(sql: str, aliases: set[str]) -> str | None:
+    """``sql`` with every column of the ``aliases`` read as a NULL text (staged columns are text);
+    None when the scan cannot read it."""
+    try:
+        toks = lex(sql)
+    except LexError:
+        return None
+    sig = [i for i, t in enumerate(toks) if t.kind not in ("ws", "comment")]
+    cut: list[tuple[int, int]] = []
+    for n, i in enumerate(sig[:-2]):
+        a, d, c = toks[i], toks[sig[n + 1]], toks[sig[n + 2]]
+        alias = a.text[1:-1] if a.kind == "qid" else a.text.lower()
+        if a.kind in ("id", "qid") and alias in aliases and d.text == "." and c.kind in ("id", "qid"):
+            follows = toks[sig[n + 3]].text if n + 3 < len(sig) else ""
+            before = toks[sig[n - 1]].text if n > 0 else ""
+            if follows != "(" and before != ".":
+                cut.append((a.start, c.end))
+    out, pos = [], 0
+    for a, b in cut:
+        out += [sql[pos:a], "NULL::text"]
+        pos = b
+    return "".join(out) + sql[pos:]
+
+
+def filled_without_source_sql(
+    old: TableMapping, new: TableMapping, schemas: Schemas, *, etl: EtlConfig | None = None,
+) -> dict[str, tuple[str, str | None]]:
+    """For an edit of a table mapping, per required field whose NULL drops the row (policy 'drop')
+    and whose value changed: a query (new, old) that tells whether the field still has a value when
+    every column of the mapping's source and joined tables is NULL (``filled``), i.e. whether its
+    expression gives rows without a source value one of its own: a literal (a birth year 1900), a
+    constant or the build date. The old query is None when the old mapping has no such field.
+    Fields whose value cannot be read this way are left out."""
+    table = _check_mapping(new)
+    before = {fm.target_field: fm for fm in old.fields}
+
+    def filled(tm: TableMapping, fm: FieldMapping | None, f: CdmField) -> str | None:
+        if fm is None:
+            return None
+        value = _uncounted_value(fm, f, table, etl, tm)
+        aliases = {tm.source.alias.lower()} | {j.alias.lower() for j in tm.joins}
+        nulled = _without_source(value, aliases) if value is not None else None
+        return schemas.render(f"SELECT ({_p(nulled)}) IS NOT NULL AS filled") if nulled is not None else None
+
+    out: dict[str, tuple[str, str | None]] = {}
+    for fm in new.fields:
+        f = table.field(fm.target_field)
+        if f is None or fm.kind not in POLICY_KINDS or required_null_policy(table.name, f.name) != "drop":
+            continue
+        was = before.get(fm.target_field)
+        if was is not None and (was.kind, _norm(was.expression or "")) == (fm.kind, _norm(fm.expression or "")):
+            continue
+        new_sql = filled(new, fm, f)
+        if new_sql is not None:
+            out[f.name] = (new_sql, filled(old, was, f))
+    return out
+
+
 def _open_end_count(
-    new: TableMapping, before: dict[str, FieldMapping], after: dict[str, FieldMapping], f: CdmField,
-    table: CdmTable, id_lines: list[str], etl: EtlConfig | None,
+    new: TableMapping, old: TableMapping, before: dict[str, FieldMapping], after: dict[str, FieldMapping],
+    f: CdmField, table: CdmTable, id_lines: list[str], etl: EtlConfig | None,
 ) -> str | None:
     """The count of ``nulling_count_sql`` for an open end ``f`` (n, v, m) over the new mapping's
-    rows, with the old (``before``) and new (``after``) field mappings; None when an end is not
-    computed from the source."""
+    rows, with the old (``before``, of ``old``) and new (``after``, of ``new``) field mappings;
+    None when an end is not computed from the source."""
     was = before.get(f.name)
-    new_end = _uncounted_value(after[f.name], f, table, etl)
-    old_end = _uncounted_value(was, f, table, etl) if was is not None else "NULL"
+    new_end = _uncounted_value(after[f.name], f, table, etl, new)
+    old_end = _uncounted_value(was, f, table, etl, old) if was is not None else "NULL"
     if new_end is None or old_end is None:
         return None
     new_end, old_end = _p(new_end), _p(old_end)
     start = table.field(OPEN_ENDS[(table.name, f.name)])
 
-    def start_value(fields: dict[str, FieldMapping]) -> str | None:
+    def start_value(fields: dict[str, FieldMapping], tm: TableMapping) -> str | None:
         sm = fields.get(start.name) if start is not None else None
-        value = _uncounted_value(sm, start, table, etl) if sm is not None and start is not None else None
+        value = _uncounted_value(sm, start, table, etl, tm) if sm is not None and start is not None else None
         return _p(value) if value is not None else None
 
-    old_start, new_start = start_value(before), start_value(after)
+    old_start, new_start = start_value(before, old), start_value(after, new)
     opened = f"({new_end} IS NULL OR {new_end} >= {OPEN_FROM}) AND {old_end} < {OPEN_FROM}"
     if old_start is not None:
         opened += f" AND {old_end} IS DISTINCT FROM {old_start}"  # an old fallback onto the start date

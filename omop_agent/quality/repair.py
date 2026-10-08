@@ -107,8 +107,9 @@ person, death and visit_occurrence keep one row per key (person and death: one p
 one per visit and person, from the earliest start to the latest end of its rows). A mapping's dedup_order (an
 ORDER BY list over its aliases, best row first, e.g. "x.verified = '1' DESC"; a missing or unreadable value
 ranks last) says which row of a key is loaded; without one the most complete row is (for death, a date
-known to the day, then the latest). Set it when etlKeyConflict reports person rows that disagree on sex or
-birth year, ranking the row that should win first. Who exists in the CDM is decided by people: changes to a
+known to the day, then the latest). It ranks the rows of its own mapping only: between the mappings of one
+table, the first in spec order that loads a key wins, and later mappings skip that key. Set it when
+etlKeyConflict reports person rows that disagree on sex or birth year, ranking the row that should win first. Who exists in the CDM is decided by people: changes to a
 person_id expression (in any table, unless the mapping cannot run at all), to the key of person or
 visit_occurrence, to the filter of person, visit_occurrence or death, and new mappings into those tables
 are refused. A record that names another person's visit, or a key no visit mapping reads (etlVisitLinkage,
@@ -134,7 +135,8 @@ episode that is still open: the build merges each person's overlapping and back-
 ends open ones at cdm_source.source_release_date or at death, drops episodes that end before they
 start (etlObservationPeriodMerge) and gives persons without a valid episode a period from their
 events; never write merging, filters or a fallback into the observation_period end date (an edit that
-opens episodes with an exit date, or closes open ones, is refused). After loading, the build moves every
+opens episodes with an exit date, or closes open ones, is refused). When the spec routes by domain (the
+"Routing by domain" line of the prompt says whether it does), after loading the build moves every
 condition_occurrence, procedure_occurrence, drug_exposure, device_exposure and measurement record whose
 standard concept belongs to another event domain (Condition, Procedure, Drug, Device, Measurement,
 Observation) to that domain's table (route_* steps, etlDomainRouting; a measurement with a result goes to
@@ -826,8 +828,10 @@ def _table_ref_issue(state: RepairState, ref: str) -> str | None:
 
 def _pii_tokens(state: RepairState, tm: TableMapping) -> list[str]:
     """Direct-identifier columns of the mapping's source tables named anywhere in its SQL (also
-    unqualified); complements ``privacy.pii_references``, which follows alias.column references."""
+    unqualified); complements ``privacy.pii_references``, which follows alias.column references.
+    A column ``privacy.not_pii_columns`` clears is not one, whatever its name."""
     pii = pii_columns(state.profile, state.cfg.privacy)
+    cleared = {e.strip().lower() for e in state.cfg.privacy.not_pii_columns}
     texts = [f.expression for f in tm.fields] + [tm.where, tm.dedup_order] + [j.on for j in tm.joins]
     tokens = set().union(*(_tokens(t) for t in texts))
     hits: list[str] = []
@@ -837,7 +841,7 @@ def _pii_tokens(state: RepairState, tm: TableMapping) -> list[str]:
             continue
         cols = set(pii.get(table.lower(), set()))
         cols |= {c.lower() for c in _columns_of(state.conn, state.schemas.src, table) if _pii_pattern(c, state)}
-        hits += [f"{table}.{c}" for c in sorted(tokens & cols)]
+        hits += [f"{table}.{c}" for c in sorted(tokens & cols) if f"{table.lower()}.{c}" not in cleared]
     return hits
 
 
@@ -849,17 +853,22 @@ _ID_MAP_KEYS = {
 
 def mapping_issues(state: RepairState, tm: TableMapping) -> list[str]:
     """Why ``tm`` may not be applied (empty when it may); checked before compiling."""
+    from ..design.validate import loading_view
+
     issues: list[str] = []
     for fm in tm.fields:
         issues += [f"{fm.target_field} expression {i}" for i in fragment_issues(fm.expression)]
     issues += [f"where {i}" for i in fragment_issues(tm.where)]
     issues += [f"dedup_order {i}" for i in fragment_issues(tm.dedup_order)]
     if tm.dedup_order:
-        from ..design.validate import paren_problem
+        from ..design.validate import dedup_order_issue, paren_problem
 
         problem = paren_problem(tm.dedup_order)
         if problem:
             issues.append(f"dedup_order has unbalanced parentheses ({problem}); it must be an ORDER BY list")
+        volatile = dedup_order_issue(tm.dedup_order)
+        if volatile:
+            issues.append(volatile)
     for j in tm.joins:
         issues += [f"join {j.alias} condition {i}" for i in fragment_issues(j.on)]
     with _readonly(state.conn):
@@ -867,11 +876,16 @@ def mapping_issues(state: RepairState, tm: TableMapping) -> list[str]:
             issue = _table_ref_issue(state, ref)
             if issue:
                 issues.append(issue)
-        pii = list(dict.fromkeys(pii_references(tm, state.profile, state.cfg.privacy) + _pii_tokens(state, tm)))
+        # what the mapping loads, as the validator judges it: a person or visit key resolved through the
+        # id maps, a filter, a join condition or the dedup_order may read an identifier (a clinic's
+        # patient_no keys its patients), a value field may not
+        loading = loading_view(tm)
+        pii = list(dict.fromkeys(pii_references(loading, state.profile, state.cfg.privacy)
+                                 + _pii_tokens(state, loading)))
     if pii:
         issues.append(
-            f"reads direct-identifier (PII) column(s) {', '.join(pii)}; direct identifiers must never be loaded "
-            "into the CDM"
+            f"loads direct-identifier (PII) column(s) {', '.join(pii)} into a CDM field; direct identifiers must never "
+            "be loaded into the CDM (a person_id or visit_id key, a filter or a join may read them)"
         )
     target = tm.target_table.lower()
     for fm in tm.fields:
@@ -939,9 +953,15 @@ def drop_guard(
     open end, the episodes it opens or closes, ``_open_end_issue``) under ``COUNT_TIMEOUT_MS``;
     when the old value does not fit the new mapping's sources (a renamed alias), the NULLs of each
     mapping over its own rows are compared instead (not for an open end). A count that times out
-    or fails lets the edit through: the build history still reverts a build that lost records."""
+    or fails lets the edit through: the build history still reverts a build that lost records.
+    It also refuses the opposite edit (``_filled_issue``): giving such a field a value of its own
+    (a literal, a constant, the build date) for rows whose source has none, which brings back
+    records the CDM convention leaves out with an invented value."""
     from ..etl.compiler import nulling_count_sql
 
+    filled = _filled_issue(old, new, conn, schemas, cfg)
+    if filled:
+        return filled
     try:
         counts = nulling_count_sql(old, new, spec, schemas, etl=cfg.etl if cfg is not None else None,
                                    na_values=cfg.source.effective_na_values if cfg is not None else ())
@@ -978,6 +998,39 @@ def drop_guard(
                 "record without it cannot be loaded. Keep the rows: fix the expression so it still gives a value "
                 "for them"
             )
+    return None
+
+
+def _filled_issue(
+    old: TableMapping, new: TableMapping, conn: psycopg.Connection, schemas: Schemas, cfg: ProjectConfig | None,
+) -> str | None:
+    """Why an edit may not give a required field whose NULL drops the row (year_of_birth, a start
+    date, death_date) a value of its own: with every source column NULL the new expression still
+    gives one (``etl.compiler.filled_without_source_sql``: a COALESCE onto 1900, a constant, the
+    build date) and the old one did not. Such rows are left out by the CDM convention; a value the
+    source does not hold would bring them back (people with an invented birth year, deaths with an
+    invented date). A query that cannot run lets the edit through."""
+    from ..etl.compiler import filled_without_source_sql
+
+    try:
+        queries = filled_without_source_sql(old, new, schemas, etl=cfg.etl if cfg is not None else None)
+    except Exception:
+        return None
+    for name, (new_sql, old_sql) in queries.items():
+        now = _guard_count(conn, schemas, cfg, new_sql)
+        if now is None or not now.get("filled"):
+            continue
+        was = _guard_count(conn, schemas, cfg, old_sql) if old_sql is not None else None
+        if old_sql is not None and (was is None or was.get("filled")):
+            continue  # the old expression gave such rows a value too (or cannot be judged)
+        return (
+            f"it would give {new.target_table}.{name} a value of its own for rows whose source has none (the new "
+            "expression is not NULL when every source column is NULL: a literal, a constant or the build date). A "
+            f"record without {name} is left out by the CDM convention and counted (etlRequiredFieldNull); a value "
+            "the source does not hold would bring it back with an invented value, which changes who or what exists "
+            "in the CDM. Read the value from the source (another column, another layout), or leave it for a person "
+            "to decide"
+        )
     return None
 
 
@@ -1181,6 +1234,20 @@ def _apply(
             "make a check pass. If the exit dates are read wrongly, fix how they are read; otherwise leave the spec as "
             "it is and explain in your summary, for a person to decide."
         )
+    if pos is None:
+        from ..etl.routing import same_table_twin
+
+        twin = same_table_twin(state.spec, new_tm)
+        if twin is not None:
+            index = sum(1 for tm in state.spec.table_mappings[:twin]
+                        if tm.target_table.lower() == new_tm.target_table.lower())  # its mapping_index
+            return (
+                f"REJECTED: {new_tm.target_table} mapping #{index} already reads the same codes from "
+                f"{new_tm.source.table}: a source row both mappings select would be loaded twice (no check counts "
+                "records loaded twice). Change that mapping instead (with update_field_mapping, e.g. a CASE "
+                "expression for the rows that need another value), or describe the change in your summary, for a "
+                "person to decide."
+            )
     mappings = list(state.spec.table_mappings)
     if pos is None:
         mappings.append(new_tm)
@@ -1460,6 +1527,20 @@ def _check_summary(r: CheckResult, k: int) -> tuple[str, str]:
     return head, description
 
 
+def _routing_line(spec: ETLSpec) -> str:
+    """The prompt line on routing by domain (``ETLSpec.route_by_domain``), which the system prompt
+    describes as it works when it is on."""
+    from ..design.render import routing_text
+
+    if spec.route_by_domain:
+        return f"Routing by domain: on: {routing_text(spec)}. Never route records by hand."
+    return ("Routing by domain: off (route_by_domain: false): records stay in the table that loads them and nothing "
+            "is moved, so the rules above on the build moving records and on routing by hand do not apply. An fkDomain "
+            "failure for a main concept of another event domain (an ICD-10 Z code with an Observation concept in "
+            "condition_occurrence) is then expected and not a wrong lookup: leave a correct lookup as it is, and leave "
+            "routing for a person to decide.")
+
+
 def build_repair_prompt(
     spec: ETLSpec,
     iteration: int,
@@ -1530,6 +1611,7 @@ def build_repair_prompt(
     else:
         lines.append("Observation periods: from_events (one period per person from their first to their last record, "
                      "generated by the build).")
+    lines.append(_routing_line(spec))
     lines.append(_eras_line(spec))
     lines.append(
         "\nDiagnose the root cause of each failure, inspect with the tools, and fix the ETL spec (not the data) "

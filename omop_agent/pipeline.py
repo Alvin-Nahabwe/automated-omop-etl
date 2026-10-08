@@ -392,12 +392,14 @@ class Pipeline:
         from .etl.runner import UPGRADE_NOTICE, run_etl, upgrade_notice
 
         def run() -> ETLRunResult:
+            # a spec the validator refuses builds nothing: the notice waits for a build that runs
+            valid = spec or self.validated_spec()
             behaviours = upgrade_notice(self.ws)
             if behaviours:  # the first build since the update: say once what builds now do
                 self.log("  note: the first build of this project with the new version, which changes the CDM it "
                          f"builds: {'; '.join(behaviours)} (README.md, \"Upgrading\")")
                 self.ws.audit("upgrade_notice", notice=UPGRADE_NOTICE, behaviours=behaviours)
-            result = run_etl(self.conn, self.schemas, spec or self.validated_spec(), self.cfg, self.ws)
+            result = run_etl(self.conn, self.schemas, valid, self.cfg, self.ws)
             derived, moved = result.rows_derived(), result.rows_moved()
             n_errors, n_blocking = len(result.errors()), len(result.blocking_errors())
             self.log(f"  {len(result.steps)} steps, {result.rows_loaded()} rows loaded"
@@ -426,6 +428,10 @@ class Pipeline:
             etl = etl_result or (
                 self.ws.load_json(self.ws.etl_run_json, ETLRunResult) if self.ws.etl_run_json.exists() else None
             )
+            from .etl.runner import OLDER_BUILD_NOTE, built_by_older_version
+
+            if built_by_older_version(etl):
+                self.log(f"  note: {OLDER_BUILD_NOTE}")
             report = run_builtin_checks(self.conn, self.schemas, self.cfg, spec_, etl)
             if self.cfg.quality.use_r_dqd and include_r:
                 problem = None
@@ -649,14 +655,15 @@ class _BuildHistory:
     def _rows(etl: ETLRunResult) -> dict[str, int]:
         """Rows loaded per CDM table (the id-map and pruning steps write no CDM table and are left out).
         When its periods were merged, observation_period counts the valid episodes the merge took
-        (episodes, or event periods, less those dropped because they end before they start) plus the
-        fill's periods. Not the merged periods: a repair that fixes an episode's dates can join two
-        periods into one, and must not count as a loss; this number grows whenever more episodes are
-        valid (a person the fill covered who now has a valid episode adds at least as many). The route
+        (episodes, or event periods, less those dropped because they end before they start). Not the
+        merged periods: a repair that fixes an episode's dates can join two periods into one, and must
+        not count as a loss. Nor the fill's periods: a repair that inverts a person's only episode
+        would get that person a period from their first to their last record instead, and the count
+        must still see the episode lost (a person the fill covered who gets a valid episode adds one,
+        and leaving the fill makes no loss). The route
         steps move records between tables after they were counted here, so moves change no total. The
         eras the build derives are left out: they follow the condition and drug records counted here."""
         from .cdm.spec import load_cdm_spec
-        from .etl.compiler import step_label
 
         cdm = load_cdm_spec()
         out: dict[str, int] = {}
@@ -668,8 +675,9 @@ class _BuildHistory:
             if merge is not None and s.target_table == "observation_period":
                 if s is merge:
                     n = int(s.stats.get("episodes") or 0) - int(s.stats.get("dropped_inverted") or 0)
-                elif step_label(s.step) != "observation_period_fill":
-                    continue  # the episodes (or event periods) the merge took, counted above
+                else:
+                    continue  # the episodes (or event periods) the merge took, counted above; the fill's
+                    # periods are no measure of what was loaded (they make up for lost episodes)
             out[s.target_table] = out.get(s.target_table, 0) + n
         return out
 

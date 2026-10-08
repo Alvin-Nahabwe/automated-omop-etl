@@ -379,6 +379,10 @@ def test_timestamps_with_offsets_need_the_site_time_zone():
     assert offset_errors(["+03:00"]) == []  # one offset: every time is on one clock
     # UTC written as an offset; one offset plus offsets too rare to list (counted only)
     assert "'+00:00' (UTC)" in offset_errors(["+00:00"])[0].message
+    # the message does not claim the build ignores an offset an explicit AT TIME ZONE converts
+    message = offset_errors(["Z"])[0].message
+    assert "so it needs etl.timezone" in message and "AT TIME ZONE conversion aside" in message
+    assert "ignore its offset" not in message
     (issue,) = offset_errors(["+03:00"], rare=2)
     assert "several time zone offsets ('+03:00' and others seen too rarely to name)" in issue.message
     assert "2 values" not in issue.message  # a count below min_cell_count is not quoted
@@ -515,8 +519,12 @@ def test_design_prompt_date_rules(tmp_path):
                                         "target": {"url": "postgresql://x/y"}})
     text = " ".join(staging_conventions(cfg).split())
     assert "<PARTIAL_DATES>" not in text and "<OFFSETS>" not in text
-    assert "start dates take the first day, end dates the last day (the widest interval), other dates the 15th" in text
+    assert ("start dates take the first day, end dates the last day (the widest interval; an end computed from the "
+            "start's columns reads them as the start does), other dates the 15th") in text
     assert "keep the time as written (no site time zone is configured" in text
+    # the prompt and the validator agree: such a column needs etl.timezone, AT TIME ZONE or not
+    assert "needs etl.timezone: the validator stops the build until a person sets it" in text
+    assert "only when you need another zone" not in text
     assert "Do not add regex guards only to avoid cast errors" in text and "value_as_string" in text
     assert "{etl}.try_date(x, 'DD/MM/YYYY')" in text and "Never pass a strftime pattern" in text
     nairobi = cfg.model_copy(update={"etl": EtlConfig(timezone="Africa/Nairobi", partial_dates="reject")})

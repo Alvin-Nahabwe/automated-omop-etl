@@ -14,6 +14,10 @@
 
 > **Steps that failed without failing the build:** {{ verdict_notes|map('md')|join('; ') }}.
 {% endif %}
+{% if older_build %}
+
+> **Built by an earlier version:** {{ older_build|md }}
+{% endif %}
 
 | | |
 |---|---|
@@ -236,10 +240,10 @@ Started {{ etl.started_at }}{% if etl.finished_at %}, finished {{ etl.finished_a
 | Step | Table | Rows inserted | Source rows | Retention | Statistics | Visit links | Time | Error |
 |---|---|--:|--:|--:|---|---|--:|---|
 {% for s in etl.steps %}
-| {{ s.step|md }} | {{ s.table|md }} | {{ s.rows|num }} | {{ s.source_rows|num }} | {{ s.retention|pct }} | {{ (s.one_row_per_key or s.periods or s.moved or s.derived or s.id_keys)|md }} | {{ s.visit_links|md }} | {{ s.seconds|secs }} | {{ (('**ERROR** ' if s.blocking else '**ERROR (not blocking)** ') ~ s.error)|md if s.error else ('skipped: ' ~ s.skipped)|md if s.skipped else '' }} |
+| {{ s.step|md }} | {{ s.table|md }} | {{ s.rows|num }} | {{ s.source_rows|num }} | {{ s.retention|pct }} | {{ (s.one_row_per_key or s.periods or s.moved or s.derived or s.id_keys or s.fan_out)|md }} | {{ s.visit_links|md }} | {{ s.seconds|secs }} | {{ (('**ERROR** ' if s.blocking else '**ERROR (not blocking)** ') ~ s.error)|md if s.error else ('skipped: ' ~ s.skipped)|md if s.skipped else '' }} |
 {% endfor %}
 
-Retention: rows inserted per source row; for steps that keep one row per key, source rows kept (rows that lost to another row of their key are not lost). Statistics: for steps that keep one row per key, source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays; for the observation-period merge, the episodes loaded and the periods they became (episodes that end before they start are dropped; open episodes end at the source release date, configured or derived from the exit dates, or at death; overlapping and back-to-back episodes merge; the persons with overlapping episodes, or with an open episode followed by a later one, are counted for review), and the persons without a period that the fill gave one from their events; for the route steps, the records they moved to the table of their concept's domain (they load none, so they have no retention); for the eras, the table they are derived from; for the id-map steps, the new keys they numbered, and for the pruning steps the keys they retired (people and visits not loaded; they keep their ids for when they return). Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.
+Retention: source rows kept per source row, as etlRecordRetention counts them (rows that lost to another row of their key are not lost, and the extra rows of a code mapped to several concepts do not count). Statistics: for steps that keep one row per key, source rows that lost to another row of their key (dup), keys an earlier mapping loaded (earlier), keys whose rows disagree (conflicting), visits whose rows are separate stays; for the observation-period merge, the episodes loaded and the periods they became (episodes that end before they start are dropped; open episodes end at the source release date, configured or derived from the exit dates, or at death; overlapping and back-to-back episodes merge; the persons with overlapping episodes, or with an open episode followed by a later one, are counted for review), and the persons without a period that the fill gave one from their events; for the route steps, the records they moved to the table of their concept's domain (they load none, so they have no retention); for the eras, the table they are derived from; for the id-map steps, the new keys they numbered, and for the pruning steps the keys they retired (people and visits not loaded; they keep their ids for when they return); for other mappings, the extra rows their codes with several concepts added (1-to-many). Visit links: records linked to a visit of their own person / records with a visit key; others name another person's visit, a visit a visit mapping left out (filtered), or a key no visit mapping reads.
 {% if etl.moved %}
 
 **Records moved to the table of their concept's domain**

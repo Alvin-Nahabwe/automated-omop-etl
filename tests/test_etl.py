@@ -22,7 +22,8 @@ from omop_agent.etl.compiler import (
     step_label,
     target_tables,
 )
-from omop_agent.etl.runner import _analyzed_after, _run_step, run_etl
+from omop_agent.etl.runner import _analyzed_after, _run_step, _server_hint, run_etl
+from omop_agent.report.inspection import _link_stats
 from omop_agent.etl.session import session_sql
 from omop_agent.models import CustomSQL, ETLSpec, FieldMapping, JoinSpec, TableLoadResult, TableMapping
 from omop_agent.sqlguard import strip_literals
@@ -498,7 +499,9 @@ def test_compiled_insert_shape():
     three, four = sql.index("-- 3) the candidate rows"), sql.index("-- 4) one row per visit_occurrence_id")
     assert four < three < sql.index("\n    SELECT\n        s.visit_occurrence_id,") < two < one
     assert one < sql.index("INSERT INTO cdm.visit_occurrence (")
-    assert sql.count("OFFSET 0") == 2 and "        OFFSET 0\n    ) s\n),\npicked AS (" in sql
+    # the two layer fences, and the fenced source subquery that hashes each source row (the last tie-break)
+    assert sql.count("OFFSET 0") == 3 and "        OFFSET 0\n    ) s\n),\npicked AS (" in sql
+    assert "md5((v.*)::text) AS _omop_src_hash FROM src.clinic_visits v OFFSET 0) v\n" in sql
     # layer 1 computes every value from the source once, with tolerant conversions (a start date
     # reads an unknown day as the first, an end date as the last); a constant keeps its cast
     assert ("                etl.omop_as_date_at('visit_start_date', 'first', v.visit_date) AS visit_start_date,"
@@ -1588,6 +1591,7 @@ def test_session_sql():
     assert session_sql() == [
         "SET LOCAL datestyle = 'ISO, YMD';",
         "SET LOCAL standard_conforming_strings = on;",
+        "SET LOCAL jit = off;",  # the helpers' default cost would make every large step compile its plan
         "SELECT set_config('omop_agent.imputation_cap', CURRENT_DATE::text, true),"
         " set_config('omop_agent.timezone', '', true);",
     ]
@@ -1595,7 +1599,7 @@ def test_session_sql():
         "etl": EtlConfig(timezone="Africa/Nairobi"),
         "cdm_source": CdmSourceConfig(source_release_date=date(2023, 12, 31)),
     })
-    assert session_sql(cfg)[2:] == [
+    assert session_sql(cfg)[3:] == [
         "SET LOCAL timezone = 'Africa/Nairobi';",
         "SELECT set_config('omop_agent.imputation_cap', '2023-12-31', true),"
         " set_config('omop_agent.timezone', 'Africa/Nairobi', true);",
@@ -1626,14 +1630,14 @@ def test_step_returns_counters_and_session(staged):
         "01_merge", "observation_period", "merge",
         "SELECT 1;\nSELECT 7 AS inserted, 3::numeric AS episodes, DATE '2020-01-31' AS release_date,"
         " current_setting('DateStyle') AS datestyle, current_setting('TimeZone') AS tz,"
-        " current_setting('omop_agent.imputation_cap') AS cap",
+        " current_setting('omop_agent.imputation_cap') AS cap, current_setting('jit') AS jit",
         returns="row",
     )
     res = _run_step(conn, stats, cfg)
     assert res.error is None and (res.kind, res.blocking) == ("merge", True)
     assert res.rows_inserted == 7
     assert res.stats == {"inserted": 7, "episodes": 3, "release_date": "2020-01-31", "datestyle": "ISO, YMD",
-                         "tz": "Africa/Nairobi", "cap": "2023-12-31"}
+                         "tz": "Africa/Nairobi", "cap": "2023-12-31", "jit": "off"}
     # SET LOCAL: the settings end with the step's transaction
     assert scalar(conn, "SELECT current_setting('omop_agent.imputation_cap', true)") in (None, "")
     # without a configured zone and release date: the session's own zone, and the cap is the current date
@@ -1683,6 +1687,18 @@ def test_step_returns_counters_and_session(staged):
                           count_sites=("row",), retained_count_sql="SELECT 4 AS n")
     res = _run_step(conn, broken, cfg)
     assert "division by zero" in res.error and res.value_counts == {} and res.retained_rows == 4
+    assert res.repairable  # an error of its SQL: the repair agent may fix it
+    # ... nor the statistics read before its INSERT (the visit links of its records)
+    linked = CompiledStep("06_condition_occurrence", "condition_occurrence", "insert", "SELECT 1/0",
+                          retained_count_sql="SELECT 9 AS n, 9 AS with_key, 9 AS linked")
+    res = _run_step(conn, linked, cfg)
+    assert res.error and res.stats == {} and _link_stats(res, str) == ""
+    # a step the server stopped (a statement timeout, a full disk, a lock timeout, a cancel) is not
+    # the spec's fault: it names the setting and is not sent to the repair agent
+    with conn.transaction():
+        execute(conn, "SET LOCAL statement_timeout = '50ms'")
+        slow = _run_step(conn, CompiledStep("05_person", "person", "insert", "SELECT pg_sleep(1)"), cfg)
+    assert "statement timeout" in slow.error and "statement_timeout" in slow.error and slow.repairable is False
 
 
 @pytest.mark.postgres
@@ -1782,3 +1798,17 @@ def test_spec_sql_is_read_under_the_session_settings(staged):
     assert run_etl(conn, schemas, spec, cfg).ok
     rows = fetch_all(conn, f"SELECT value_as_string, metadata_date FROM {schemas.cdm}.metadata")
     assert [(r["value_as_string"], r["metadata_date"].isoformat()) for r in rows] == [("2020-01-02 05:00", "2020-01-02")]
+
+
+def test_server_limits_are_not_spec_errors():
+    """Errors of the database server's limits get a hint naming the setting or resource; others none."""
+    import psycopg
+
+    assert "disk space" in _server_hint(psycopg.errors.DiskFull("could not write to file"))
+    assert "memory" in _server_hint(psycopg.errors.OutOfMemory("out of memory"))
+    assert "lock_timeout" in _server_hint(psycopg.errors.LockNotAvailable("canceling statement due to lock timeout"))
+    assert "statement_timeout" in _server_hint(
+        psycopg.errors.QueryCanceled("canceling statement due to statement timeout"))
+    assert "administrator" in _server_hint(psycopg.errors.QueryCanceled("canceling statement due to user request"))
+    assert _server_hint(psycopg.errors.DivisionByZero("division by zero")) is None
+    assert _server_hint(psycopg.errors.UndefinedColumn("column x does not exist")) is None

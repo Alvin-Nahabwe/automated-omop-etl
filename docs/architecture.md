@@ -264,8 +264,10 @@ list over the aliases, ranked in layer 1 and read tolerantly; `NULLS LAST` is ad
 item that does not say where NULLs go, so a missing or unreadable value never wins), then the
 table's default (for death a date known to the day before one completed from a year or month,
 then the latest date), then the most complete row (a concept 0 counts as missing, so an unknown
-sex never wins over a known one), then the source row's text (compared byte-wise, `COLLATE
-"C"`): the choice is deterministic and prefers no value. A visit takes the earliest start and
+sex never wins over a known one), then an md5 hash of the source row's text (computed where the
+source table is scanned, in a fenced subquery, so wide source rows are not carried through the
+joins and sorts; compared byte-wise, `COLLATE "C"`): the choice is deterministic and prefers no
+value. A visit takes the earliest start and
 the latest end of its rows (window `MIN` / `MAX`), where the patient came from as in its first
 row and where they went as in its last (`FIRST_VALUE`). Rows with a NULL drop-policy field are
 gone in layer 2, so they never win. A key an earlier mapping loaded is skipped (an anti-join
@@ -444,8 +446,10 @@ integer conversion rounds halves away from zero, where `float8` rounds them to e
 A date with an unknown day or month (`00`, `97`-`99`, no day in the value such as `06/1975`
 for `DD/MM/YYYY`, or a template without DD or MM) is completed by the field's rule
 (`etl/policies.py`, `partial_policy`) and counted as `imputed`, or left NULL and counted as
-`partial_null`: the start of a DQD start/end pair takes the first day, its end the last day,
-other dates the 15th (`etl.partial_dates: reject` makes them NULL); birth and death dates follow
+`partial_null`: the start of a DQD start/end pair takes the first day, its end the last day
+(a conversion in the end's expression of a column the start also reads takes the first day, so
+`start + days_supply - 1` or `COALESCE(discharge_date, visit_date)` is not stretched), other dates
+the 15th (`etl.partial_dates: reject` makes them NULL); birth and death dates follow
 THEMIS (year and month of birth are kept, a missing birth day is the 1st and a year alone gives no
 `birth_datetime`; a death date takes the last day). An imputed date is not later than the
 configured `cdm_source.source_release_date` (else the build date). An offset (`Z`, `+03:00`)
@@ -489,8 +493,10 @@ ISO cast (or `try_date` without a template) of a column profiled with a day-firs
 format, in a field, join, key or custom SQL, a date conversion of a column of day numbers,
 and a strftime template such as `'%d/%m/%Y'`, are errors. So is a spec that reads a column whose
 profile shows UTC ('Z' or '+00:00') or several time zone offsets while `etl.timezone` is not set:
-the build would keep each time as written, so the times would not be on one clock. Offsets too
-rare to list count towards "several" only next to a listed one.
+the build would keep each time as written, so the times would not be on one clock. The error
+stands even for an expression that converts explicitly (`::timestamptz AT TIME ZONE '<zone>'`,
+which keeps the instant): such a column needs `etl.timezone`, and the design prompt says so. Offsets
+too rare to list count towards "several" only next to a listed one.
 
 ## Quality gate and repair loop
 
@@ -631,6 +637,15 @@ drug names:
 The count queries of a record mapping (its source rows, and the rows it keeps with their visit
 links classified, which reads the distinct visit keys of the visit source) take a quarter of its
 step's time.
+
+**A wide visit source** (`--wide 150`: 150 extra ODK-like columns in `clinic_visits`, mostly
+skipped questions and short codes; 60,000 people, 178,000 visit rows): the one-row-per-key steps
+break ties by an md5 hash of the source row, computed where the source is scanned, so the columns
+no field reads never reach the joins and sorts. The `visit_occurrence` step took 4.5 s and the
+whole build wrote 302 MB of temporary files, against 6.3 s and 479 MB when the row's whole text
+was carried as the tie-break. The build steps run with `jit = off` (`etl.session`): the helper
+functions' default cost puts large steps above the JIT thresholds, and compiling their plans
+(plpgsql cannot be inlined) cost up to 3 s a step.
 
 **Observation periods of 1 million people from 5 million residency episodes** (overlaps,
 back-to-back moves, gaps, open and inverted episodes, a death for one person in 17, and 2 million

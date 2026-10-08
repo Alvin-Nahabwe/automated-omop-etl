@@ -48,6 +48,7 @@ and nothing here raises.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 # Kinds of conversion: the counted front end and the uncounted function of each.
@@ -81,6 +82,8 @@ _TRY_KINDS = {f"try_{k}": k for k in KINDS}
 # Functions whose result changes from call to call: a value with one is not inlined.
 _VOLATILE_FUNCTIONS = {"random", "nextval", "setval", "clock_timestamp", "timeofday", "setseed", "gen_random_uuid",
                        "uuid_generate_v4", "txid_current", "pg_sleep"}
+# ... of those, the ones that give each row another value (txid_current is one value per transaction)
+_DRAWS = _VOLATILE_FUNCTIONS - {"txid_current", "pg_sleep"}
 # The cost (operators and calls) up to which PostgreSQL inlines a function that references its
 # argument several times is 10; built-in calls can cost more than one, so the scan keeps a margin.
 _MAX_SIMPLE_COST = 6
@@ -119,6 +122,14 @@ _TOKEN = re.compile(
     re.S | re.X,
 )
 _MAX_STEPS = 500  # rewrites of one expression (each removes one conversion)
+# A partial-date rule (etl.policies.partial_policy), or a function that gives the rule of one
+# operand: an end date computed from its start's columns reads them as the start does
+# (etl.compiler._date_rule).
+PolicyArg = str | Callable[[str], str]
+
+
+def _policy_of(policy: PolicyArg, operand: str) -> str:
+    return policy(operand) if callable(policy) else policy
 
 
 @dataclass
@@ -522,8 +533,9 @@ def _date_typed(operand: str) -> bool:
     return ct is not None and ct[0] in DATE_KINDS and ct[1] == len(toks) - 1
 
 
-def _call(kind: str, site: str, policy: str, operand: str, template: str | None, counted: bool) -> str:
+def _call(kind: str, site: str, policy: PolicyArg, operand: str, template: str | None, counted: bool) -> str:
     """The tolerant conversion of ``operand`` (SQL text) to ``kind``."""
+    policy = _policy_of(policy, operand)
     once = "_once" if kind in DATE_KINDS and not _simple_operand(operand) and not _date_typed(operand) else ""
     if counted:
         args = [_quote(site), _quote(policy), operand] + ([template] if template is not None else [])
@@ -547,7 +559,7 @@ def _with_modifier(call: str, kind: str, modifier: str) -> str:
     return f"{call}::{kind}{modifier}"
 
 
-def _next_rewrite(sql: str, toks: list[Tok], site: str, policy: str, counted: bool, out: Rewrite,
+def _next_rewrite(sql: str, toks: list[Tok], site: str, policy: PolicyArg, counted: bool, out: Rewrite,
                   seen: set[str | int]) -> str | None:
     """``sql`` with its first rewritable conversion rewritten, or None when there is none left. A
     conversion left as written is recorded once and skipped: ``seen`` holds the text and the start
@@ -581,12 +593,12 @@ def _next_rewrite(sql: str, toks: list[Tok], site: str, policy: str, counted: bo
             template = toks[fmt[0]].text if fmt is not None and fmt[0] == fmt[1] else None
             if fmt is not None and (template is None or _literal_text(toks[fmt[0]]) is None):
                 continue  # a template that is not a literal: read as written, uncounted
+            operand = _span(sql, toks, a0, a1)
             if not counted:  # already the uncounted form: only the policy changes, once
                 pol = args[2] if len(args) > 2 else None
                 if kind not in DATE_KINDS or (pol is not None and pol[0] == pol[1]
-                                              and _literal_text(toks[pol[0]]) == policy):
+                                              and _literal_text(toks[pol[0]]) == _policy_of(policy, operand)):
                     continue
-            operand = _span(sql, toks, a0, a1)
             out.conversions.append(Conversion(kind, operand, _span(sql, toks, i, close),
                                               _literal_text(toks[fmt[0]]) if fmt is not None else None,
                                               function=f"try_{kind}", rewritten=True))
@@ -689,7 +701,7 @@ def _next_rewrite(sql: str, toks: list[Tok], site: str, policy: str, counted: bo
     return None
 
 
-def rewrite(expr: str | None, site: str, policy: str, *, counted: bool = True) -> Rewrite:
+def rewrite(expr: str | None, site: str, policy: PolicyArg, *, counted: bool = True) -> Rewrite:
     """``expr`` with its hard conversions rewritten tolerantly (see the module docstring). Never
     raises: an expression the scan cannot read is returned as written, in ``left_hard``."""
     if not expr or not expr.strip():
@@ -713,6 +725,43 @@ def rewrite(expr: str | None, site: str, policy: str, *, counted: bool = True) -
 
 
 _CONVERSION_CALL = re.compile(r"^(omop_as_[a-z]+(_once)?_at|try_[a-z]+|omop_try_[a-z]+_once)$")
+
+
+def volatile_calls(sql: str | None) -> list[str]:
+    """The functions of ``sql`` whose result changes from call to call (``random()``,
+    ``clock_timestamp()``, ``nextval(...)``), in order, once each. Empty when the scan cannot read
+    the SQL."""
+    try:
+        toks = [t for t in lex(sql or "") if t.kind not in ("ws", "comment")]
+    except LexError:
+        return []
+    out: list[str] = []
+    for i, t in enumerate(toks[:-1]):
+        name = t.text.lower()
+        if t.kind == "id" and name in _DRAWS and toks[i + 1].text == "(" and name not in out:
+            out.append(name)
+    return out
+
+
+def column_refs(sql: str | None) -> set[tuple[str, str]]:
+    """The ``alias.column`` references of ``sql`` (lower case, quotes removed); a qualified call
+    (``s.f(...)``) is not one. Empty when the scan cannot read the SQL."""
+    try:
+        toks = [t for t in lex(sql or "") if t.kind not in ("ws", "comment")]
+    except LexError:
+        return set()
+
+    def name(t: Tok) -> str:
+        return t.text[1:-1].replace('""', '"') if t.kind == "qid" else t.text.lower()
+
+    out: set[tuple[str, str]] = set()
+    for i in range(len(toks) - 2):
+        a, d, c = toks[i], toks[i + 1], toks[i + 2]
+        if a.kind in ("id", "qid") and d.text == "." and c.kind in ("id", "qid"):
+            if i + 3 < len(toks) and toks[i + 3].text == "(":
+                continue
+            out.add((name(a), name(c)))
+    return out
 
 
 def without_conversions(sql: str) -> str:
@@ -773,7 +822,7 @@ def _is_whole_call(sql: str, kind: str, counted: bool) -> bool:
     return _match_forward(toks, 3) == len(toks) - 1
 
 
-def tolerant_value(expr: str, datatype: str, site: str, policy: str, *, counted: bool = True) -> Rewrite:
+def tolerant_value(expr: str, datatype: str, site: str, policy: PolicyArg, *, counted: bool = True) -> Rewrite:
     """A column or expression field's value: ``expr`` rewritten (``rewrite``) and, for a numeric or
     date CDM type, converted to it tolerantly as well (once: an expression that is already one
     such conversion is not wrapped again). For a text type the caller applies its own cast."""
