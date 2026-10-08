@@ -2,7 +2,8 @@
 # Installs R, Java and the OHDSI packages (DatabaseConnector, Achilles, DataQualityDashboard) for
 # omop-agent's quality.use_r_dqd. Used by Dockerfile.r; also works as root on an Ubuntu 24.04
 # server. Tested 2026-10-02: R 4.3.3, OpenJDK 21, DatabaseConnector 8.0.0, SqlRender 1.19.7,
-# ParallelLogger 3.5.1, Achilles 1.7.2, DataQualityDashboard 2.8.9. Takes about 3 minutes.
+# ParallelLogger 3.5.1, Achilles 1.7.2, DataQualityDashboard 2.8.9 (CRAN has served 2.9.0 since
+# then; it installs the same way). Takes about 3 minutes.
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
@@ -22,15 +23,34 @@ apt-get install -y --no-install-recommends \
 
 R CMD javareconf
 
-# DatabaseConnector 8.0.0 needs dbplyr >= 2.6.0; dbplyr 2.6.0 calls dplyr::filter_out (dplyr >= 1.2,
-# not declared in its DESCRIPTION); dplyr 1.2.1 needs rlang >= 1.1.7, vctrs >= 0.7.1,
-# lifecycle >= 1.0.5. install.packages() does not upgrade outdated dependencies, so list them.
+# The apt packages above are older than some of these need, and install.packages() upgrades only
+# the packages it is given, so every one that must be newer is listed with its minimum version:
+# DatabaseConnector 8.0.0 needs SqlRender >= 1.19.7 and dbplyr >= 2.6.0; dbplyr 2.6.0 calls
+# dplyr::filter_out (dplyr >= 1.2, not declared in its DESCRIPTION); dplyr 1.2.1 needs
+# rlang >= 1.1.7, vctrs >= 0.7.1, lifecycle >= 1.0.5. A download that fails is only a warning in
+# install.packages(), and the packages built after it then fail with a misleading error (dbplyr
+# against the old dplyr: "object 'filter_out' is not exported"), so check what got installed,
+# try the rest again, and name what is still missing.
 Rscript -e '
-options(repos = c(CRAN = "https://cloud.r-project.org"))
-pkgs <- c("rlang", "lifecycle", "vctrs", "tidyselect", "dplyr", "dbplyr", "memuse",
-          "SqlRender", "DatabaseConnector", "ParallelLogger", "Achilles", "DataQualityDashboard")
-install.packages(pkgs, lib = "/usr/local/lib/R/site-library", Ncpus = 3,
-                 dependencies = c("Depends", "Imports", "LinkingTo"))
+options(repos = c(CRAN = "https://cloud.r-project.org"), timeout = 600)
+lib <- "/usr/local/lib/R/site-library"
+need <- c(rlang = "1.1.7", lifecycle = "1.0.5", vctrs = "0.7.1", tidyselect = "1.2.1",
+          dplyr = "1.2.0", dbplyr = "2.6.0", memuse = "0", SqlRender = "1.19.7",
+          DatabaseConnector = "8.0.0", ParallelLogger = "0", Achilles = "0",
+          DataQualityDashboard = "0")
+ok <- function(p) {
+  v <- tryCatch(packageVersion(p, lib.loc = lib), error = function(e) NULL)
+  !is.null(v) && v >= need[[p]]
+}
+for (attempt in 1:3) {
+  todo <- names(need)[!vapply(names(need), ok, logical(1))]
+  if (!length(todo)) break
+  message("install attempt ", attempt, ": ", paste(todo, collapse = ", "))
+  install.packages(todo, lib = lib, Ncpus = 3, dependencies = c("Depends", "Imports", "LinkingTo"))
+}
+missing <- names(need)[!vapply(names(need), ok, logical(1))]
+if (length(missing)) stop("not installed after 3 attempts (see the download and build errors above): ",
+                          paste(missing, collapse = ", "))
 stopifnot(all(vapply(c("DatabaseConnector", "Achilles", "DataQualityDashboard"),
                      requireNamespace, logical(1), quietly = TRUE)))'
 
