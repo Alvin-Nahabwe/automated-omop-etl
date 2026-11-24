@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 
 import psycopg
 import yaml
@@ -557,6 +558,30 @@ def _normalise_plan(plan: TablePlan) -> TablePlan:
     return plan.model_copy(update=update)
 
 
+def _derived_visit_key(visit_key: KeySpec | None, mappings: list[TableMapping]) -> tuple[KeySpec | None, str | None]:
+    """The plan's visit key, or, when the plan set none but the visit_occurrence mapping resolves
+    its visit_occurrence_id through the visit id map (kind visit_id), the key that mapping uses
+    (its expression over the bare columns of its source table). A table revision cannot change
+    the plan, so without this the spec could never validate."""
+    if visit_key is not None:
+        return visit_key, None
+    for tm in mappings:
+        if tm.target_table != "visit_occurrence":
+            continue
+        fm = next((f for f in tm.fields if f.target_field == "visit_occurrence_id" and f.kind == "visit_id"), None)
+        if fm is None or not (fm.expression or "").strip():
+            continue
+        others = {j.alias.lower() for j in tm.joins}
+        refs = {m.group(1).lower() for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\.", fm.expression)}
+        if refs & others or refs - {tm.source.alias.lower()}:
+            continue  # reads a joined table: not a key of the source table alone
+        expr = re.sub(rf"\b{re.escape(tm.source.alias)}\s*\.\s*", "", fm.expression, flags=re.IGNORECASE).strip()
+        key = KeySpec(table=tm.source.table, expression=expr)
+        return key, (f"the plan set no visit key, but the visit_occurrence mapping takes its ids from the visit id map; "
+                     f"the visit key is {tm.source.table}.{expr}, as that mapping uses it.")
+    return None, None
+
+
 def design_etl(
     profile: SourceProfile,
     annotations: SourceAnnotations | None,
@@ -608,12 +633,15 @@ def design_etl(
         tidied += notes
     mappings = [drafted[i] for i in range(len(plan.tables))]
 
+    visit_key, visit_note = _derived_visit_key(plan.visit_key, mappings)
+    if visit_note:
+        tidied.append(visit_note)
     open_questions = list(plan.open_questions)
     if plan.unmapped_source_tables:
         open_questions.append("Source tables not mapped to the CDM: " + ", ".join(plan.unmapped_source_tables) + ".")
     spec = ETLSpec(
         person_key=plan.person_key,
-        visit_key=plan.visit_key,
+        visit_key=visit_key,
         observation_period=plan.observation_period,
         table_mappings=mappings,
         assumptions=list(plan.assumptions),

@@ -58,3 +58,22 @@ def test_zero_foreign_keys_become_null():
 def test_a_clean_mapping_is_unchanged():
     tm = mapping("death", [{"target_field": "person_id", "kind": "person_id", "expression": "s.id"}])
     assert tidy_mapping(tm) == (tm, [])
+
+
+def test_a_visit_key_the_plan_left_out_is_taken_from_the_visit_mapping():
+    from omop_agent.design.designer import _derived_visit_key
+    from omop_agent.models import KeySpec
+
+    visit = TableMapping.model_validate({
+        "target_table": "visit_occurrence", "source": {"table": "clinic_visits", "alias": "v"},
+        "fields": [{"target_field": "visit_occurrence_id", "kind": "visit_id",
+                    "expression": "v.individual_id || ':' || V.visit_no"}]})
+    key, note = _derived_visit_key(None, [mapping("person", []), visit])
+    assert key == KeySpec(table="clinic_visits", expression="individual_id || ':' || visit_no")
+    assert note and "clinic_visits.individual_id" in note
+    planned = KeySpec(table="t", expression="k")
+    assert _derived_visit_key(planned, [visit]) == (planned, None)
+    joined = TableMapping.model_validate({**visit.model_dump(), "joins": [{"table": "x", "alias": "x",
+                                                                         "on": "x.id = v.id"}]})
+    joined.fields[0].expression = "x.visit_no"
+    assert _derived_visit_key(None, [joined]) == (None, None)
