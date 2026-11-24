@@ -295,6 +295,7 @@ class Pipeline:
             source_vocabulary_domains,
             write_source_to_concept_map,
         )
+        from .privacy_review import sends_to_llm
         from .vocab.review import export_review, import_review
 
         self._privacy_gate()
@@ -327,13 +328,16 @@ class Pipeline:
             new_terms = [t for t in terms if (t.source_vocabulary_id, t.source_code) not in prior]
             if kept:
                 self.log(f"  kept {len(kept)} earlier/reviewed decisions; mapping {len(new_terms)} new terms")
-            decisions = kept + (map_terms(self.conn, self.schemas, new_terms, self.llm, self.cfg, self.ws) if new_terms else [])
+            memory = self.mapping_memory()
+            decisions = kept + (map_terms(self.conn, self.schemas, new_terms, self.llm, self.cfg, self.ws, memory=memory,
+                                          memory_text=not sends_to_llm(self.cfg)) if new_terms else [])
             decisions.sort(key=lambda d: (d.source_vocabulary_id, -d.frequency, d.source_code))
             export_review(self.ws, decisions)
             n = write_source_to_concept_map(
                 self.conn, self.schemas, decisions, include_unchecked=self.cfg.mapping.use_unchecked_in_etl
             )
             self.conn.commit()
+            self.remember_mappings(decisions)
             for row in mapping_summary(decisions):
                 self.log(
                     f"  {row['source_vocabulary_id']}: {row['terms']} terms, {row['approved']} approved, "
@@ -367,6 +371,30 @@ class Pipeline:
         )
         self.conn.commit()
         self.ws.audit("mappings_reimported", rows=n)
+        self.remember_mappings(decisions)
+        return n
+
+    def mapping_memory(self):
+        """The shared mapping memory (``mapping.memory_path``), or None."""
+        from .vocab.memory import MappingMemory
+
+        path = self.cfg.mapping.memory_path
+        return MappingMemory(path) if path is not None else None
+
+    def remember_mappings(self, decisions: list[MappingDecision]) -> int | None:
+        """Replace this project's entries in the mapping memory with its human-approved decisions.
+        A memory that cannot be written is logged, never fatal."""
+        memory = self.mapping_memory()
+        if memory is None:
+            return None
+        project = str(self.ws.root)
+        try:
+            n = memory.record(project, self.cfg.name, decisions, self.cfg.privacy.min_cell_count)
+        except Exception as e:  # noqa: BLE001 - a shared file another process holds, a read-only disk, ...
+            self.log(f"  ! mapping memory {memory.path} not updated: {e}")
+            self.ws.audit("mapping_memory_failed", path=str(memory.path), error=str(e))
+            return None
+        self.ws.audit("mapping_memory_recorded", path=str(memory.path), mappings=n)
         return n
 
     def validated_spec(self) -> ETLSpec:

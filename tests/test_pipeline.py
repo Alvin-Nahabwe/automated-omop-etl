@@ -187,6 +187,11 @@ def test_cli_init(tmp_path, monkeypatch):
     assert cfg.target.url == "postgresql://postgres:@localhost:5432/omop"
     assert cfg.llm.model == "gpt-oss-120b" and cfg.llm.base_url == "http://127.0.0.1:8080/v1" and cfg.privacy.min_cell_count == 5
     assert (cfg.etl.timezone, cfg.etl.partial_dates, cfg.source.na_values) == (None, "widest", None)
+    assert cfg.mapping.memory_path == Path.home() / ".omop-agent" / "mapping_memory.sqlite"
+    monkeypatch.setenv("OMOP_AGENT_MAPPING_MEMORY", str(tmp_path / "shared.sqlite"))
+    assert load_config(tmp_path / "omop_agent.yaml").mapping.memory_path == tmp_path / "shared.sqlite"
+    monkeypatch.setenv("OMOP_AGENT_MAPPING_MEMORY", "")
+    assert load_config(tmp_path / "omop_agent.yaml").mapping.memory_path is None
     # the commented settings work once uncommented
     text = (tmp_path / "omop_agent.yaml").read_text()
     assert "# timezone: Africa/Nairobi" in text and "# source_release_date: 2024-06-30" in text

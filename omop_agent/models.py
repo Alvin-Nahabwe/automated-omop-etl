@@ -393,7 +393,7 @@ class MappingDecision(BaseModel):
     equivalence: Equivalence = "UNMATCHED"
     confidence: float = 0.0
     status: MappingStatus = "UNCHECKED"
-    method: Literal["exact", "lexical", "llm", "manual", "suppressed"] = "lexical"
+    method: Literal["exact", "memory", "lexical", "llm", "manual", "suppressed"] = "lexical"
     rationale: str = ""
     candidates: list[ConceptCandidate] = Field(default_factory=list)
     reviewed_by: str | None = None

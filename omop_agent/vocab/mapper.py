@@ -69,6 +69,7 @@ from ..sqlguard import strip_literals
 from ..workspace import Workspace
 from .evaluate import paren, query_rows, source_from_sql
 from .loader import has_trigram
+from .memory import MappingMemory, Remembered
 
 STAGE = "vocab_map"
 LEXICAL_MIN_SCORE = 0.85  # lexical fallback threshold when no LLM is available
@@ -122,6 +123,9 @@ diagnosis list that holds observations and procedures; each candidate then shows
 Prefer a concept of the target domain. Choose one of another accepted domain only when the term \
 clearly means that kind of thing (an ICD-10 Z code for antenatal care is an observation, not a \
 condition): the record then moves to that domain's table, and a reviewer checks the choice.
+- Some terms list mappings that reviewers approved in earlier projects for the same or a similar \
+term. They are strong evidence, since a person checked them, but check that the meaning really \
+is the same (a different strength, specimen or qualifier is a different concept).
 - Keep each rationale to one or two sentences.
 
 Return exactly one choice per source term, with source_code copied exactly as given."""
@@ -841,7 +845,9 @@ def _lexical(t: SourceTerm, hits: list[_Hit], why: str) -> MappingDecision:
     )
 
 
-def _format_term(i: int, t: SourceTerm, hits: list[_Hit], k: int, phrases: list[str] | None) -> list[str]:
+def _format_term(
+    i: int, t: SourceTerm, hits: list[_Hit], k: int, phrases: list[str] | None, recalled: list[str] | None = None
+) -> list[str]:
     lines = [f"{i}. source_code: {json.dumps(t.source_code, ensure_ascii=False)}"]
     if t.source_name != t.source_code:
         lines.append(f"   description: {json.dumps(t.source_name, ensure_ascii=False)}")
@@ -856,6 +862,9 @@ def _format_term(i: int, t: SourceTerm, hits: list[_Hit], k: int, phrases: list[
         lines.append("   units recorded with it: " + "; ".join(f"{json.dumps(u.value, ensure_ascii=False)} ×{u.count}" for u in t.units))
     if phrases:
         lines.append(f"   searched again for: {'; '.join(phrases)}")
+    if recalled:
+        lines.append("   approved by reviewers in earlier projects:")
+        lines += [f"   - {r}" for r in recalled]
     shown = _shown(t, hits, k)
     if others or len({h.candidate.domain_id for h in shown}) > 1:  # other domains accepted: show each candidate's
         lines.append("   candidates (concept_id | name | domain | class | vocabulary | score):")
@@ -881,8 +890,10 @@ def build_prompt(
     hits: dict[str, list[_Hit]],
     k: int,
     retry_phrases: dict[str, list[str]] | None = None,
+    recalled: dict[str, list[str]] | None = None,
 ) -> str:
-    """The user prompt for one batch. Only aggregate information: codes/labels and counts."""
+    """The user prompt for one batch. Only aggregate information: codes/labels and counts (and,
+    with ``recalled``, the reviewed mappings the mapping memory retrieved for each term)."""
     domains = sorted({t.target_domain or "any" for t in batch})
     lines = [f"Source vocabulary: {source_vocabulary_id}", f"Target domain: {', '.join(domains)}", ""]
     if retry_phrases is not None:
@@ -900,7 +911,7 @@ def build_prompt(
         ]
     for i, t in enumerate(batch, 1):
         phrases = retry_phrases.get(t.source_code) if retry_phrases else None
-        lines += _format_term(i, t, hits[t.source_code], k, phrases) + [""]
+        lines += _format_term(i, t, hits[t.source_code], k, phrases, (recalled or {}).get(t.source_code)) + [""]
     lines.append("Return one choice per source term, copying source_code exactly.")
     return "\n".join(lines)
 
@@ -924,14 +935,19 @@ def _match_choices(batch: Sequence[SourceTerm], choices: list[TermChoice]) -> di
 class _VocabMapper:
     """Maps the terms of one source vocabulary."""
 
-    def __init__(self, searcher: _Searcher, llm: LLMClient, cfg: ProjectConfig, svid: str):
+    def __init__(self, searcher: _Searcher, llm: LLMClient, cfg: ProjectConfig, svid: str,
+                 memory: MappingMemory | None = None, memory_text: bool = True):
         self.s = searcher
         self.llm = llm
         self.cfg = cfg
         self.svid = svid
         self.k = max(1, cfg.mapping.candidates_per_term)
         self.hits: dict[str, list[_Hit]] = {}
-        self.stats = {"llm_calls": 0, "llm_unavailable": 0, "retried": 0, "rejected_ids": 0}
+        self.memory = memory
+        self.memory_text = memory_text  # the remembered terms' descriptions may go into prompts
+        self.recalled: dict[str, list[str]] = {}
+        self.stats = {"llm_calls": 0, "llm_unavailable": 0, "retried": 0, "rejected_ids": 0, "memory_reused": 0,
+                      "memory_retrieved": 0}
         # privacy.send_values_to_llm: false keeps every source value out of prompts
         self.llm_disabled = None if cfg.privacy.send_values_to_llm else LLM_DISABLED_BY_PRIVACY
 
@@ -1004,6 +1020,76 @@ class _VocabMapper:
             rationale=ch.rationale + note,
         )
 
+    def _remembered_concept(self, t: SourceTerm, r: Remembered) -> ConceptCandidate | None:
+        """The remembered concept, if it is still a valid standard concept of a domain ``t`` accepts."""
+        cand, _ = _validate_row(self.s.lookup(r.target_concept_id), r.target_concept_id, accepted_domains(t))
+        if cand is None:
+            return None
+        score = round(text_score(normalize(t.source_name), normalize(cand.concept_name)), 3)
+        return cand.model_copy(update={"score": score})
+
+    def _reuse(self, t: SourceTerm) -> MappingDecision | None:
+        """The concept reviewers chose for the same description, when they all chose the same one
+        and it is still valid for ``t``."""
+        same = self.memory.same(t.source_name) if self.memory is not None else []
+        if not same or len({r.target_concept_id for r in same}) != 1:
+            return None
+        cand = self._remembered_concept(t, same[0])
+        if cand is None:
+            return None
+        # the remembered concept first among the candidates the reviewer sees
+        hits = [_Hit(cand, [cand.concept_name])] + [h for h in self.hits[t.source_code]
+                                                     if h.candidate.concept_id != cand.concept_id]
+        self.hits[t.source_code] = hits
+        in_domain = _in_target_domain(t, cand)
+        auto = self.cfg.mapping.memory_auto_approve and in_domain and t.auto_approve
+        n = len({r.project for r in same})
+        r = same[0]
+        why = (f"Reviewers mapped the same term to this concept {r.where()}"
+               + (f" and in {n - 1} other project(s)" if n > 1 else "") + ".")
+        if not in_domain:
+            why += (f" (A {cand.domain_id} concept, not {t.target_domain}: the record moves to the table of the "
+                    f"{cand.domain_id} domain; review it.)")
+        self.stats["memory_reused"] += 1
+        return _decision(
+            t,
+            hits,
+            **_target(cand),
+            equivalence=(r.equivalence if r.equivalence and r.equivalence != "UNMATCHED" else "EQUIVALENT"),
+            confidence=1.0,
+            status="APPROVED" if auto else "UNCHECKED",
+            method="memory",
+            rationale=why + ("" if t.auto_approve else MIXED_DOMAINS_NOTE),
+        )
+
+    def _recall(self, t: SourceTerm) -> None:
+        """Add the concepts reviewers chose for similar terms to ``t``'s candidates, and note them for
+        the prompt."""
+        if self.memory is None:
+            return
+        lines: list[str] = []
+        ids: set[int] = set()
+        hits = self.hits[t.source_code]
+        for r in self.memory.similar(t.source_name):
+            cand = self._remembered_concept(t, r)
+            if cand is None:
+                continue
+            if all(h.candidate.concept_id != cand.concept_id for h in hits):
+                hits.append(_Hit(cand, [cand.concept_name]))
+            ids.add(cand.concept_id)
+            term = (f"{json.dumps(r.source_name, ensure_ascii=False)} -> " if self.memory_text
+                    else "a similar term -> ")
+            lines.append(f"{term}{cand.concept_id} | {cand.concept_name} | {cand.domain_id}"
+                         + ("" if r.score >= 1 else f" (similarity {r.score:.2f})"))
+        if lines:
+            # keep the recalled concepts among the k candidates shown, just behind the term's own
+            # best matches
+            top = [h for h in hits if h.candidate.concept_id not in ids]
+            rec = [h for h in hits if h.candidate.concept_id in ids]
+            self.hits[t.source_code] = top[: max(0, self.k - len(rec))] + rec + top[max(0, self.k - len(rec)):]
+            self.recalled[t.source_code] = lines
+            self.stats["memory_retrieved"] += 1
+
     def run(self, terms: list[SourceTerm]) -> dict[str, MappingDecision]:
         min_cell = self.cfg.privacy.min_cell_count
         ordered = sorted(terms, key=lambda t: (-t.frequency, t.source_code))
@@ -1013,7 +1099,9 @@ class _VocabMapper:
         for t in ordered:
             hits = self.s.search(t.source_name, t.target_domain, self.k, t.accepted_domains)
             self.hits[t.source_code] = hits
-            if t.frequency < min_cell:
+            if (d := self._reuse(t)) is not None:
+                out[t.source_code] = d
+            elif t.frequency < min_cell:
                 out[t.source_code] = _decision(
                     t,
                     hits,
@@ -1024,6 +1112,7 @@ class _VocabMapper:
             else:
                 if (d := _exact_match(t, hits)) is not None:
                     exact[t.source_code] = d
+                self._recall(t)
                 pending.append(t)
         if self.llm_disabled is not None:
             for t in pending:
@@ -1034,7 +1123,8 @@ class _VocabMapper:
         retry: list[SourceTerm] = []
         phrases: dict[str, list[str]] = {}
         for n, batch in enumerate(_chunks(pending, self.cfg.mapping.llm_batch_size), 1):
-            ans = self._call(f"{self.svid}:batch{n}", build_prompt(self.svid, batch, self.hits, self.k))
+            ans = self._call(f"{self.svid}:batch{n}",
+                             build_prompt(self.svid, batch, self.hits, self.k, recalled=self.recalled))
             if isinstance(ans, str):
                 for t in batch:
                     out[t.source_code] = exact.get(t.source_code) or _lexical(t, self.hits[t.source_code], ans)
@@ -1070,7 +1160,8 @@ class _VocabMapper:
                                                                          DECISION_CANDIDATES)]
         self.stats["retried"] = len(retry)
         for n, batch in enumerate(_chunks(retry, self.cfg.mapping.llm_batch_size), 1):
-            ans = self._call(f"{self.svid}:retry{n}", build_prompt(self.svid, batch, self.hits, self.k, phrases))
+            ans = self._call(f"{self.svid}:retry{n}",
+                             build_prompt(self.svid, batch, self.hits, self.k, phrases, self.recalled))
             if isinstance(ans, str):
                 continue  # keep the first-round answer (unmapped)
             choices = _match_choices(batch, ans.choices)
@@ -1092,8 +1183,15 @@ def map_terms(
     llm: LLMClient,
     cfg: ProjectConfig,
     ws: Workspace | None = None,
+    memory: MappingMemory | None = None,
+    memory_text: bool = True,
 ) -> list[MappingDecision]:
     """Map every term to a standard concept (or 0). Returns decisions in the order of ``terms``.
+
+    With a ``memory`` (``vocab.memory``), a term reviewers already mapped elsewhere reuses their
+    concept (method ``memory``), and the concepts of similar reviewed terms are added to the
+    candidates and listed in the prompt; ``memory_text=False`` leaves the remembered terms'
+    descriptions (other projects' source values) out of the prompt.
 
     LLM calls are named ``vocab_map/<source_vocabulary_id>:batch<n>`` and ``...:retry<n>``.
     Only terms seen at least ``privacy.min_cell_count`` times ever appear in a prompt. With
@@ -1106,7 +1204,7 @@ def map_terms(
         by_vocab.setdefault(t.source_vocabulary_id, []).append(t)
     decided: dict[tuple[str, str], MappingDecision] = {}
     for svid in sorted(by_vocab):
-        vm = _VocabMapper(searcher, llm, cfg, svid)
+        vm = _VocabMapper(searcher, llm, cfg, svid, memory, memory_text)
         result = vm.run(by_vocab[svid])
         decided.update({(svid, code): d for code, d in result.items()})
         if ws is not None:
@@ -1115,7 +1213,7 @@ def map_terms(
                 "vocab_mapped",
                 source_vocabulary_id=svid,
                 terms=len(ds),
-                methods={m: sum(d.method == m for d in ds) for m in ("exact", "llm", "lexical", "suppressed")},
+                methods={m: sum(d.method == m for d in ds) for m in ("exact", "memory", "llm", "lexical", "suppressed")},
                 statuses={s: sum(d.status == s for d in ds) for s in ("APPROVED", "UNCHECKED", "FLAGGED")},
                 mapped=sum(d.target_concept_id != 0 for d in ds),
                 llm_disabled=vm.llm_disabled,

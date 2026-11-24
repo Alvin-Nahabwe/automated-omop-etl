@@ -329,7 +329,7 @@ def import_review(
 
 
 # methods whose APPROVED status was given automatically (a reviewer's choice is 'manual')
-_AUTOMATIC = ("exact", "lexical", "llm")
+_AUTOMATIC = ("exact", "memory", "lexical", "llm")
 
 
 def recheck(d: MappingDecision, auto_approve: bool = True) -> MappingDecision:

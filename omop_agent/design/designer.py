@@ -38,6 +38,7 @@ from ..models import (
 from ..privacy import profile_prompt_text
 from ..workspace import Workspace, utcnow
 from .render import render_spec_md
+from .tidy import tidy_mapping
 from .validate import SpecIssue, format_issues, validate_spec, validate_table_mapping
 
 REFERENCE_DOMAINS = ["Gender", "Race", "Ethnicity", "Visit", "Type Concept"]
@@ -594,6 +595,7 @@ def design_etl(
     draft_order = sorted(range(len(plan.tables)), key=lambda i: (rank.get(plan.tables[i].target_table, len(rank)), i))
     prompts: list[str] = [""] * len(plan.tables)
     drafted: dict[int, TableMapping] = {}
+    tidied: list[str] = []  # the mechanical fixes (design/tidy.py), for the reviewer
     for i in draft_order:
         pt = plan.tables[i]
         prompt = _table_prompt(pt, plan, profile, annotations, cfg, [drafted[j] for j in sorted(drafted)])
@@ -602,7 +604,8 @@ def design_etl(
         except LLMUnavailable as e:
             raise _need_llm(e) from e
         prompts[i] = prompt
-        drafted[i] = tm.model_copy(update={"target_table": pt.target_table})
+        drafted[i], notes = tidy_mapping(tm.model_copy(update={"target_table": pt.target_table}))
+        tidied += notes
     mappings = [drafted[i] for i in range(len(plan.tables))]
 
     open_questions = list(plan.open_questions)
@@ -638,10 +641,13 @@ def design_etl(
                     ws.audit("design_revision_unavailable", key=rkey, error=str(e))
                 break
             target = spec.table_mappings[i].target_table
-            spec.table_mappings[i] = revised.model_copy(update={"target_table": target})
+            spec.table_mappings[i], notes = tidy_mapping(revised.model_copy(update={"target_table": target}))
+            tidied += notes
             if ws is not None:
                 ws.audit("design_revision", key=rkey, issues=[str(x) for x in errors])
 
+    if tidied:
+        spec.assumptions += ["Fixed automatically: " + n for n in dict.fromkeys(tidied)]
     issues = validate_spec(spec, profile, conn, schemas, cfg.privacy, cfg=cfg)
     if ws is not None:
         save_design(ws, spec, issues)

@@ -96,6 +96,7 @@ omop-agent vocab-load       # load Athena CSVs
 omop-agent design           # the LLM drafts etl_spec.yaml / etl_spec.md   <- review & edit
 omop-agent map              # evaluate vocabulary + map codes -> mappings/*.csv  <- review & edit
 omop-agent apply-mappings   # load your CSV edits into source_to_concept_map
+omop-agent mapping-memory   # record the reviewed mappings in the shared memory (also done by map/apply-mappings)
 omop-agent build            # compile + load + DQ checks + repair loop
 omop-agent check            # DQ checks only
 omop-agent report [--shareable]   # report.md / report.html
@@ -142,6 +143,8 @@ example WHO `ICD10` when only `ICD10CM` was selected).
   `anthropic`: `model` (default `claude-opus-5-5`) and `effort`. See
   [docs/local-llm.md](docs/local-llm.md).
 * `privacy`: `min_cell_count` (default 5), `send_values_to_llm`, extra `pii_columns`.
+* `mapping.memory_path`: the mapping memory shared by the projects on a server (see "How the LLM is
+  used"); `mapping.memory_auto_approve`.
 * `mapping.auto_approve_confidence`, `quality.max_repair_iterations`, `quality.blocking_severities`, `quality.use_r_dqd`.
 * `cdm_source`: the `cdm_source` row; `source_release_date` is the date of the data extract.
   Observation periods still open there (no exit date) end on it. Unset, the build derives it from
@@ -322,6 +325,16 @@ With a **self-hosted open-weight model** (`provider: openai_compatible`,
   same way whichever model proposes it.
 * `omop-agent llm-check` tests a server before use: every schema, a code-mapping task with known
   answers, and a tool call round trip.
+
+Whichever model is used, mapping is **retrieval first**: candidates come from your Athena
+vocabulary and the model only chooses among real concepts. The **mapping memory**
+(`mapping.memory_path`, `omop_agent/vocab/memory.py`) adds what reviewers decided before. It is
+a SQLite file shared by the projects on a server, holding every mapping a person approved. A
+term whose description reviewers already mapped takes their concept without a model call (method
+`memory`; approved unless `mapping.memory_auto_approve: false`), and for other terms the concepts
+chosen for the most similar reviewed terms join the candidates and are listed in the prompt as
+examples. Only human approvals are remembered, only terms seen at least `min_cell_count` times,
+and the remembered descriptions go into prompts only when the model runs on your own servers.
 
 With **Claude** (`provider: anthropic`), through the official `anthropic` Python SDK:
 

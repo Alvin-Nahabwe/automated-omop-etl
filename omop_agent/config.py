@@ -218,6 +218,19 @@ class MappingConfig(_Base):
     use_unchecked_in_etl: bool = Field(
         True, description="Load UNCHECKED (not yet human-reviewed) mappings into the ETL; they are flagged in the report."
     )
+    memory_path: Path | None = Field(
+        None,
+        description="SQLite file of the mappings people approved, shared by the projects on a server "
+        "(vocab/memory.py): reused for the same terms and shown to the model for similar ones. Unset: no memory.",
+    )
+    memory_auto_approve: bool = Field(
+        True, description="Approve a concept reused from the mapping memory (otherwise it is UNCHECKED)."
+    )
+
+    @field_validator("memory_path", mode="before")
+    @classmethod
+    def _empty_path(cls, v: object) -> object:
+        return None if isinstance(v, str) and not v.strip() else v
 
 
 class QualityConfig(_Base):
@@ -362,4 +375,5 @@ def load_config(path: str | Path) -> ProjectConfig:
     cfg.vocabulary.athena_dir = _resolve(base, cfg.vocabulary.athena_dir)
     cfg.llm.replay_dir = _resolve(base, cfg.llm.replay_dir)
     cfg.llm.record_dir = _resolve(base, cfg.llm.record_dir)
+    cfg.mapping.memory_path = _resolve(base, cfg.mapping.memory_path)
     return cfg

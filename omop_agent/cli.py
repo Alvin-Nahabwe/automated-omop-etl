@@ -177,6 +177,9 @@ privacy:
 mapping:
   auto_approve_confidence: 0.9
   use_unchecked_in_etl: true
+  # Mappings people approved, shared by the projects on this server: reused for the same terms
+  # and shown to the model for similar ones (docs/local-llm.md). Empty: no memory.
+  memory_path: ${{OMOP_AGENT_MAPPING_MEMORY:-~/.omop-agent/mapping_memory.sqlite}}
 
 quality:
   max_repair_iterations: 3
@@ -332,6 +335,31 @@ def apply_mappings(config: Path = ConfigOpt) -> None:
             console.print(f"{n} mappings written")
         finally:
             p.close()
+
+
+@app.command("mapping-memory")
+def mapping_memory(config: Path = ConfigOpt) -> None:
+    """Record this project's reviewed mappings in the shared mapping memory and show its size.
+
+    Runs on its own whenever mappings are written (map, apply-mappings, run); use it after
+    reviewing in a spreadsheet, or to see what the memory holds."""
+    from .vocab.review import import_review
+
+    p = _pipeline(config)
+    try:
+        memory = p.mapping_memory()
+        if memory is None:
+            console.print("No mapping memory: set mapping.memory_path in the project config.")
+            raise typer.Exit(1)
+        if p.ws.decisions_json.exists():
+            n = p.remember_mappings(import_review(p.ws))
+            if n is not None:
+                console.print(f"recorded {n} reviewed mappings of this project")
+        st = memory.stats()
+        console.print(f"{memory.path}: {st['mappings']} mappings to {st['concepts']} concepts "
+                      f"from {st['projects']} project(s)")
+    finally:
+        p.close()
 
 
 @app.command()

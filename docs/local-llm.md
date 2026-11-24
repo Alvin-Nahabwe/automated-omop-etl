@@ -95,6 +95,12 @@ How answers are kept to the pipeline's schemas:
 * **Validate and retry.** An answer that still fails validation (a value out of range, a rule the
   grammar cannot express) goes back to the model with the validation errors, up to
   `structured_retries` times. Every attempt is in the call's record under `work/llm_calls/`.
+* **Mechanical fixes.** Mistakes whose right answer follows from the CDM specification alone
+  are fixed in code before validation, so a slow CPU model does not spend a revision call on
+  them: a missing surrogate primary key gets `auto_id`, helper functions written `etl.try_...`
+  get the `{etl}` schema placeholder, and a foreign key to another CDM table set to `0` (provider,
+  care site, location) is left NULL. Each fix is listed under the spec's assumptions
+  (`omop_agent/design/tidy.py`).
 * **Code checks everything anyway**, as with any model: concept ids must exist in your
   vocabulary, spec expressions are parsed and `EXPLAIN`ed, and the repair agent's tools validate
   their input.
@@ -147,17 +153,38 @@ identifier columns withheld, and the repair agent can only count.
 ## Improving quality: retrieval (RAG)
 
 A smaller open model knows less than a frontier model, but much of what these tasks need is
-looked up, not reasoned. omop-agent already retrieves where it matters most, and further
-retrieval is planned:
+looked up, not reasoned. omop-agent retrieves where it matters most:
 
 * **Concept mapping is retrieval-first**: candidates come from your Athena vocabulary (exact,
   lexical and trigram search), and the model only picks among real candidates or asks for a
   re-search with better terms. It cannot invent a concept id.
+* **The CDM conventions** for each target table (the field-level ETL conventions of the OMOP CDM
+  v5.4 specification) are put into each design prompt.
+* **The mapping memory** (`mapping.memory_path`) keeps every mapping a person approved, across
+  projects. `omop-agent init` sets it to `~/.omop-agent/mapping_memory.sqlite` (in the Docker
+  deployment `/srv/data/mapping_memory.sqlite`, shared by all projects), or to
+  `$OMOP_AGENT_MAPPING_MEMORY`.
+  * A term whose description reviewers already mapped (the same text after normalising case,
+    spacing and punctuation; every reviewer chose the same concept; the concept is still a valid
+    standard concept of a domain the field accepts) takes that concept with no model call. The
+    decision says who approved it in which project. Set `mapping.memory_auto_approve: false` to
+    have such decisions wait for a reviewer.
+  * For the other terms, the concepts reviewers chose for the three most similar remembered terms
+    join the candidates, and the prompt lists them as reviewed examples.
+  * Local codes without a word of three or more letters ("1", "M") are never matched: they mean
+    different things in different sources.
+  * Only decisions a person approved are kept (a reviewer's own concept, or a suggestion approved
+    in the web app), only for terms seen at least `privacy.min_cell_count` times, and each
+    project's entries are replaced whenever its mappings are written, so a corrected mapping
+    replaces the old one. With an external model (`anthropic`, or a server that is not on your
+    network), the remembered concepts are still offered but other projects' term descriptions
+    are not put into prompts.
+  * The memory is written by `map`, `apply-mappings` and `run`; `omop-agent mapping-memory` records
+    the current project's reviewed mappings and shows the memory's size.
 * **Planned**: semantic concept search (a small local embedding model and `pgvector`) so that
-  candidates are found by meaning as well as spelling; a memory of reviewed mappings and approved
-  designs from earlier projects, retrieved as examples; the OMOP CDM field-level ETL conventions
-  and THEMIS conventions retrieved into each design prompt; and the data-quality check
-  descriptions and known fixes retrieved for the repair agent.
+  candidates are found by meaning as well as spelling; approved designs from earlier projects
+  retrieved as examples for the design stage; and the data-quality check descriptions and known
+  fixes retrieved for the repair agent.
 
 Retrieved text lengthens prompts, and on a CPU prompt processing is the slow part, so each
 addition is measured against the demo and the HDSS test set before it is enabled by default.

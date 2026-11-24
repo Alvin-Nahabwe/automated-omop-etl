@@ -56,6 +56,8 @@ services:
       OMOP_AGENT_LLM_URL: ${OMOP_AGENT_LLM_URL:-http://llm:8080/v1}
       OMOP_AGENT_LLM_MODEL: ${LLM_MODEL_NAME:-gpt-oss-120b}
       OMOP_AGENT_LLM_API_KEY: ${OMOP_AGENT_LLM_API_KEY:-}
+      # Projects created with `init` share this memory of reviewed mappings.
+      OMOP_AGENT_MAPPING_MEMORY: /srv/data/mapping_memory.sqlite
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ATHENA_DOWNLOAD_URL: ${ATHENA_DOWNLOAD_URL:-}
       OMOP_AGENT_WEB_SECRET: ${OMOP_AGENT_WEB_SECRET:-}
