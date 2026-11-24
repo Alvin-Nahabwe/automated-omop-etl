@@ -55,7 +55,7 @@ def _pipeline(config: Path, mode: str = "stage"):
     * ``recorded`` (``run --recorded-approvals``): pass only with a recorded approval;
     * ``skip`` (``run --yes``, ``demo``): do not stop (and say so in the audit log and report);
     * ``stage`` (single stage commands): the design and mapping gates are not checked (the stage is
-      an explicit action and its output is reviewed afterwards), but data goes to Claude only after
+      an explicit action and its output is reviewed afterwards), but data goes to the model only after
       a recorded privacy review.
     """
     import getpass
@@ -160,9 +160,13 @@ vocabulary:
   athena_dir: {q(athena_dir)}
 
 llm:
-  provider: anthropic          # anthropic | replay | none
-  model: claude-opus-5-5
-  effort: high
+  # A self-hosted open-weight model behind an OpenAI-compatible server (see docs/local-llm.md):
+  # llama.cpp's llama-server (default URL below), Ollama (http://127.0.0.1:11434/v1) or vLLM.
+  provider: openai_compatible  # openai_compatible | anthropic | replay | none
+  base_url: ${{OMOP_AGENT_LLM_URL:-http://127.0.0.1:8080/v1}}
+  model: ${{OMOP_AGENT_LLM_MODEL:-gpt-oss-120b}}   # the name the server knows the model by
+  # reasoning_effort: high     # gpt-oss: low | medium | high
+  # timeout_seconds: 3600      # CPU inference is slow; one call may take minutes
   # record_dir: ./recordings   # save live answers for offline replay
 
 privacy:
@@ -403,7 +407,7 @@ def status(config: Path = ConfigOpt) -> None:
     gates = Table("review gate", "state", "approved by", "at")
     for stage in GATES:
         if stage == "privacy" and not sends_to_llm(cfg):
-            gates.add_row(stage, "not needed (no data sent to Claude)", "", "")
+            gates.add_row(stage, "not needed (prompts stay on your servers)", "", "")
             continue
         g = gate_state(ws, stage)
         a = g.approval
@@ -414,13 +418,13 @@ def status(config: Path = ConfigOpt) -> None:
 @app.command()
 def approve(
     stage: str = typer.Argument(
-        ..., help="privacy (what is sent to Claude), design (the ETL spec) or vocab_map (the code mappings)."
+        ..., help="privacy (what is sent to the model), design (the ETL spec) or vocab_map (the code mappings)."
     ),
     by: str = typer.Option(..., "--by", help="Reviewer's name, recorded with the approval."),
     note: str = typer.Option("", help="Optional comment kept with the approval."),
     config: Path = ConfigOpt,
 ) -> None:
-    """Record that a reviewer approved what will be sent to Claude, the ETL spec or the code mappings.
+    """Record that a reviewer approved what will be sent to the model, the ETL spec or the code mappings.
 
     Check the artifact first: work/privacy_review.md, work/etl_spec.md, or work/mappings/*.csv.
     `omop-agent run --recorded-approvals` (and runs started from the web app) continue past a
@@ -436,7 +440,7 @@ def approve(
     ws = Workspace(cfg.workdir)
     if stage == "privacy":
         if not sends_to_llm(cfg):
-            console.print(f"Not needed: this project does not send data to Claude (llm.provider: {cfg.llm.provider}).")
+            console.print(f"Not needed: this project's prompts do not leave your own servers (llm.provider: {cfg.llm.provider}).")
             return
         if refresh(cfg, ws) is not None:
             console.print(f"Approving {ws.root / REVIEW_MD} as it is now (rebuilt from the current profile and settings).")
@@ -452,7 +456,9 @@ def approve(
 def demo(
     directory: Path = typer.Argument(Path("omop-demo"), help="Where to create the demo project."),
     db_url: str = typer.Option(..., "--db-url", envvar="OMOP_AGENT_DB_URL", help="PostgreSQL URL (schemas demo_* are created)."),
-    provider: str = typer.Option("replay", help="replay (offline, recorded answers) or anthropic (live Claude)."),
+    provider: str = typer.Option("replay", help="replay (offline, recorded answers), openai_compatible (a local model server, see --llm-url) or anthropic (Claude API)."),
+    llm_url: str = typer.Option("http://127.0.0.1:8080/v1", "--llm-url", help="openai_compatible: the model server's URL."),
+    llm_model: str = typer.Option("gpt-oss-120b", "--llm-model", help="openai_compatible: the served model's name."),
     people: int = typer.Option(1500, help="Synthetic population size."),
     schema_prefix: str = typer.Option("demo", help="Schemas are named <prefix>_cdm, <prefix>_vocab, ..."),
     run_pipeline: bool = typer.Option(True, "--run/--no-run", help="Run the pipeline after creating the project."),
@@ -460,7 +466,10 @@ def demo(
     """Create and run a demo on synthetic HDSS + clinic data with a synthetic vocabulary."""
     from .demo import create_demo_project
 
-    cfg_path = create_demo_project(directory, db_url, provider=provider, n_people=people, schema_prefix=schema_prefix)
+    cfg_path = create_demo_project(
+        directory, db_url, provider=provider, n_people=people, schema_prefix=schema_prefix,
+        llm_url=llm_url, llm_model=llm_model,
+    )
     console.print(f"Demo project written to {directory} (config {cfg_path})")
     if run_pipeline:
         p = _pipeline(cfg_path, "skip")
@@ -597,6 +606,27 @@ def users_disable(name: str, data_dir: Path = DataDirOpt) -> None:
 def users_enable(name: str, data_dir: Path = DataDirOpt) -> None:
     """Re-enable a disabled account."""
     _user_change(_users(data_dir).set_active, name, True)
+
+
+@app.command("llm-check")
+def llm_check(
+    config: Path = ConfigOpt,
+    schemas: bool = typer.Option(True, "--schemas/--no-schemas", help="Check that the server accepts every answer schema."),
+) -> None:
+    """Check that the configured model answers as the pipeline needs (synthetic prompts, no project data)."""
+    from .llm import make_llm
+    from .llm.check import run_checks
+
+    cfg = load_config(config)
+    llm = make_llm(cfg.llm)
+    where = f" at {cfg.llm.base_url}" if cfg.llm.provider == "openai_compatible" else ""
+    console.print(f"Checking {cfg.llm.provider} / {llm.model}{where} (CPU models can take minutes per answer) ...")
+    report = run_checks(llm, schemas=schemas)
+    table = Table("check", "result", "seconds", "detail")
+    for c in report.checks:
+        table.add_row(c.name, "[green]ok[/]" if c.ok else "[red]failed[/]", f"{c.seconds:.1f}", c.detail)
+    console.print(table)
+    raise typer.Exit(0 if report.ok else 1)
 
 
 @app.command("show-spec")

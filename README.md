@@ -5,19 +5,23 @@ exports or a relational database) into the **OMOP Common Data Model v5.4** on Po
 
 It follows the same steps a data team takes by hand with White Rabbit, Rabbit-in-a-Hat,
 Athena, Usagi, R/SQL, Achilles and the Data Quality Dashboard. Each step is either automated
-in code or drafted by Claude and then checked in code. The agent stops for human review where
+in code or drafted by an LLM and then checked in code. The agent stops for human review where
 judgement matters, and it keeps fixing its own ETL until the data-quality gate passes.
+
+The LLM is a **self-hosted open-weight model** by default (gpt-oss-120b on a CPU server, served
+by llama.cpp, Ollama or vLLM), so prompts never leave your infrastructure. Claude can be used
+instead. See [docs/local-llm.md](docs/local-llm.md).
 
 | OHDSI pipeline step | Tool you would use | What `omop-agent` does |
 |---|---|---|
-| Summarize the source data | White Rabbit | Stages the source into Postgres and profiles every column in SQL (types, date formats, null %, frequencies, ranges). Claude then interprets the scan: grain, person keys, coding systems, data issues. |
-| Create the ETL design | Rabbit-in-a-Hat | Claude drafts a table/field-level `etl_spec.yaml`, which code validates against the CDM spec, the source profile and the vocabulary, and `EXPLAIN`s. **You review it.** |
+| Summarize the source data | White Rabbit | Stages the source into Postgres and profiles every column in SQL (types, date formats, null %, frequencies, ranges). The LLM then interprets the scan: grain, person keys, coding systems, data issues. |
+| Create the ETL design | Rabbit-in-a-Hat | The LLM drafts a table/field-level `etl_spec.yaml`, which code validates against the CDM spec, the source profile and the vocabulary, and `EXPLAIN`s. **You review it.** |
 | Download vocabulary | Athena | Loads your Athena download (COPY with indexes and trigram search). |
 | Evaluate vocabulary | manual | Checks that the required vocabularies are present and measures code coverage (e.g. what % of ICD-10 records reach a standard concept). |
-| Map source codes | Usagi | Lexical and trigram candidate search, then Claude picks the best standard concept (only from real candidates) with a confidence score, re-searching after expanding abbreviations. Output is Usagi-style CSVs. **You review them.** |
+| Map source codes | Usagi | Lexical and trigram candidate search, then the LLM picks the best standard concept (only from real candidates) with a confidence score, re-searching after expanding abbreviations. Output is Usagi-style CSVs. **You review them.** |
 | Implement the ETL | R + PostgreSQL | Compiles the spec into plain, readable SQL (`sql/*.sql`) and loads the CDM, with the OHDSI conventions built in: one row per person and visit, merged observation periods, records in the table of their domain, condition and drug eras. |
 | Perform quality assessment | Achilles, DQD | Runs the DQD field and table checks in Postgres using DQD's own thresholds and severities. Optionally runs the official R Achilles + DQD too. |
-| Pass? No → fix | you | A **repair agent** (Claude with tools) diagnoses failing checks or SQL errors, inspects aggregates, and patches the spec. The CDM is rebuilt and re-checked. |
+| Pass? No → fix | you | A **repair agent** (the LLM with tools) diagnoses failing checks or SQL errors, inspects aggregates, and patches the spec. The CDM is rebuilt and re-checked. |
 | Inspection report | manual | `report.html` / `report.md`: verdict, mapping coverage, DQ results, the repairs made, CDM characterization, open questions. |
 | Analysis | R, ATLAS | The CDM is ready for ATLAS/HADES; the report lists the registration steps. |
 
@@ -42,8 +46,10 @@ but with convention-level failures from these two bugs, which the repair agent f
 iteration: the build ends those visits on their start date (the CDM convention) and reports it as
 `etlDefaultedValue`, and the agent writes that fallback into the spec; then the ICD-10 codes
 fail `standardConceptRecordCompleteness`, and the agent fixes the code normalisation. The final
-report has fewer failed checks. To run the same demo against Claude live, use
-`--provider anthropic` (it needs an API key, see below).
+report has fewer failed checks. To run the same demo against a live model, use
+`--provider openai_compatible --llm-url http://127.0.0.1:8080/v1 --llm-model gpt-oss-120b` (a
+local model server, see [docs/local-llm.md](docs/local-llm.md)) or `--provider anthropic` (Claude;
+it needs an API key).
 
 ## The review web app and the Docker bundle
 
@@ -51,9 +57,9 @@ For a team, install the bundle in `deploy/` on the server that holds the data: P
 and a small web app, started with one `docker compose up`. Reviewers then work in a browser
 instead of editing YAML and CSV files:
 
-* **ETL design**: read Claude's draft table by table, see what changed since it was last
+* **ETL design**: read the LLM's draft table by table, see what changed since it was last
   approved (including changes made by the repair agent), and approve it.
-* **Code mappings**: each local code with how often it occurs, Claude's proposed concept and
+* **Code mappings**: each local code with how often it occurs, the LLM's proposed concept and
   reasoning, and the other candidates. Search the vocabulary, pick a concept, approve, flag for
   discussion or reject, with a note. Then approve the mappings as a whole.
 * **Runs**: an operator starts the pipeline in the background and watches its log. A run
@@ -70,9 +76,10 @@ Without Docker: `pip install -e ".[web]"` and `omop-agent serve --projects DIR`.
 
 ```bash
 pip install -e .
-export ANTHROPIC_API_KEY=...          # or CLAUDE_API_KEY
+# a local model server, e.g. llama.cpp:  llama-server -m gpt-oss-120b-MXFP4.gguf --jinja -c 32768
 omop-agent init my-project --source ./exports --db-url 'postgresql://${PGUSER}:${PGPASSWORD}@db:5432/omop' --athena-dir ./athena
 cd my-project
+omop-agent llm-check                  # is the model server ready? (synthetic prompts only)
 omop-agent run                        # stops for review after the design and after the mapping
 ```
 
@@ -83,10 +90,10 @@ over. You can also run the stages one at a time:
 
 ```text
 omop-agent profile          # stage source -> src.*, write profile.md (scan report)
-omop-agent annotate         # Claude interprets the profile -> annotations.json
+omop-agent annotate         # the LLM interprets the profile -> annotations.json
 omop-agent vocab-download   # fetch + unpack the bundle from the link in $ATHENA_DOWNLOAD_URL
 omop-agent vocab-load       # load Athena CSVs
-omop-agent design           # Claude drafts etl_spec.yaml / etl_spec.md   <- review & edit
+omop-agent design           # the LLM drafts etl_spec.yaml / etl_spec.md   <- review & edit
 omop-agent map              # evaluate vocabulary + map codes -> mappings/*.csv  <- review & edit
 omop-agent apply-mappings   # load your CSV edits into source_to_concept_map
 omop-agent build            # compile + load + DQ checks + repair loop
@@ -129,7 +136,11 @@ example WHO `ICD10` when only `ICD10CM` was selected).
   tables, `results`); `etl_role` is an optional least-privilege role for the build (see "Privacy
   and safety").
 * `vocabulary.athena_dir`: an unzipped Athena download.
-* `llm`: `provider` (`anthropic` | `replay` | `none`), `model` (default `claude-opus-5-5`), `effort`, `record_dir`/`replay_dir`.
+* `llm`: `provider` (`openai_compatible` (default) | `anthropic` | `replay` | `none`), `model`,
+  `base_url` (default `http://127.0.0.1:8080/v1`, llama-server), `reasoning_effort`,
+  `timeout_seconds`, `structured_retries`, `on_premises`, `record_dir`/`replay_dir`. With
+  `anthropic`: `model` (default `claude-opus-5-5`) and `effort`. See
+  [docs/local-llm.md](docs/local-llm.md).
 * `privacy`: `min_cell_count` (default 5), `send_values_to_llm`, extra `pii_columns`.
 * `mapping.auto_approve_confidence`, `quality.max_repair_iterations`, `quality.blocking_severities`, `quality.use_r_dqd`.
 * `cdm_source`: the `cdm_source` row; `source_release_date` is the date of the data extract.
@@ -199,7 +210,7 @@ still checked, and the report names the step and what the CDM lacks because of i
 
 Health data is sensitive, so these rules are enforced in code rather than left to prompts:
 
-* **No patient rows reach the LLM.** Claude sees table and column names, types, counts and
+* **No patient rows reach the LLM.** It sees table and column names, types, counts and
   frequent values. Ranges are coarsened: dates to years, continuous numbers to two
   significant figures. Code-like ranges whose end is a rare value are withheld.
 * **Small-cell suppression.** A value seen fewer than `min_cell_count` times is never shown to
@@ -210,18 +221,21 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   questions), staff names, phone numbers, e-mail, national, health and register numbers (CCC,
   UPI, Huduma, OPD/IP numbers), addresses (plot and house numbers), GPS (including ODK
   geopoints) and free text (narratives, comments, "other, specify"). Value rules catch e-mail
-  addresses, Kenyan and international phone numbers, coordinates and free text. Columns Claude
+  addresses, Kenyan and international phone numbers, coordinates and free text. Columns the LLM
   itself labels as identifiers or free text are withheld from then on. Values of patient and
   parent keys are never listed, nor are those of household, visit and other record keys with
   more than 50 distinct values. Withheld columns can't be used in the ETL spec or sent for
   mapping; the validator rejects them. List extra identifier columns in `privacy.pii_columns`,
   and columns flagged by mistake (a CD4 count) in `privacy.not_pii_columns` (their values are
   collected the next time the source is profiled).
-* **A person checks what will be sent before Claude is first called.** Detection is
-  heuristic, so a project that uses Claude stops for a *privacy review*: the withheld columns
-  and the profile exactly as Claude will see it (`work/privacy_review.md`, or the Privacy tab of
-  the web app). Nothing goes to Claude until a reviewer approves it, and a re-staged source or a
-  changed privacy setting needs a new approval.
+* **Prompts stay on your servers by default.** With a self-hosted model on this machine or a
+  private network address, nothing leaves your infrastructure.
+* **A person checks what will be sent before an external model is first called.** Detection is
+  heuristic, so a project whose prompts leave your servers (Claude, or a model server at a
+  public address not marked `llm.on_premises: true`) stops for a *privacy review*: the withheld
+  columns and the profile exactly as the model will see it (`work/privacy_review.md`, or the
+  Privacy tab of the web app). Nothing is sent until a reviewer approves it, and a re-staged
+  source or a changed privacy setting needs a new approval.
 * **The repair agent can only count.** It can't write SQL to read data. Its `count_records`
   tool takes a table, up to three grouping columns and typed filters, and the tool builds the
   query itself with bound parameters. It returns `COUNT(*)` per group, withholds groups below
@@ -245,7 +259,7 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   role automatically. The role also needs EXECUTE on the helper functions the build installs in
   the ETL schema (PUBLIC has it by default). A new version of those functions is installed by
   the first build that runs as their owner.
-* **Nothing Claude produces is trusted blindly.** Concept ids must exist in your vocabulary
+* **Nothing the LLM produces is trusted blindly.** Concept ids must exist in your vocabulary
   as valid standard concepts in the right domain (for the main concept of a condition,
   procedure, drug, device or measurement code list also another domain the table accepts, whose
   records the build moves to their own table; such a choice is never approved automatically).
@@ -286,15 +300,30 @@ Health data is sensitive, so these rules are enforced in code rather than left t
   record values they can quote. Some of its tables show counts below `min_cell_count` as `<k`,
   but totals, differences and the data-quality counts are exact, so a small count can often be
   worked out from them.
-* `privacy.send_values_to_llm: false` goes further. Claude then sees statistics only, code
+* `privacy.send_values_to_llm: false` goes further. The LLM then sees statistics only, code
   mapping is lexical only, and the repair agent can only group by concept ids.
 
 `provider: none` runs every deterministic stage (staging, profiling, lexical mapping, build,
 checks, report) with no LLM at all. In that mode you write `etl_spec.yaml` yourself.
 
-## How Claude is used
+## How the LLM is used
 
-The agent calls Claude through the official `anthropic` Python SDK (`omop_agent/llm/`):
+Every stage asks the model for one of two things (`omop_agent/llm/base.py`): an answer that must
+validate against a pydantic model, or a tool-using loop over functions the agent controls.
+
+With a **self-hosted open-weight model** (`provider: openai_compatible`,
+`omop_agent/llm/openai_compatible.py`):
+
+* **Constrained decoding**: each answer's JSON Schema is sent as `response_format`, so the
+  server (llama.cpp, Ollama, vLLM, SGLang) can only produce JSON of that shape.
+* **Validate and retry**: an answer that still fails validation goes back to the model with the
+  errors (`llm.structured_retries`, default 2).
+* **Tool use**: the repair agent's loop runs in omop-agent, so every tool call is validated the
+  same way whichever model proposes it.
+* `omop-agent llm-check` tests a server before use: every schema, a code-mapping task with known
+  answers, and a tool call round trip.
+
+With **Claude** (`provider: anthropic`), through the official `anthropic` Python SDK:
 
 * **Structured outputs**: annotation, design and mapping answers are parsed straight into
   pydantic models (`client.beta.messages.stream(..., output_format=Model)`).
@@ -330,6 +359,14 @@ measures the build on synthetic sources of a million people and a full Athena vo
 "Measured performance" in `docs/architecture.md`).
 
 ## Upgrading
+
+**The default LLM is now a self-hosted open-weight model.** `llm.provider` defaults to
+`openai_compatible` (a model server at `http://127.0.0.1:8080/v1`, model `gpt-oss-120b`). A
+project whose `omop_agent.yaml` names no provider used Claude before and uses the local server
+now: add `provider: anthropic` to keep Claude, or start a model server (see
+[docs/local-llm.md](docs/local-llm.md)) and run `omop-agent llm-check`. Projects that name
+`anthropic`, `replay` or `none` are unchanged. With a local server the privacy review gate is no
+longer required, since nothing leaves your infrastructure.
 
 Updating to the version with the conventions above ("What the build does beyond the mappings")
 changes the CDM that an unchanged spec builds. The first build of a project after the update says

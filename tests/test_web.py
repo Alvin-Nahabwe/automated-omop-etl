@@ -758,7 +758,7 @@ def test_privacy_review_page(site):
         ])]))
     page = client.get("/p/demo/privacy").text
     assert "deceased_name" in page and "a person&#39;s name" in page and "Malaria" in page
-    assert "Check what is sent to Claude" in client.get("/p/demo").text
+    assert "Check what is sent to the model" in client.get("/p/demo").text
     digest = re.search(r'name="expected_digest" value="([^"]+)"', page).group(1)
     client.post("/p/demo/privacy/approve", data={"csrf_token": _csrf(client, "/p/demo/privacy"),
                                                   "expected_digest": digest, "note": "checked the VA columns"})

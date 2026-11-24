@@ -185,7 +185,7 @@ def test_cli_init(tmp_path, monkeypatch):
     cfg = load_config(tmp_path / "omop_agent.yaml")
     assert cfg.name == "APHRC: Nairobi HDSS" and cfg.source.type == "csv"
     assert cfg.target.url == "postgresql://postgres:@localhost:5432/omop"
-    assert cfg.llm.model == "claude-opus-5-5" and cfg.privacy.min_cell_count == 5
+    assert cfg.llm.model == "gpt-oss-120b" and cfg.llm.base_url == "http://127.0.0.1:8080/v1" and cfg.privacy.min_cell_count == 5
     assert (cfg.etl.timezone, cfg.etl.partial_dates, cfg.source.na_values) == (None, "widest", None)
     # the commented settings work once uncommented
     text = (tmp_path / "omop_agent.yaml").read_text()

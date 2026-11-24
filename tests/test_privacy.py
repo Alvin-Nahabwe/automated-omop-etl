@@ -11,6 +11,7 @@ from omop_agent.config import PrivacyConfig, ProjectConfig
 from omop_agent.models import ColumnAnnotation, ColumnProfile, SourceAnnotations, SourceProfile, TableProfile, ValueFreq
 from omop_agent.pipeline import Pipeline, PipelineStopped
 from omop_agent.privacy import apply_overrides, detect_pii, llm_view
+from omop_agent.config import LLMConfig
 from omop_agent.privacy_review import REVIEW_MD, build_review, refresh, review_path
 from omop_agent.workspace import Workspace, utcnow
 
@@ -198,6 +199,30 @@ def test_no_privacy_review_without_claude(tmp_path):
         ws.save_json(ws.profile_json, _profile())
         assert refresh(cfg, ws) is None
         Pipeline(cfg, approver=recorded_approver(ws), log=lambda m: None)._privacy_gate()  # does not stop
+
+
+def test_privacy_review_follows_where_the_model_runs(tmp_path):
+    from omop_agent.privacy_review import sends_to_llm
+
+    def cfg(**llm):
+        return _project(tmp_path, provider="openai_compatible").model_copy(
+            update={"llm": LLMConfig(provider="openai_compatible", **llm)}
+        )
+
+    # a model on this machine or the institution's private network: prompts stay on site
+    for url in ("http://127.0.0.1:8080/v1", "http://localhost:11434/v1", "http://10.20.0.5:8000/v1",
+                "http://192.168.1.40/v1", "http://llm.internal/v1", "http://[::1]:8080/v1", "http://llm:8080/v1"):
+        assert not sends_to_llm(cfg(base_url=url)), url
+    assert not sends_to_llm(cfg())  # the default URL is local
+    # a public address needs the review unless it is declared on premises
+    assert sends_to_llm(cfg(base_url="https://llm.example.org/v1"))
+    assert not sends_to_llm(cfg(base_url="https://llm.example.org/v1", on_premises=True))
+    assert sends_to_llm(cfg(base_url="http://127.0.0.1:8080/v1", on_premises=False))
+    ws = Workspace(tmp_path / "work")
+    ws.save_json(ws.profile_json, _profile())
+    local = cfg()
+    assert refresh(local, ws) is None
+    Pipeline(local, approver=recorded_approver(ws), log=lambda m: None)._privacy_gate()  # does not stop
 
 
 def test_stage_commands_need_a_recorded_privacy_review(tmp_path):

@@ -382,7 +382,7 @@ def _relative(v: Any, root: Path) -> Any:
 
 def _timeline(stages: dict[str, dict[str, Any]], audit: list[dict[str, Any]], root: Path) -> dict[str, Any]:
     known = PIPELINE_STAGES + [s for s in STAGES if s not in PIPELINE_STAGES]
-    if "privacy" in stages:  # only projects that send data to Claude have this review step
+    if "privacy" in stages:  # only projects whose prompts leave your servers have this review step
         known.insert(known.index("profile") + 1, "privacy")
     extra = sorted((s for s in stages if s not in known), key=lambda s: str(stages[s].get("at", "")))
     rows = []
@@ -442,7 +442,7 @@ def _reviews(
     caveats: list[str] = []
     for stage, label in GATES.items():
         if stage == "privacy" and not sends:
-            rows.append({"gate": label, "state": "not needed", "by": "", "at": "", "note": "no data is sent to Claude",
+            rows.append({"gate": label, "state": "not needed", "by": "", "at": "", "note": "prompts do not leave your own servers",
                          "last_pass": ""})
             continue
         g = gate_state(ws, stage)
@@ -458,7 +458,7 @@ def _reviews(
         if not g.ready or g.current:
             continue
         if stage == "privacy":
-            caveats.append("data was sent to Claude without an approved privacy review of the current profile")
+            caveats.append("data was sent to the model without an approved privacy review of the current profile")
         elif stage == "design":
             why = f": {len(applied)} automatic repair(s) changed it after review" if g.approval and applied else ""
             caveats.append(f"the ETL design this CDM was built from is {g.label}{why}")

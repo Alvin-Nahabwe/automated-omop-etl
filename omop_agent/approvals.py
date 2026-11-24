@@ -1,6 +1,6 @@
 """Recorded reviewer approvals for the pipeline's review gates.
 
-A reviewer approves what a gate shows: what will be sent to Claude (``privacy``, see
+A reviewer approves what a gate shows: what will be sent to the model (``privacy``, see
 privacy_review.py), the ETL design (``design``) or the code mappings (``vocab_map``), in the web
 app, at the terminal during ``omop-agent run``, or with ``omop-agent approve``. The approval is stored in
 ``<workdir>/approvals.json`` together with a digest of what was approved, and a copy of it is
@@ -35,7 +35,7 @@ GATES = {
 }
 # The same, for use inside a sentence.
 GATE_PHRASES = {
-    "privacy": "data that will be sent to Claude",
+    "privacy": "data that will be sent to the model",
     "design": "ETL design",
     "vocab_map": "code mappings",
 }

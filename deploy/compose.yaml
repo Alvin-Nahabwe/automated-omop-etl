@@ -7,8 +7,9 @@
 #   docker compose run --rm app users add YOUR-NAME --role operator
 #
 # Then open http://127.0.0.1:8000 on the server (or through your HTTPS reverse proxy).
-# Full instructions: docs/deploy.md. Patient data never leaves this server; only aggregates
-# go to the Claude API, and only when a project's llm.provider is "anthropic".
+# Full instructions: docs/deploy.md. Patient data never leaves this server. The LLM runs here too
+# (the optional "llm" service, a llama.cpp server: docker compose --profile llm up -d); only a
+# project with llm.provider "anthropic" sends aggregates to the Claude API.
 name: omop-agent
 
 services:
@@ -51,6 +52,10 @@ services:
     user: "${OMOP_AGENT_UID:-10001}:${OMOP_AGENT_GID:-10001}"
     environment:
       OMOP_AGENT_DB_URL: postgresql://omop:${OMOP_DB_PASSWORD}@db:5432/omop
+      # Projects created with `init` use these for llm.base_url and llm.model.
+      OMOP_AGENT_LLM_URL: ${OMOP_AGENT_LLM_URL:-http://llm:8080/v1}
+      OMOP_AGENT_LLM_MODEL: ${LLM_MODEL_NAME:-gpt-oss-120b}
+      OMOP_AGENT_LLM_API_KEY: ${OMOP_AGENT_LLM_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ATHENA_DOWNLOAD_URL: ${ATHENA_DOWNLOAD_URL:-}
       OMOP_AGENT_WEB_SECRET: ${OMOP_AGENT_WEB_SECRET:-}
@@ -67,6 +72,37 @@ services:
       - ./source:/srv/source:ro   # source CSV exports (read-only)
     ports:
       - "${OMOP_AGENT_BIND:-127.0.0.1}:${OMOP_AGENT_PORT:-8000}:8000"
+
+  # The self-hosted open-weight model (llama.cpp's llama-server, CPU). Off unless started with
+  #   docker compose --profile llm up -d
+  # Put the GGUF weights in models/ (see docs/local-llm.md). Reachable only from the app
+  # container (no port is published), at http://llm:8080/v1.
+  llm:
+    image: ${LLAMA_CPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+    profiles: ["llm"]
+    restart: unless-stopped
+    volumes:
+      - ./models:/models:ro
+    command:
+      - -m
+      - /models/${LLM_MODEL_FILE:-gpt-oss-120b-MXFP4.gguf}
+      - --alias
+      - ${LLM_MODEL_NAME:-gpt-oss-120b}
+      - --jinja
+      - -c
+      - "${LLM_CONTEXT:-32768}"
+      - -np
+      - "1"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15m  # loading 60+ GB of weights from disk takes a while
+      retries: 5
 
 volumes:
   pgdata:

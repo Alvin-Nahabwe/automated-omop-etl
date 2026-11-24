@@ -91,7 +91,7 @@ class Pipeline:
         outcome = "stopped" if not ok else {"skip": "skipped", "stage": "not_checked"}.get(mode, "approved")
         self.ws.audit("review_gate", stage=stage, outcome=outcome, mode=mode, artifacts=paths)
         if outcome == "skipped" and stage == "privacy":
-            self.log("  ! privacy review skipped (--yes): data goes to Claude without a recorded review")
+            self.log("  ! privacy review skipped (--yes): data goes to the model without a recorded review")
         if not ok:
             self.ws.mark(stage, "awaiting_review")
             if mode == "recorded":
@@ -105,23 +105,23 @@ class Pipeline:
             raise PipelineStopped(f"Stopped for review at '{stage}'. Edit {', '.join(paths)} and re-run.", stage)
 
     def _privacy_gate(self) -> None:
-        """Before any step that sends source data to Claude: the privacy review must be approved."""
+        """Before any step that sends source data to the model: the privacy review must be approved."""
         from .privacy_review import REVIEW_MD, refresh, sends_to_llm
 
         if self._privacy_checked:
             return
         if not sends_to_llm(self.cfg):
             if self.ws.stage_status("privacy") == "awaiting_review":
-                self.ws.mark("privacy", "done", note="nothing is sent to Claude")
+                self.ws.mark("privacy", "done", note="prompts do not leave your own servers")
             return
         if not self.ws.profile_json.exists() or refresh(self.cfg, self.ws) is None:
             raise RuntimeError(
                 "Profile the source first (`omop-agent profile`): the privacy review is built from the "
-                "profile and must be approved before anything is sent to Claude."
+                "profile and must be approved before anything is sent to the model."
             )
         self._gate(
             "privacy",
-            "Check what will be sent to Claude: the withheld columns and the profile exactly as Claude will see it.",
+            "Check what will be sent to the model: the withheld columns and the profile exactly as the model will see it.",
             [str(self.ws.root / REVIEW_MD)],
         )
         if self.ws.stage_status("privacy") != "done":
@@ -164,7 +164,7 @@ class Pipeline:
     # ---- artifacts ---------------------------------------------------------------------
     def load_profile(self) -> SourceProfile:
         """The profile with the current privacy decisions applied (privacy.pii_columns /
-        not_pii_columns, and columns Claude labelled as identifiers or free text)."""
+        not_pii_columns, and columns the model labelled as identifiers or free text)."""
         from .privacy import apply_overrides
 
         profile = self.ws.load_json(self.ws.profile_json, SourceProfile)

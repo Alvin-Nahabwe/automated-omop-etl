@@ -133,7 +133,7 @@ class ColumnAnnotation(BaseModel):
         "vocabulary (e.g. 'ICD10', 'LOINC', 'RxNorm'), or 'local' for site-specific codes/labels.",
     )
     description: str = Field(..., description="One sentence on what the column holds.")
-    # Who labelled the column: Claude, or the rule-based fallback. Not part of the answer schema.
+    # Who labelled the column: the model, or the rule-based fallback. Not part of the answer schema.
     origin: SkipJsonSchema[Literal["llm", "rules"]] = "rules"
 
 

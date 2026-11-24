@@ -1,6 +1,6 @@
 """Interpret the source profile: what each table and column means (stage 1b).
 
-Claude reads the privacy-filtered scan report and describes each table (grain, patient key,
+The model reads the privacy-filtered scan report and describes each table (grain, patient key,
 candidate OMOP tables) and each column (semantic type, coding system). The answer is then
 checked against the profile: unknown tables/columns are dropped, PII flags from the profiler
 always win, and anything the model left out is filled in by the rule-based

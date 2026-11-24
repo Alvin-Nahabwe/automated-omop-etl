@@ -8,7 +8,7 @@ Recordings live at ``<replay_dir>/<stage>/<key>.json``::
 For agent recordings the tool calls are re-executed against the live tools, so their side
 effects (for example a repair to the ETL spec) really happen during the replay.
 
-Set ``llm.record_dir`` while running against Claude to capture recordings of a live run.
+Set ``llm.record_dir`` while running against the model to capture recordings of a live run.
 """
 
 from __future__ import annotations

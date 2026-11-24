@@ -206,7 +206,7 @@ def apply_overrides(
     """The profile with the project's current privacy decisions applied.
 
     The profiler's flags are taken when the source is profiled; this applies what may have changed
-    since: ``privacy.pii_columns`` and ``privacy.not_pii_columns``, and columns Claude labelled as
+    since: ``privacy.pii_columns`` and ``privacy.not_pii_columns``, and columns the model labelled as
     identifiers or free text when it interpreted the profile (those values are then withheld from
     every later prompt and can never be loaded into the CDM).
     """
@@ -215,10 +215,10 @@ def apply_overrides(
     labelled: dict[str, str] = {}
     if annotations is not None:
         for ca in annotations.columns:
-            # Only Claude's own labels: the rule-based fallback calls any long string free text.
+            # Only the model's own labels: the rule-based fallback calls any long string free text.
             if ca.origin == "llm" and ca.semantic_type in ("pii", "free_text"):
                 what = "an identifier" if ca.semantic_type == "pii" else "free text"
-                labelled[f"{ca.table}.{ca.column}".lower()] = f"labelled {what} when Claude interpreted the profile"
+                labelled[f"{ca.table}.{ca.column}".lower()] = f"labelled {what} when the model interpreted the profile"
     tables: list[TableProfile] = []
     for t in profile.tables:
         cols = []

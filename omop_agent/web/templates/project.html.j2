@@ -19,7 +19,7 @@
 <div class="grid">
   <section class="card">
     <h2>Review steps</h2>
-    <p><strong>Privacy review</strong><br>{% if sends_data %}{{ gate_line(gates.privacy) }}<br><a href="/p/{{ project.id }}/privacy">Check what is sent to Claude</a>{% else %}<span class="muted small">Not needed: this project does not send data to Claude.</span>{% endif %}</p>
+    <p><strong>Privacy review</strong><br>{% if sends_data %}{{ gate_line(gates.privacy) }}<br><a href="/p/{{ project.id }}/privacy">Check what is sent to the model</a>{% else %}<span class="muted small">Not needed: this project's prompts do not leave your own servers.</span>{% endif %}</p>
     <p><strong>ETL design</strong><br>{{ gate_line(gates.design) }}<br><a href="/p/{{ project.id }}/spec">Review the ETL design</a></p>
     <p><strong>Code mappings</strong><br>{{ gate_line(gates.vocab_map) }}<br>
       {% if counts %}<span class="small">{{ counts.review }} need review · {{ counts.unmapped }} without a concept · {{ counts.all }} in total</span><br>{% endif %}
@@ -47,7 +47,7 @@
           {% for kind, label in KIND_LABELS.items() if kind != 'continue' %}
           <label class="inline"><input type="radio" name="kind" value="{{ kind }}" {% if loop.first %}checked{% endif %}> {{ label }}</label>
           {% endfor %}
-          <p class="muted">Mapping again or redrafting replaces Claude's earlier proposals (reviewed mappings are kept only when continuing). Starting over re-reads the source data.</p>
+          <p class="muted">Mapping again or redrafting replaces the model's earlier proposals (reviewed mappings are kept only when continuing). Starting over re-reads the source data.</p>
           <label class="inline"><input type="checkbox" name="confirm" value="yes"> I understand</label>
           <button class="btn" type="submit">Start this run</button>
         </form>

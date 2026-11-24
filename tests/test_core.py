@@ -37,7 +37,7 @@ def test_load_config_resolves_paths(tmp_path, monkeypatch):
     assert cfg.target.url == "postgresql://x@y/z"
     assert cfg.source.path == (tmp_path / "data").resolve()
     assert cfg.workdir == (tmp_path / "work").resolve()
-    assert cfg.llm.model == "claude-opus-5-5"
+    assert (cfg.llm.provider, cfg.llm.model) == ("openai_compatible", "gpt-oss-120b")
 
 
 def test_config_etl_settings_and_release_date(tmp_path, monkeypatch):
@@ -151,7 +151,7 @@ def test_anthropic_structured_request_shape(tmp_path):
         usage=SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0, cache_creation_input_tokens=0),
     )
     calls: list[dict] = []
-    cfg = LLMConfig(record_dir=tmp_path / "rec")
+    cfg = LLMConfig(provider="anthropic", record_dir=tmp_path / "rec")
     llm = AnthropicLLM(cfg, Workspace(tmp_path / "w"), client=_fake_client(msg, calls))  # type: ignore[arg-type]
     out = llm.structured(stage="design", key="plan", system="sys", prompt="hello", output=Answer)
     assert out.value == 7
@@ -168,7 +168,7 @@ def test_anthropic_structured_request_shape(tmp_path):
 
 def test_anthropic_refusal_raises(tmp_path):
     msg = SimpleNamespace(stop_reason="refusal", parsed_output=None, stop_details=SimpleNamespace(category="bio"), usage=None)
-    llm = AnthropicLLM(LLMConfig(use_fallbacks=False), None, client=_fake_client(msg, []))  # type: ignore[arg-type]
+    llm = AnthropicLLM(LLMConfig(provider="anthropic", use_fallbacks=False), None, client=_fake_client(msg, []))  # type: ignore[arg-type]
     with pytest.raises(LLMError, match="declined"):
         llm.structured(stage="s", key="k", system="", prompt="", output=Answer)
 
@@ -176,7 +176,7 @@ def test_anthropic_refusal_raises(tmp_path):
 def test_api_key_env_fallback(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("CLAUDE_API_KEY", "sk-ant-test")
-    llm = AnthropicLLM(LLMConfig())
+    llm = AnthropicLLM(LLMConfig(provider="anthropic"))
     assert llm.client.api_key == "sk-ant-test"
 
 
@@ -243,7 +243,7 @@ def test_structured_validation_error_becomes_llm_error(tmp_path):
         exc = e
     client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(stream=lambda **kw: _Stream(exc))))
     ws = Workspace(tmp_path / "w")
-    llm = AnthropicLLM(LLMConfig(), ws, client=client)  # type: ignore[arg-type]
+    llm = AnthropicLLM(LLMConfig(provider="anthropic"), ws, client=client)  # type: ignore[arg-type]
     with pytest.raises(LLMError, match="did not validate"):
         llm.structured(stage="s", key="k", system="", prompt="p", output=Answer)
     assert ws.read_audit()[-1]["error"]  # the failed call is still logged
@@ -252,7 +252,7 @@ def test_structured_validation_error_becomes_llm_error(tmp_path):
 def test_missing_credentials_become_llm_unavailable():
     exc = TypeError('"Could not resolve authentication method. Expected either api_key or auth_token to be set."')
     client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(stream=lambda **kw: _Stream(exc))))
-    llm = AnthropicLLM(LLMConfig(), None, client=client)  # type: ignore[arg-type]
+    llm = AnthropicLLM(LLMConfig(provider="anthropic"), None, client=client)  # type: ignore[arg-type]
     with pytest.raises(LLMUnavailable, match="ANTHROPIC_API_KEY"):
         llm.structured(stage="s", key="k", system="", prompt="p", output=Answer)
 
@@ -278,7 +278,7 @@ def test_agent_sums_usage_reports_limit_and_explains_bad_tool_input(tmp_path):
 
     client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(tool_runner=tool_runner)))
     ws = Workspace(tmp_path / "w")
-    llm = AnthropicLLM(LLMConfig(agent_max_tokens=20000), ws, client=client)  # type: ignore[arg-type]
+    llm = AnthropicLLM(LLMConfig(provider="anthropic", agent_max_tokens=20000), ws, client=client)  # type: ignore[arg-type]
     tool = AgentTool("double", "double a value", Answer, lambda a: str(a.value * 2))
     res = llm.run_agent(stage="repair", key="iteration:1", system="s", prompt="p", tools=[tool], max_iterations=3)
     assert seen["max_tokens"] == 20000

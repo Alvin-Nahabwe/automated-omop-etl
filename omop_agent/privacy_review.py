@@ -1,16 +1,18 @@
-"""The privacy review: what this project will send to Claude, for a person to approve first.
+"""The privacy review: what this project will send to the model, for a person to approve first.
 
 Identifier detection is heuristic, so before the first live call a reviewer checks the profile as
-Claude will see it and the columns that are withheld, and approves it (the ``privacy`` review
+the model will see it and the columns that are withheld, and approves it (the ``privacy`` review
 gate, in the web app or with ``omop-agent approve privacy``). The review is written to
 ``<workdir>/privacy_review.json`` (what the approval's digest covers) and ``privacy_review.md``.
 It is rebuilt from the current profile and privacy settings whenever it is shown or checked, so a
-re-staged source or a changed setting needs a fresh approval. Columns that Claude later labels as
+re-staged source or a changed setting needs a fresh approval. Columns that the model later labels as
 identifiers or free text are withheld from then on; they are listed, but they only remove data
 from what was approved, so they don't need a new approval (``also_withheld`` is left out of the
 digest).
 
-Projects that do not call Claude (``llm.provider`` ``none`` or ``replay``) need no privacy review.
+Only projects whose prompts leave infrastructure you control need the review: ``llm.provider``
+``anthropic``, or ``openai_compatible`` with a model server elsewhere (see ``llm.on_premises``). A
+self-hosted model on your own server, ``replay`` and ``none`` need none.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ REVIEW_JSON = "privacy_review.json"
 REVIEW_MD = "privacy_review.md"
 
 LATER_SENDS = [
-    "The profile below (column statistics and frequent values), when Claude interprets the source, "
+    "The profile below (column statistics and frequent values), when the model interprets the source, "
     "drafts the ETL design and repairs it.",
     "Source codes and labels of the fields being mapped to concepts, each seen at least "
     "{k} times, with their counts and the units recorded with them.",
@@ -40,8 +42,17 @@ LATER_SENDS = [
 
 
 def sends_to_llm(cfg: ProjectConfig) -> bool:
-    """True when this project's settings send data to the Claude API."""
-    return cfg.llm.provider == "anthropic"
+    """True when this project's prompts leave infrastructure you control (an external LLM API)."""
+    if cfg.llm.provider == "anthropic":
+        return True
+    if cfg.llm.provider == "openai_compatible":
+        from .llm.openai_compatible import endpoint_is_private
+
+        on_premises = cfg.llm.on_premises
+        if on_premises is None:
+            on_premises = endpoint_is_private(cfg.llm.base_url)
+        return not on_premises
+    return False
 
 
 def review_path(ws: Workspace) -> Path:
@@ -49,7 +60,7 @@ def review_path(ws: Workspace) -> Path:
 
 
 def current_profile(cfg: ProjectConfig, ws: Workspace, with_labels: bool = True) -> SourceProfile | None:
-    """The profile with the current privacy settings (and, with ``with_labels``, Claude's
+    """The profile with the current privacy settings (and, with ``with_labels``, the model's
     identifier labels) applied."""
     if not ws.profile_json.exists():
         return None
@@ -105,7 +116,7 @@ def digest_payload(review: dict[str, Any]) -> dict[str, Any]:
 def render_md(review: dict[str, Any]) -> str:
     s = review["settings"]
     lines = [
-        "# Privacy review: what this project sends to Claude",
+        "# Privacy review: what this project sends to the language model",
         "",
         f"Provider `{review['provider']}`, model `{review['model']}`. Values seen fewer than "
         f"{s['min_cell_count']} times are never sent; values are sent: {'yes' if s['send_values_to_llm'] else 'no'}.",
@@ -122,7 +133,7 @@ def render_md(review: dict[str, Any]) -> str:
         "",
         *(
             [
-                f"Also withheld from later prompts ({len(review['also_withheld'])}), because Claude labelled them "
+                f"Also withheld from later prompts ({len(review['also_withheld'])}), because the model labelled them "
                 "as identifiers or free text: " + ", ".join(f"{w['table']}.{w['column']}" for w in review["also_withheld"]),
                 "",
             ]
@@ -133,7 +144,7 @@ def render_md(review: dict[str, Any]) -> str:
         "`privacy.pii_columns`. To release a column flagged by mistake, add it to `privacy.not_pii_columns`; "
         "its values were never collected, so they are sent only after the source is profiled again.",
         "",
-        "## The profile exactly as Claude will see it",
+        "## The profile exactly as the model will see it",
         "",
         "```text",
         review["profile_text"].rstrip(),
@@ -147,7 +158,7 @@ def render_md(review: dict[str, Any]) -> str:
 
 def refresh(cfg: ProjectConfig, ws: Workspace) -> Path | None:
     """Write the review files from the current profile and settings. Returns the JSON path, or None
-    when there is no profile yet (or when the project does not send data to Claude)."""
+    when there is no profile yet (or when the project does not send data to the model)."""
     path = review_path(ws)
     review = build_review(cfg, ws) if sends_to_llm(cfg) else None
     if review is None:

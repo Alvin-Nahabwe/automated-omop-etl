@@ -11,7 +11,7 @@ import os
 import re
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -107,22 +107,89 @@ class VocabularyConfig(_Base):
     athena_dir: Path | None = Field(None, description="Unzipped Athena download (CONCEPT.csv, ...).")
 
 
+LOCAL_DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"  # llama.cpp's llama-server
+LOCAL_DEFAULT_MODEL = "gpt-oss-120b"
+LLM_PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
+    "openai_compatible": {
+        "model": LOCAL_DEFAULT_MODEL,
+        "base_url": LOCAL_DEFAULT_BASE_URL,
+        "max_tokens": 16384,
+        "api_key_env": ["OMOP_AGENT_LLM_API_KEY"],
+    },
+    "anthropic": {
+        "model": "claude-opus-5-5",
+        "max_tokens": 64000,
+        "api_key_env": ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
+    },
+}
+
+
 class LLMConfig(_Base):
-    provider: Literal["anthropic", "replay", "none"] = "anthropic"
-    model: str = "claude-opus-5-5"
-    effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
-    max_tokens: int = 64000
-    use_fallbacks: bool = Field(True, description="Opt into server-side refusal fallbacks.")
+    provider: Literal["openai_compatible", "anthropic", "replay", "none"] = Field(
+        "openai_compatible",
+        description="openai_compatible: a self-hosted open-weight model behind an OpenAI-compatible "
+        "server (llama.cpp llama-server, Ollama, vLLM). anthropic: the Claude API. replay: recorded "
+        "answers. none: no model (deterministic fallbacks only).",
+    )
+    model: str = Field(
+        "",
+        description="The served model's name. Default: gpt-oss-120b (openai_compatible), claude-opus-5-5 (anthropic).",
+    )
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = Field("high", description="Claude only.")
+    reasoning_effort: Literal["low", "medium", "high"] | None = Field(
+        None,
+        description="openai_compatible: sent as reasoning_effort (gpt-oss and other reasoning models "
+        "read it). Unset: the server's default.",
+    )
+    temperature: float | None = Field(None, description="openai_compatible: sampling temperature (unset: the server's).")
+    max_tokens: int = Field(0, description="Longest answer. Default: 16384 (openai_compatible), 64000 (anthropic).")
+    use_fallbacks: bool = Field(True, description="Claude only: opt into server-side refusal fallbacks.")
     replay_dir: Path | None = Field(None, description="Recorded responses used when provider=replay.")
     record_dir: Path | None = Field(None, description="If set, every live response is saved here for replay.")
     max_agent_iterations: int = 25
     agent_max_tokens: int = Field(16000, description="max_tokens per turn of the repair agent (non-streaming).")
-    base_url: str | None = Field(None, description="Override the API endpoint (default: the SDK's).")
-    api_key_env: list[str] = Field(
-        default_factory=lambda: ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
-        description="Environment variables checked, in order, for the API key. If none is set the "
-        "SDK's own resolution applies (ANTHROPIC_AUTH_TOKEN, `ant auth login` profile).",
+    base_url: str | None = Field(
+        None,
+        description="The API endpoint. openai_compatible default: http://127.0.0.1:8080/v1 (llama-server); "
+        "Ollama serves http://127.0.0.1:11434/v1. anthropic default: the SDK's.",
     )
+    api_key_env: list[str] = Field(
+        default_factory=list,
+        description="Environment variables checked, in order, for the API key. Default: "
+        "OMOP_AGENT_LLM_API_KEY (openai_compatible; a local server usually needs none), "
+        "ANTHROPIC_API_KEY then CLAUDE_API_KEY (anthropic, after which the SDK's own resolution applies).",
+    )
+    timeout_seconds: float = Field(
+        3600, description="openai_compatible: how long one request may take (CPU inference is slow)."
+    )
+    structured_retries: int = Field(
+        2,
+        description="openai_compatible: how many times an answer that does not validate is sent back "
+        "to the model with the validation errors before the call fails.",
+    )
+    structured_output: Literal["json_schema", "json_object", "prompt"] = Field(
+        "json_schema",
+        description="openai_compatible: how answers are held to their schema. json_schema: the server "
+        "constrains decoding to the schema (llama.cpp, Ollama, vLLM, SGLang). json_object: any JSON, "
+        "schema in the prompt. prompt: the schema in the prompt only.",
+    )
+    on_premises: bool | None = Field(
+        None,
+        description="openai_compatible: true if the model server runs on infrastructure you control, so "
+        "prompts never leave it and no privacy review is required. Unset: true only for a loopback or "
+        "private-network address in base_url.",
+    )
+    extra_body: dict[str, Any] = Field(
+        default_factory=dict,
+        description="openai_compatible: extra fields added to every request (e.g. chat_template_kwargs, top_k).",
+    )
+
+    @model_validator(mode="after")
+    def _provider_defaults(self) -> "LLMConfig":
+        for name, value in LLM_PROVIDER_DEFAULTS.get(self.provider, {}).items():
+            if not getattr(self, name):
+                setattr(self, name, value)
+        return self
 
 
 class PrivacyConfig(_Base):

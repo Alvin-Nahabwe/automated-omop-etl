@@ -1,7 +1,7 @@
 """The review web app (FastAPI, server-rendered pages, no JavaScript needed).
 
 Screens: projects; a project's stages, review gates and runs; the ETL design with an approve
-button and a diff against the approved version; the code mappings, with Claude's reasoning,
+button and a diff against the approved version; the code mappings, with the model's reasoning,
 the candidates and a vocabulary search, and approve / flag / reject per term; run logs; the
 inspection report; the audit trail.
 

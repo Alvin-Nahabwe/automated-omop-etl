@@ -1,8 +1,10 @@
 # Installing omop-agent on a server (Docker)
 
 This sets up omop-agent on the server that holds the source data. Patient data stays on that
-server. When a project uses Claude (`llm.provider: anthropic`), only aggregates leave it (see
-"Privacy and safety" in the README).
+server, and so does the LLM: an open-weight model served by llama.cpp in a third container
+(see [local-llm.md](local-llm.md) for choosing the model). Only a project that uses Claude
+(`llm.provider: anthropic`) sends anything out, and then only aggregates (see "Privacy and
+safety" in the README).
 
 You get two containers, started together by `deploy/compose.yaml`:
 
@@ -38,10 +40,16 @@ It also uses four folders next to `compose.yaml`:
 ## Requirements
 
 * Linux with Docker Engine and Docker Compose v2.
-* About 4 CPU cores and 16 GB RAM. Disk: about 10 GB for a full vocabulary, plus your data.
-* Outbound HTTPS to `api.anthropic.com` only for projects that use Claude. Outbound HTTPS to
-  `athena.ohdsi.org` only if you download the vocabulary from the server; otherwise copy the
-  unpacked bundle into `athena/`.
+* For the app and the database: about 4 CPU cores and 16 GB RAM. Disk: about 10 GB for a full
+  vocabulary, plus your data.
+* For the model (the `llm` service): RAM for its weights plus about 20 %, and as many cores as
+  you can give it. gpt-oss-120b, the default, needs 96 GB or more of RAM and 65 GB of disk; a
+  smaller model fits less (see [local-llm.md](local-llm.md)). It can also run on a separate
+  server on your network.
+* Outbound HTTPS to `huggingface.co` (and its download hosts) once, to fetch the model
+  weights, or copy them in. Outbound HTTPS to `api.anthropic.com` only for projects that use
+  Claude. Outbound HTTPS to `athena.ohdsi.org` only if you download the vocabulary from the
+  server; otherwise copy the unpacked bundle into `athena/`.
 
 ## Install
 
@@ -56,7 +64,10 @@ Edit `.env`:
 
 * `POSTGRES_PASSWORD` and `OMOP_DB_PASSWORD`: two different passwords made of letters and
   digits, for example from `openssl rand -hex 24`.
-* `ANTHROPIC_API_KEY`: your Claude API key, if projects will use Claude.
+* `LLM_MODEL_FILE`, `LLM_MODEL_NAME`, `LLM_CONTEXT`: the model's GGUF file in `models/` (the first
+  part, for a model split into several files), the
+  name projects use for it, and its context length. The defaults are for gpt-oss-120b.
+* `ANTHROPIC_API_KEY`: your Claude API key, only if projects will use Claude.
 * `ATHENA_DOWNLOAD_URL`: the link Athena e-mails you, if you download the vocabulary here.
   Treat it like a password.
 * `OMOP_AGENT_WEB_SECRET`: optional. A key of at least 32 characters for signing sessions,
@@ -64,24 +75,41 @@ Edit `.env`:
 * `OMOP_AGENT_UID` and `OMOP_AGENT_GID`: the output of `id -u` and `id -g`. The app then writes
   files as you, and you can edit them.
 
+Download the model weights into `models/` (about 65 GB for gpt-oss-120b; any machine with
+Python and access to Hugging Face can do it, then copy the folder):
+
+```bash
+pip install -U huggingface_hub
+hf download ggml-org/gpt-oss-120b-GGUF gpt-oss-120b-MXFP4.gguf --local-dir models/
+```
+
 Then start it:
 
 ```bash
-mkdir -p projects data athena source
-docker compose up -d --build
-docker compose ps                                   # both should be "healthy"
+mkdir -p projects data athena source models
+docker compose --profile llm up -d --build
+docker compose ps                                   # all three should be "healthy"
 docker compose run --rm app users add YOUR-NAME --role operator --full-name "Your Name"
 ```
+
+Without `--profile llm` the model container is not started: use that when the model runs on
+another server (set `OMOP_AGENT_LLM_URL` in `.env`) or no project needs it.
 
 The app now listens on `http://127.0.0.1:8000` on the server. For other people to use it, put
 it behind HTTPS (next section).
 
-To try it first, create the demo project (synthetic data, recorded answers, no API key). Then
-sign in and press **Continue the pipeline** on its page:
+To try it first, create the demo project (synthetic data, recorded answers, no model needed).
+Then sign in and press **Continue the pipeline** on its page:
 
 ```bash
 docker compose run --rm app demo /srv/projects/demo --no-run
 ```
+
+To check the model, create a project (below) and run
+`docker compose run --rm app llm-check -c /srv/projects/<name>/omop_agent.yaml`, or run the demo
+against it: `docker compose run --rm app demo /srv/projects/demo-llm --provider openai_compatible
+--llm-url http://llm:8080/v1 --llm-model gpt-oss-120b --no-run`. On a CPU the demo's design and
+mapping take a while (see "Speed" in [local-llm.md](local-llm.md)).
 
 ## HTTPS
 
@@ -145,13 +173,13 @@ internal network or VPN.
      kept as written, and a design that reads times with `Z` or with several different offsets
      fails validation.
 4. In the browser, open the project and press **Continue the pipeline**. The first run
-   profiles the source and then stops for the **privacy review**, before anything is sent to
-   Claude. A reviewer opens the **Privacy** tab, checks the withheld columns and the profile
-   exactly as Claude will see it (look for names, phone numbers, local ID numbers, GPS or free
+   profiles the source. A project whose prompts leave the server (Claude) then stops for the
+   **privacy review**, before anything is sent. A reviewer opens the **Privacy** tab, checks the withheld columns and the profile
+   exactly as the model will see it (look for names, phone numbers, local ID numbers, GPS or free
    text among the listed values), fixes the settings if needed and approves it. A column added
    to `privacy.pii_columns` is withheld at once. One released with `privacy.not_pii_columns`
    only shows values after the source is profiled again (**Start over**).
-5. **Continue the pipeline** again: Claude interprets the profile, the vocabulary is loaded (a
+5. **Continue the pipeline** again: the model interprets the profile, the vocabulary is loaded (a
    few minutes for a full bundle) and the ETL design is drafted. The run then stops until a
    reviewer approves the design.
 6. A reviewer reads **ETL design** and approves it, or asks for changes. Changes are made by
@@ -168,8 +196,9 @@ spec page shows those changes as a diff.
 ## Data protection
 
 Before the first real project, agree the following with APHRC's data protection officer or
-ethics committee. Sending aggregates to the Claude API is a transfer of data derived from
-health records to a service outside Kenya, which the Data Protection Act expects to be covered.
+ethics committee. With the self-hosted model nothing leaves the server. Sending aggregates to
+the Claude API (`llm.provider: anthropic`) is a transfer of data derived from health records to a
+service outside Kenya, which the Data Protection Act expects to be covered.
 
 * **What leaves the server**, and only for projects with `llm.provider: anthropic`: column
   names and statistics, values seen at least `privacy.min_cell_count` times (5 by default),
@@ -178,8 +207,10 @@ health records to a service outside Kenya, which the Data Protection Act expects
   values of withheld columns. Every prompt and answer is kept in the project's
   `work/llm_calls/`. `privacy.send_values_to_llm: false` sends statistics only;
   `llm.provider: none` sends nothing (you then write the ETL design yourself).
-* **The privacy review** is the control point: a named reviewer approves what will be sent
-  before the first call, and again whenever the source or the settings change.
+* **The privacy review** is the control point for those projects: a named reviewer approves
+  what will be sent before the first call, and again whenever the source or the settings change.
+  Projects on the self-hosted model skip it, because nothing is sent; the same data-minimisation
+  rules still decide what the model sees, and every prompt is still kept in `work/llm_calls/`.
 * **What stays on the server**: the staged copy of the source (including identifier columns)
   in the `<project>_src` schema, the CDM, the work folders and the backups. Keep the server,
   the backups and `.env` under the same controls as the source data.

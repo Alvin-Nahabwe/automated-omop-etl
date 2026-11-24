@@ -7,7 +7,7 @@
 {%- endmacro %}
 {% block content %}
 <h1>Code mappings</h1>
-<p class="sub">Each local code, how often it occurs, and the standard concept Claude proposed (the Usagi step). Approve it, pick another concept, flag it for discussion, or reject it. Your name and note are saved with every change.</p>
+<p class="sub">Each local code, how often it occurs, and the standard concept the model proposed (the Usagi step). Approve it, pick another concept, flag it for discussion, or reject it. Your name and note are saved with every change.</p>
 
 {% if decisions is none %}
 <div class="card"><p class="muted">There are no mappings yet. A pipeline run maps the codes once the ETL design is approved.</p></div>
@@ -32,7 +32,7 @@
   {% endif %}
   {% if gate.ready and not gate.current and counts.review %}
     <p class="small">{{ counts.review }} mapping(s) still need review.
-    {% if include_unchecked %}If you approve now, unchecked mappings are used in the ETL as Claude proposed them; flagged ones are left out.
+    {% if include_unchecked %}If you approve now, unchecked mappings are used in the ETL as the model proposed them; flagged ones are left out.
     {% else %}Unchecked and flagged mappings are left out of the ETL until approved.{% endif %}</p>
   {% endif %}
   {{ approve_form('/p/' ~ project.id ~ '/mappings/approve', gate, csrf, 'code mappings', user) }}

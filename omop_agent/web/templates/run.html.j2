@@ -8,7 +8,7 @@
 <section class="card">
   <p>{{ badge(status) }} {{ job.message }}</p>
   {% if status == 'waiting_review' %}
-    <p>{% if job.stage == 'privacy' %}<a href="/p/{{ project.id }}/privacy">Check what will be sent to Claude</a>{% elif job.stage == 'design' %}<a href="/p/{{ project.id }}/spec">Review the ETL design</a>{% else %}<a href="/p/{{ project.id }}/mappings">Review the code mappings</a>{% endif %},
+    <p>{% if job.stage == 'privacy' %}<a href="/p/{{ project.id }}/privacy">Check what will be sent to the model</a>{% elif job.stage == 'design' %}<a href="/p/{{ project.id }}/spec">Review the ETL design</a>{% else %}<a href="/p/{{ project.id }}/mappings">Review the code mappings</a>{% endif %},
     then continue the pipeline from the <a href="/p/{{ project.id }}">project page</a>.</p>
   {% elif status in ('passed', 'failed_quality') %}
     <p><a href="/p/{{ project.id }}/report">Open the inspection report</a></p>

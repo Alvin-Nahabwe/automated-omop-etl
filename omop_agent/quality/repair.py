@@ -1,4 +1,4 @@
-"""The repair agent: Claude diagnoses failed ETL steps and data-quality checks and fixes the spec.
+"""The repair agent: the model diagnoses failed ETL steps and data-quality checks and fixes the spec.
 
 The agent never touches the data. It reads context through tools (the table mapping and its
 compiled SQL, the CDM table conventions, the privacy-filtered source profile), tests hypotheses

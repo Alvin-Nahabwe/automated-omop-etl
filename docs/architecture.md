@@ -3,21 +3,21 @@
 `omop-agent` automates the OHDSI ETL pipeline that data teams (for example at APHRC) run by
 hand with White Rabbit, Rabbit-in-a-Hat, Athena, Usagi, SQL/R, Achilles and the Data Quality
 Dashboard. The same stages remain, but each is either automated deterministically or drafted
-by Claude and checked by code. A human can review and edit every hand-off between stages.
+by an LLM (a self-hosted open-weight model by default, or Claude) and checked by code. A human can review and edit every hand-off between stages.
 
 ```mermaid
 flowchart LR
     SRC[(Source data<br/>CSV / database)] --> STAGE[Stage to Postgres<br/><i>text copy</i>]
     STAGE --> PROF[Profile<br/><i>White Rabbit</i>]
-    PROF -->|privacy review| ANN[Interpret profile<br/><b>Claude</b>]
+    PROF -->|privacy review| ANN[Interpret profile<br/><b>LLM</b>]
     ATH[Athena download] --> VLOAD[Load vocabulary]
-    ANN --> DES[Design ETL<br/><i>Rabbit-in-a-Hat</i><br/><b>Claude</b> + validator]
+    ANN --> DES[Design ETL<br/><i>Rabbit-in-a-Hat</i><br/><b>LLM</b> + validator]
     VLOAD --> DES
     DES -->|human review| VEVAL[Evaluate vocabulary<br/>coverage]
-    VEVAL --> MAP[Map source codes<br/><i>Usagi</i><br/>lexical search + <b>Claude</b> rerank]
+    VEVAL --> MAP[Map source codes<br/><i>Usagi</i><br/>lexical search + <b>LLM</b> rerank]
     MAP -->|human review| BUILD[Compile + run SQL<br/><i>R / PostgreSQL</i>]
     BUILD --> DQ[Quality checks<br/><i>DQD rules, Achilles-lite</i>]
-    DQ -->|fail| REP[Repair agent<br/><b>Claude</b> + tools]
+    DQ -->|fail| REP[Repair agent<br/><b>LLM</b> + tools]
     REP --> BUILD
     DQ -->|after repairs| RDQD[Official DQD + Achilles<br/><i>R, optional</i>]
     RDQD -->|pass| CDM[(OMOP CDM)]
@@ -27,7 +27,7 @@ flowchart LR
 
 ## Design principles
 
-1. **Claude drafts, code verifies.** Every LLM output is a pydantic model validated on
+1. **The LLM drafts, code verifies.** Every LLM output is a pydantic model validated on
    arrival. Concept ids are checked against the loaded vocabulary, since the model can only
    choose among candidates or ids that exist. Generated SQL is `EXPLAIN`ed before it runs.
    Data-quality results come from SQL, never from the model.
@@ -37,13 +37,13 @@ flowchart LR
    e-mail, ID numbers, addresses, GPS, free text), are withheld by construction
    (`omop_agent/privacy.py`). Detection uses column-name rules (including common local ones
    such as `nupi`, `ccc_no` and the WHO verbal-autopsy name fields) and value patterns; a
-   column Claude labels as an identifier or free text is withheld from then on. Before the
-   first call a reviewer approves the profile exactly as Claude will see it (the privacy
+   column the LLM labels as an identifier or free text is withheld from then on. Before the
+   first call a reviewer approves the profile exactly as the LLM will see it (the privacy
    review, `privacy_review.py`). The repair agent can
    only count records through a tool that builds the query itself, withholds small groups and
    refuses identifiers. Database errors are redacted before they reach the model. Every prompt
    and tool result is stored verbatim in `work/llm_calls/` for audit.
-3. **Human in the loop at the right places.** What is sent to Claude, the ETL spec
+3. **Human in the loop at the right places.** What is sent to the LLM, the ETL spec
    (`etl_spec.yaml`) and the vocabulary mappings (`mappings/*.csv`, Usagi-like columns) are
    each reviewed before the pipeline moves on, unless `--yes` is passed. Spec and mappings are
    plain files; edits are picked up on the next step.
@@ -678,7 +678,8 @@ threshold, so both retrievals run, and the first one adds about a tenth to their
 
 The pipeline stops three times for people:
 
-* **privacy**: before the first call to Claude (only when `llm.provider` is `anthropic`). The
+* **privacy**: before the first call to a model outside your infrastructure (`llm.provider:
+  anthropic`, or `openai_compatible` at a public address not marked `llm.on_premises`). The
   reviewer sees the withheld columns and the profile text exactly as it will be sent. The
   digest covers that text and the privacy and LLM settings, so a new source extract or a
   changed setting needs a new approval;

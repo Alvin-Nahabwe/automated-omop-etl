@@ -1,4 +1,4 @@
-"""Draft the ETL spec with Claude (the "Rabbit-in-a-Hat" stage), then check it with code.
+"""Draft the ETL spec with the model (the "Rabbit-in-a-Hat" stage), then check it with code.
 
 The design runs in two passes. A plan call decides which source tables feed which CDM tables,
 the person and visit keys, and the observation-period strategy. Then one call per planned table
@@ -504,8 +504,9 @@ Return the complete corrected table mapping. Keep the parts that were fine.
 
 def _need_llm(e: Exception) -> RuntimeError:
     return RuntimeError(
-        "Designing the ETL needs an LLM: set llm.provider to 'anthropic' (with an API key) or to "
-        "'replay' with recorded answers, or write etl_spec.yaml by hand and skip the design stage. "
+        "Designing the ETL needs an LLM: run a local model server and set llm.provider to "
+        "'openai_compatible' (llm.base_url), use 'anthropic' (with an API key) or 'replay' with recorded "
+        "answers, or write etl_spec.yaml by hand and skip the design stage. "
         f"({e})"
     )
 

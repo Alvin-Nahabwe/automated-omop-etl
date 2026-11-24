@@ -21,18 +21,26 @@ def create_demo_project(
     n_people: int = 1500,
     seed: int = 42,
     schema_prefix: str = "demo",
+    llm_url: str = "http://127.0.0.1:8080/v1",
+    llm_model: str = "gpt-oss-120b",
 ) -> Path:
     """Generate demo data and write ``omop_agent.yaml``. Returns the config path.
 
     The recorded answers in ``fixtures/replay`` were written for the default ``n_people`` and
-    ``seed``. With ``provider='anthropic'`` Claude is called live, and its answers are
-    recorded under ``recordings/``.
+    ``seed``. With ``provider='openai_compatible'`` (a local model server at ``llm_url``) or
+    ``provider='anthropic'`` (Claude) the model is called live, and its answers are recorded under
+    ``recordings/``.
     """
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     generate(root / "data", n_people=n_people, seed=seed)
     if provider == "replay":
         llm = f"  provider: replay\n  replay_dir: {FIXTURE_REPLAY}\n"
+    elif provider == "openai_compatible":
+        llm = (
+            f"  provider: openai_compatible\n  base_url: {llm_url}\n  model: {llm_model}\n"
+            "  record_dir: ./recordings\n"
+        )
     elif provider == "anthropic":
         llm = "  provider: anthropic\n  model: claude-opus-5-5\n  effort: high\n  record_dir: ./recordings\n"
     else:
