@@ -9,18 +9,37 @@ Rules below refer to these by name.
 | **Project** | `omop-agent`: an AI agent that automates the OHDSI ETL pipeline, converting patient-level source data into the OMOP CDM v5.4 on PostgreSQL (`README.md`, `docs/architecture.md`). It handles health data. |
 | **Deferred register** | `docs/deferred.md` |
 | **Decision records** | `docs/architecture.md`, in the section for the stage the decision changes |
-| **Test database** | PostgreSQL 16 with `pg_trgm`, reached through the `OMOP_AGENT_TEST_DB_URL` environment variable. CI uses `postgresql://omop:omop@localhost:5432/omop_test` (`.github/workflows/ci.yml`). With the variable unset the PostgreSQL tests are skipped, and a skipped test is not a passed one. |
-| **Narrowest checks** | One test: `pytest -q tests/test_core.py::test_expand_env`; one file: `pytest -q tests/test_core.py`. The project configures no linter and no type checker (`pyproject.toml`, `.github/workflows/ci.yml`); do not report either as run. |
-| **Full suite** | `pytest -q` with `OMOP_AGENT_TEST_DB_URL` set (about 3 minutes; the only skip is the slow scale test in `tests/test_tolerant.py`, run with `OMOP_AGENT_SLOW_TESTS=1`), then the offline demo ("Verification commands" below). CI also builds the Docker bundle and the R image and runs the demo inside each (the `docker` and `docker-r` jobs); those run on push. |
+| **Test database** | PostgreSQL 16 with `pg_trgm`, reached through the `OMOP_AGENT_TEST_DB_URL` environment variable, with a role that may create schemas. Nothing in the repository starts one; "Verification commands" below sets one up. With the variable unset the PostgreSQL tests are skipped, and a skipped test is not a passed one. |
+| **Narrowest checks** | One test: `pytest -q tests/test_core.py::test_expand_env`; one file: `pytest -q tests/test_eras.py`. The project configures no linter and no type checker (`pyproject.toml`, `.github/workflows/ci.yml`); do not report either as run. |
+| **Full suite** | `pytest -q` with `OMOP_AGENT_TEST_DB_URL` set, then the offline demo ("Verification commands" below). With `pg_trgm` and the `dev` extra installed, the only skip is the slow scale test in `tests/test_tolerant.py` (run with `OMOP_AGENT_SLOW_TESTS=1`). CI runs both on every push and pull request, and also builds the Docker bundle and the R image and runs the demo inside each (the `docker` and `docker-r` jobs). |
 | **Live verification** | The offline demo for the pipeline, the build, the quality gate and the report; a browser session for the web app; the CI job steps for the Docker bundle and the R image. Commands are under "Verification commands" below. |
-| **Expensive-to-reverse choices** | Anything a deployed project already holds on disk or in its database: the `etl_spec.yaml` and `omop_agent.yaml` schemas; the files under `work/` that a later run reloads; the approval digests (`omop_agent/approvals.py`: a changed digest un-approves existing designs and mappings); the id maps and the ETL-schema tables (ids are kept across builds); what the build does with an unchanged spec (README, "Upgrading"). Also: what may reach the LLM, the web role model, the CDM version, and the target database. |
-| **Access-gating surfaces** | (1) **The LLM boundary:** `omop_agent/privacy.py`, `omop_agent/privacy_review.py`, the repair agent's tools and error redaction in `omop_agent/quality/repair.py`, and any code that builds a prompt or a tool result. (2) **Review gates:** `omop_agent/approvals.py` and the gate decisions in `omop_agent/pipeline.py`. (3) **SQL written by the model or the spec:** `omop_agent/sqlguard.py` and its callers. (4) **Web:** the `need(request, role)` check in `omop_agent/web/app.py`, accounts and roles in `omop_agent/web/users.py`, sessions, CSRF and sign-in limits in `omop_agent/web/security.py`. (5) **Database roles and grants:** `deploy/postgres-init/10-omop-role.sh` and the grants the build makes to `target.etl_role`. |
+| **Expensive-to-reverse choices** | Anything a deployed site already holds or scripts against; listed under "Expensive-to-reverse choices" below. |
+| **Access-gating surfaces** | Anything that decides who may see or change what, or what data leaves the server; listed under "Access-gating surfaces" below. |
 
 ## Verification commands
 
-Run on 2026-11-24 against a local PostgreSQL 16; each printed what is shown.
+Run on 2026-11-24 in a Claude Code cloud session; each printed what is shown. Shell variables do
+not carry from one tool call to the next: run the blocks you need in one call, or repeat the
+`export` and the `WORK=` line.
 
-The offline demo (recorded LLM answers, no API key):
+**The test database.** `pg_lsclusters` listed one cluster here (`16 main`, port 5432, down at
+session start). The role is a superuser of a throwaway local server, as in CI. On another machine,
+read the cluster name from `pg_lsclusters` first.
+
+```bash
+pip install -e ".[dev]"
+pg_ctlcluster 16 main start
+su postgres -c "psql -c \"CREATE ROLE omop LOGIN SUPERUSER PASSWORD 'omop'\""
+su postgres -c "createdb -O omop omop_test"
+su postgres -c "psql -d omop_test -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'"
+export OMOP_AGENT_TEST_DB_URL=postgresql://omop:omop@localhost:5432/omop_test
+```
+
+`pytest -q tests/test_eras.py` then prints `17 passed`. With the variable unset it prints
+`10 passed, 7 skipped`: that is what a run without the database looks like. The whole suite
+printed `650 passed, 1 skipped` in about 3 minutes.
+
+**The offline demo** (recorded LLM answers, no API key):
 
 ```bash
 WORK=$(mktemp -d)
@@ -29,25 +48,77 @@ OMOP_AGENT_DB_URL="$OMOP_AGENT_TEST_DB_URL" omop-agent demo "$WORK/projects/demo
 
 It ends with `PASSED -> ` and the path of `work/report.html`, and exits 0. Then read the artifact
 the change affects under `$WORK/projects/demo/work/`: `report.md`, `dq_results.json`, `sql/`,
-`etl_spec.yaml`, `audit.jsonl`.
+`etl_spec.yaml`, `audit.jsonl`. The demo builds into schemas named `demo_*`; two sessions on one
+database overwrite each other unless each passes its own `--schema-prefix`.
 
-The web app, on the demo project:
+**The web app**, on the demo project, in the same call as the demo:
 
 ```bash
 printf 'local-check-1234\n' | omop-agent users add check --role operator --password-stdin --data-dir "$WORK/data"
-omop-agent serve --projects "$WORK/projects" --data-dir "$WORK/data" --port 8765
+omop-agent serve --projects "$WORK/projects" --data-dir "$WORK/data" --port 8765 > "$WORK/serve.log" 2>&1 &
+sleep 5 && curl -fsS http://127.0.0.1:8765/healthz
 ```
 
-The first prints `check: operator`. With the server up, `curl -fsS http://127.0.0.1:8765/healthz`
-prints `ok`, and `/p/demo` answers 303 (to the sign-in page) until you sign in. Those two show the
-app started, not that a change works: drive the changed page in a browser, signed in at the role
-the change concerns (`viewer`, `reviewer` or `operator`).
+The first line prints `check: operator` and the last prints `ok`. `/p/demo` answers 303 to
+`/login` until you sign in. Those show the app started, not that a change works: sign in at
+`http://127.0.0.1:8765/login` as `check` in a browser and drive the changed page, at the role the
+change concerns (`viewer`, `reviewer` or `operator`; `omop-agent users set-role`). Stop the server
+with `pkill -f "omop-agent serve"`.
 
-The Docker bundle and the R image: the steps of the `docker` and `docker-r` jobs in
-`.github/workflows/ci.yml`. Not run here.
+**The Docker bundle and the R image:** the steps of the `docker` and `docker-r` jobs in
+`.github/workflows/ci.yml`. Not run.
 
 A run against Claude live (`--provider anthropic`) needs an API key and is not part of routine
 verification.
+
+## Access-gating surfaces
+
+Written by hand on 2026-11-24, so not guaranteed complete (B3): a change that decides who may see
+or change something, or what leaves the server, is on a gating surface whether or not it is here.
+
+- **The LLM boundary.** `omop_agent/privacy.py`, `omop_agent/privacy_review.py`, the repair
+  agent's tools and `redact_error` in `omop_agent/quality/repair.py`, and any code that builds a
+  prompt or a tool result.
+- **What leaves in files.** The shareable report (`build_report(..., shareable=True)` in
+  `omop_agent/report/inspection.py`), and the rejection of mappings that load direct identifiers
+  into the CDM (`_pii_loaded` in `omop_agent/design/validate.py`).
+- **Review gates.** `omop_agent/approvals.py`, `Pipeline._gate` in `omop_agent/pipeline.py`, and
+  the callers that choose the approver: `Pipeline.approver` defaults to `auto_approve`, which lets
+  every gate through, so the gate is only as strong as `_pipeline` in `omop_agent/cli.py` (`run
+  --yes` and `demo` skip the gates), the `omop-agent approve` command, and
+  `omop_agent/web/worker.py`.
+- **SQL written by the model or the spec.** `omop_agent/sqlguard.py` and its callers, and the
+  database role every build step runs under (`target.etl_role`, `omop_agent/etl/runner.py`).
+- **The web app.** The `need(request, role)` check in `omop_agent/web/app.py`; accounts and roles
+  in `omop_agent/web/users.py`; sessions, CSRF, sign-in limits, `safe_next` and the two
+  Content-Security-Policy values in `omop_agent/web/security.py`; the `csrf_token` fields and
+  autoescaping of the templates; project-id and path containment in `omop_agent/web/projects.py`;
+  `WORKER_HIDDEN_ENV` in `omop_agent/web/jobs.py`, which keeps the web secret out of pipeline
+  runs; the 0600 modes of `users.json`, `secret_key` and `access.jsonl`.
+- **Deployment.** `deploy/compose.yaml` (the bind address, `FORWARDED_ALLOW_IPS`, which the per-IP
+  sign-in limit depends on, the database not published, `source` mounted read-only),
+  `deploy/postgres-init/10-omop-role.sh`, and the grants the build makes to `target.etl_role`.
+- **Downloads.** The link and archive handling in `omop_agent/vocab/download.py`.
+
+## Expensive-to-reverse choices
+
+A site that has installed the bundle keeps these, so a change reaches every existing install:
+
+- The `etl_spec.yaml` and `omop_agent.yaml` schemas, and the files under `work/` that a later run
+  reloads.
+- The approval digests (`omop_agent/approvals.py`): a changed digest un-approves existing designs
+  and mappings.
+- The id maps and the ETL-schema tables: ids are kept across builds. The helper functions carry a
+  version stamp (`FUNCTIONS_VERSION` in `omop_agent/cdm/ddl.py`), and a new version must be
+  installed once by their owner at each site (README, "Upgrading").
+- What the build does with an unchanged spec (README, "Upgrading").
+- The web data directory: the `users.json` format and the session key (a new key signs everyone
+  out).
+- `deploy/postgres-init/10-omop-role.sh` runs only when the database volume is first created, so
+  a change to it never reaches an existing install. The image's user id (10001) owns the mounted
+  folders.
+- The command, option and environment-variable names that installs script against.
+- What may reach the LLM, the web role model, the CDM version, and the target database.
 
 ---
 
@@ -226,8 +297,11 @@ Maintaining these rules:
 - **A skill or agent this file names that does not resolve in the session's list fails silently.**
   A name may resolve under another prefix (`rigor-loop` and `what-if-oracle` appear under
   `anthropic-skills:` in cloud sessions); use the form the session lists. When one is missing
-  altogether, say so, do the job the rule gives it by direct analysis, and record it under B6. One
-  standing row in the Deferred register per missing name is enough.
+  altogether, say so and report it to the controller, who corrects the name where an equivalent
+  resolves. Where none does, the job the rule gives it is still owed: a checklist is derived in
+  writing in the brief, and an agent's job goes to a fresh agent briefed with it, never to the
+  agent that wrote the code. The miss is recorded under B6; the Deferred register's standing row
+  covers the names it lists.
 - **A process or orchestration skill never discharges the always-on tier.** Skills that decide how
   work is sequenced and reviewed supply no domain expertise, and their reviews check a diff
   against a brief after code exists. Symptom to catch: "the review loop already covers this."
@@ -318,7 +392,7 @@ continuing. This applies to subagents exactly as it applies to the controller.
 | You have finished a design artifact (a spec, a decision record, a plan, a decomposition) and are about to show it to the user | Dispatch a **fresh agent that did not write it**, on Opus, briefed to attack the decomposition ("what is missing, and what lens would reveal it?"), not to review the content. Self-review does not catch this class. |
 | You are about to hand over anything another person or agent will act on without re-deriving it: a plan, a brief, a list of commands, a runbook | The five hand-over checks below. |
 | You are about to record an obligation as discharged, in a report, a commit message, a coverage map or a register closure | State the obligation's **property** in your own words. State what the test actually **causes to happen**. Ask whether the second entails the first: could the property be violated by another mechanism while this test still passes? If yes, name the gap; do not close it. |
-| You are editing an environment file, a container or deployment config, a provisioning script, or any secret-bearing config (here: `deploy/`, `Dockerfile`, `Dockerfile.r`, `.github/workflows/`, any `omop_agent.yaml`) | `ecc:security-review` (secrets); for `deploy/compose.yaml` also `ecc:docker-patterns`. Never put a connection string on a command line: `omop-agent` reads `OMOP_AGENT_DB_URL`, and `omop_agent.yaml` takes `${VAR}` references (`omop_agent/config.py`). |
+| You are editing an environment file, a container or deployment config, a provisioning script, or any secret-bearing config (here: `deploy/`, `Dockerfile`, `Dockerfile.r`, `.github/workflows/`, any `omop_agent.yaml`) | `ecc:security-review` (secrets); for `deploy/compose.yaml` also `ecc:docker-patterns`. Never write a connection string out on a command line or in a committed file; pass it by reference to an environment variable. `omop-agent demo` and `omop-agent init` read `OMOP_AGENT_DB_URL`, and `omop_agent.yaml` takes `${VAR}` references (`omop_agent/config.py`). The throwaway Test database URL is the one exception. |
 | You are about to write or edit HTML, CSS or client-side JS (here: `omop_agent/web/templates/`, `omop_agent/web/static/`, `omop_agent/report/templates/`) | `modern-web-guidance:modern-web-guidance` first. |
 | You are about to defer, substitute or park anything | B6. |
 
@@ -476,6 +550,8 @@ mechanism in the right-hand column exists (B0, item 4).
 | Rule | What would enforce it |
 |---|---|
 | Skills and agents named in C1, C4, C6, B2, B3 and B7 | The plugins that supply them: `superpowers`, `rigor-loop`, `what-if-oracle`, `ecc`, `pr-review-toolkit`, `modern-web-guidance`, plus the built-in `code-review`, `simplify` and `security-review`. Row 1 of the Deferred register lists the names that did not resolve in a cloud session. |
+| C1 skill scan | A UserPromptSubmit hook that asks for the task's skills to be named and invoked. |
+| C7 branch check | A hook that warns before a commit on `main` or `master`. |
 | Hand-over checks 3 and 4 (B2) | A Stop hook and a PreToolUse hook on agent dispatches. |
 | Hand-over check 5 (B2) | A lint test in CI over the command blocks of `README.md` and `docs/deploy.md`. |
 | Reach: guards and their triggers (B3) | A test that enumerates from disk the web routes and their `need(request, role)` checks, and the callers of `sqlguard.fragment_issues`, and fails when one has none. |
